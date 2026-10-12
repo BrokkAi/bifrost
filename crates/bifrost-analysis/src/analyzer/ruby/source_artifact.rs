@@ -353,6 +353,7 @@ fn project_type<'tree>(
         }
     }
     types.push(TypeFact {
+        jvm_inventory: None,
         ambient_use: None,
         id: owner_id.clone(),
         name,

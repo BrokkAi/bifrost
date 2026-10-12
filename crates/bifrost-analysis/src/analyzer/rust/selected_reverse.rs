@@ -5,10 +5,10 @@ use super::selected_projection::{RustSelectedReferenceFile, rust_selected_usage_
 use crate::CancellationToken;
 use crate::analyzer::resolution::ResolutionCompletion;
 use crate::analyzer::store::resolution_operation::{
-    RustReverseCandidateSet, SelectedResolutionContextMetrics, SelectedResolutionOperation,
-    SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
-    SelectedResolutionOperationOutcome, SelectedRustReverseBatchOutcome,
-    SelectedRustReverseQueries, SelectedRustTargetReferences,
+    RustReverseCandidateSet, RustReverseConfirmation, SelectedResolutionContextMetrics,
+    SelectedResolutionOperation, SelectedResolutionOperationInput,
+    SelectedResolutionOperationOpenOutcome, SelectedResolutionOperationOutcome,
+    SelectedRustReverseBatchOutcome, SelectedRustReverseQueries, SelectedRustTargetReferences,
 };
 use crate::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
 use crate::analyzer::store::resolution_selection::SelectedResolutionLanguage;
@@ -369,7 +369,15 @@ pub fn with_rust_selected_reverse_queries<T>(
     cancellation: &CancellationToken,
     run: impl FnOnce(&mut dyn RustSelectedReverseQueries) -> Result<T>,
 ) -> RustSelectedReverseOutcome<T> {
-    with_rust_selected_reverse_reference_admission(rust, None, cancellation, run)
+    with_rust_selected_reverse_reference_admission(
+        rust,
+        None,
+        cancellation,
+        |operation, root, locators| {
+            confirm_rust_reverse_references(operation, root, locators, cancellation)
+        },
+        run,
+    )
 }
 
 /// Bound result-site discovery to admitted files without removing definitions,
@@ -380,13 +388,26 @@ pub(crate) fn with_rust_selected_reverse_queries_in_files<T>(
     cancellation: &CancellationToken,
     run: impl FnOnce(&mut dyn RustSelectedReverseQueries) -> Result<T>,
 ) -> RustSelectedReverseOutcome<T> {
-    with_rust_selected_reverse_reference_admission(rust, Some(admitted_files), cancellation, run)
+    with_rust_selected_reverse_reference_admission(
+        rust,
+        Some(admitted_files),
+        cancellation,
+        |operation, root, locators| {
+            confirm_rust_reverse_references(operation, root, locators, cancellation)
+        },
+        run,
+    )
 }
 
 fn with_rust_selected_reverse_reference_admission<T>(
     rust: &RustAnalyzer,
     admitted_files: Option<&HashSet<ProjectFile>>,
     cancellation: &CancellationToken,
+    confirm: impl for<'confirm_store, 'confirm_input> FnMut(
+        &mut SelectedResolutionOperation<'confirm_store, 'confirm_input>,
+        &std::path::Path,
+        &[&crate::analyzer::resolution::SelectedSemanticLocator],
+    ) -> Result<RustReverseConfirmation>,
     run: impl FnOnce(&mut dyn RustSelectedReverseQueries) -> Result<T>,
 ) -> RustSelectedReverseOutcome<T> {
     let _timing = crate::profiling::scope("rust_selected::reverse_queries");
@@ -473,14 +494,8 @@ fn with_rust_selected_reverse_reference_admission<T>(
             work: RustSelectedReverseWork::default(),
         })
     };
-    let result = operation.with_rust_row_reverse_queries(
-        admitted_files,
-        cancellation,
-        |operation, root, locators| {
-            confirm_rust_reverse_references(operation, root, locators, cancellation)
-        },
-        query,
-    );
+    let result =
+        operation.with_rust_row_reverse_queries(admitted_files, cancellation, confirm, query);
     match result {
         Ok(SelectedResolutionOperationOutcome::Native(value)) => {
             RustSelectedReverseOutcome::Ready(value)
@@ -539,7 +554,7 @@ fn confirm_rust_reverse_references(
         // The receiver-analysis budget is a bound the analysis declares and
         // enforces, not a store failure. It leaves this candidate blob's sites
         // unproven and says so; the caller keeps every other blob's answers.
-        BoundedResolution::Exceeded { .. } => Ok(RustReverseConfirmation::Bounded),
+        BoundedResolution::Exceeded { limit, .. } => Ok(RustReverseConfirmation::Bounded { limit }),
         BoundedResolution::Complete { value, .. } => match value {
             SelectedRustCallerReferencesOutcome::Operation(
                 SelectedResolutionOperationOutcome::Native(located),
@@ -582,6 +597,163 @@ mod tests {
     };
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#4926: a budget-bound binding recheck dropped an incoming call site instead of keeping it unproven"
+    )]
+    fn incoming_call_recheck_keeps_budget_stopped_sites_unproven() {
+        use crate::analyzer::store::resolution_operation::{
+            ReferenceOmission, RustReverseConfirmation,
+        };
+        use crate::analyzer::usages::call_relations::{
+            CallRelationDiagnosticCode, CallRelationLimits,
+        };
+        use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname='recheck'\nversion='0.1.0'\nedition='2024'\n")
+            .file("src/lib.rs", "mod first; mod second; mod third; pub struct Engine; impl Engine { pub fn run(&self) {} }\n")
+            .file("src/first.rs", "pub fn first(e: &crate::Engine) { e.run(); }\n")
+            .file("src/second.rs", "pub fn second(e: &crate::Engine) { e.run(); }\n")
+            .file("src/third.rs", "pub fn third(e: &crate::Engine) { e.run(); }\n")
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "run")
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut results = Vec::new();
+        for (omitted_file, omission) in [
+            (None, None),
+            (
+                Some("src/second.rs"),
+                Some(ReferenceOmission::ReceiverBudget(
+                    ReceiverBudgetLimit::ScopeNodes,
+                )),
+            ),
+            (
+                Some("src/third.rs"),
+                Some(ReferenceOmission::TimeBudgetExceeded),
+            ),
+        ] {
+            let mut initially_confirmed_files = HashSet::default();
+            let outcome = with_rust_selected_reverse_reference_admission(
+                &rust,
+                None,
+                &cancellation,
+                |operation, root, locators| {
+                    let file = locators[0].relative_path();
+                    let initial = initially_confirmed_files.insert(file.to_owned());
+                    if !initial && omitted_file == Some(file) {
+                        return Ok(match omission.unwrap() {
+                            ReferenceOmission::ReceiverBudget(limit) => {
+                                RustReverseConfirmation::Bounded { limit }
+                            }
+                            ReferenceOmission::TimeBudgetExceeded => {
+                                RustReverseConfirmation::TimeBudgetExceeded
+                            }
+                        });
+                    }
+                    let mut confirmation =
+                        confirm_rust_reverse_references(operation, root, locators, &cancellation)?;
+                    if initial
+                        && let RustReverseConfirmation::Confirmed(answers) = &mut confirmation
+                    {
+                        // Keep type-prefix evidence available for nomination, but
+                        // require a rich recheck for each method binding.
+                        for answer in answers.iter_mut().flatten() {
+                            if answer.definitions.contains(&target) {
+                                let definition = answer.resolution.binding().targets()[0];
+                                answer.resolution.combine_binding_completion(
+                                    &ResolutionCompletion::incomplete([
+                                        crate::analyzer::resolution::ResolutionIncompleteReason::ReceiverBudgetExhausted(definition),
+                                    ]),
+                                );
+                            }
+                        }
+                    }
+                    Ok(confirmation)
+                },
+                |queries| {
+                    queries.incoming_calls_for(
+                        std::slice::from_ref(&target),
+                        CallRelationLimits {
+                            max_files: 16,
+                            max_source_bytes: 64 * 1024,
+                            max_candidates: 64,
+                        },
+                    )
+                },
+            );
+            let RustSelectedReverseOutcome::Ready(Some(mut answers)) = outcome else {
+                panic!("incoming projection did not complete: {outcome:?}");
+            };
+            assert_eq!(answers.len(), 1);
+            results.push(answers.remove(0));
+        }
+        let time_bounded = results.pop().unwrap();
+        let bounded = results.pop().unwrap();
+        let complete = results.pop().unwrap();
+        assert_eq!(complete.sites.len(), 3, "{complete:?}");
+        assert!(!complete.truncated, "{complete:?}");
+        assert_eq!(bounded.sites.len(), 3, "{bounded:?}");
+        assert!(bounded.truncated, "{bounded:?}");
+        assert_eq!(time_bounded.sites.len(), 3, "{time_bounded:?}");
+        assert!(time_bounded.truncated, "{time_bounded:?}");
+        assert_eq!(bounded.work.scanned_files, complete.work.scanned_files);
+        assert_eq!(
+            bounded.work.scanned_source_bytes,
+            complete.work.scanned_source_bytes
+        );
+        assert_eq!(
+            bounded.work.examined_candidates,
+            complete.work.examined_candidates
+        );
+        for (result, file, lane, expected_count) in [
+            (&bounded, "src/second.rs", "scope_nodes", Some(1)),
+            (&time_bounded, "src/third.rs", "time_budget", None),
+        ] {
+            let stopped_file = fixture.file(file);
+            let stopped_site = result
+                .sites
+                .iter()
+                .find(|site| site.file == stopped_file)
+                .unwrap();
+            assert_eq!(stopped_site.proof, UsageProof::Unproven, "{result:?}");
+            let diagnostic = result
+                .diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.code == CallRelationDiagnosticCode::BudgetExhausted
+                        && diagnostic.message.contains(lane)
+                })
+                .unwrap_or_else(|| panic!("{result:?}"));
+            let count = diagnostic
+                .message
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            assert!(count > 0, "{diagnostic:?}");
+            if let Some(expected_count) = expected_count {
+                assert_eq!(count, expected_count, "{diagnostic:?}");
+            }
+            assert_eq!(diagnostic.context, target.fq_name());
+            assert!(diagnostic.reason_kind.is_none(), "{diagnostic:?}");
+            assert!(
+                !result.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == CallRelationDiagnosticCode::AnalysisFailed
+                        && diagnostic.reason_kind.as_deref() == Some("time_budget")
+                }),
+                "{result:?}"
+            );
+            assert_eq!(result.sites, complete.sites);
+        }
+    }
 
     /// The files a target's candidate set names, or None when the target has
     /// no selected definition.

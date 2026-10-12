@@ -24,7 +24,36 @@ pub(super) const REVERSE_LOOKUP_NAMESPACES: [ResolutionNamespace; 6] = [
 ];
 
 pub(crate) const DEFINITION_SITE_SQL: &str = "SELECT sites.blob_id, sites.source_site FROM temp.selected_resolution_mounts AS mounts CROSS JOIN resolution_semantic_sites AS sites ON sites.blob_id = mounts.blob_id AND sites.semantic_key = ?2 AND sites.semantic_role = 'definition' WHERE mounts.mount_ordinal = ?1";
-pub(crate) const SAME_BLOB_TYPE_EXPORT_KEYS_SQL: &str = "SELECT DISTINCT sites.semantic_key FROM rust_crate_exports AS exports INDEXED BY rust_crate_exports_declaration CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=exports.topology_id CROSS JOIN source_native_declaration_bridges AS export_bridge ON export_bridge.blob_id=exports.declaration_blob_id AND export_bridge.source_site=exports.declaration_site CROSS JOIN source_declaration_units AS export_unit ON export_unit.blob_id=export_bridge.blob_id AND export_unit.declaration_id=export_bridge.declaration_id CROSS JOIN source_native_declaration_bridges AS target_bridge ON target_bridge.blob_id=exports.declaration_blob_id AND target_bridge.source_site=?3 CROSS JOIN source_declaration_units AS target_unit ON target_unit.blob_id=target_bridge.blob_id AND target_unit.declaration_id=target_bridge.declaration_id AND target_unit.unit_key=export_unit.unit_key CROSS JOIN resolution_semantic_sites AS sites ON sites.blob_id=exports.declaration_blob_id AND sites.source_site=exports.declaration_site AND sites.semantic_role='definition' WHERE exports.declaration_blob_id=?1 AND exports.namespace='type' AND exports.name=?2 AND exports.declaration_site<>?3";
+pub(crate) const SAME_BLOB_TYPE_EXPORT_KEYS_SQL: &str = r#"
+SELECT DISTINCT sites.semantic_key
+FROM main.resolution_unit_summary_members AS candidate
+  INDEXED BY resolution_unit_summary_members_blob
+CROSS JOIN selected_rust_unit_summaries AS owner
+  ON owner.summary_id=candidate.summary_id
+CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
+  INDEXED BY rust_resolution_unit_summary_exports_declaration
+  ON exports.summary_id=owner.summary_id
+ AND exports.declaration_member_ordinal=candidate.member_ordinal
+ AND exports.origin='declaration'
+CROSS JOIN source_native_declaration_bridges AS export_bridge
+  ON export_bridge.blob_id=candidate.blob_id
+ AND export_bridge.source_site=exports.declaration_site
+CROSS JOIN source_declaration_units AS export_unit
+  ON export_unit.blob_id=export_bridge.blob_id
+ AND export_unit.declaration_id=export_bridge.declaration_id
+CROSS JOIN source_native_declaration_bridges AS target_bridge
+  ON target_bridge.blob_id=candidate.blob_id AND target_bridge.source_site=?3
+CROSS JOIN source_declaration_units AS target_unit
+  ON target_unit.blob_id=target_bridge.blob_id
+ AND target_unit.declaration_id=target_bridge.declaration_id
+ AND target_unit.unit_key=export_unit.unit_key
+CROSS JOIN resolution_semantic_sites AS sites
+  ON sites.blob_id=candidate.blob_id
+ AND sites.source_site=exports.declaration_site
+ AND sites.semantic_role='definition'
+WHERE candidate.blob_id=?1 AND exports.namespace='type' AND exports.name=?2
+  AND exports.declaration_site<>?3
+"#;
 pub(crate) const BASE_TARGET_ACTIVATION_SQL: &str = r#"
 WITH target_unit AS (
   SELECT units.unit_key
@@ -33,7 +62,7 @@ WITH target_unit AS (
     ON units.blob_id=bridge.blob_id AND units.declaration_id=bridge.declaration_id
   WHERE bridge.blob_id=?1 AND bridge.source_site=?2
 )
-SELECT properties.cfg_condition, json(owner.cfg_atoms), owner.target_kind
+SELECT properties.cfg_condition, json(context.cfg_atoms), context.target_kind
 FROM source_declaration_units AS units
 CROSS JOIN target_unit ON target_unit.unit_key=units.unit_key
 CROSS JOIN source_native_declaration_bridges AS bridge
@@ -43,9 +72,13 @@ CROSS JOIN resolution_semantic_sites AS site
  AND site.semantic_role='definition'
 CROSS JOIN source_rust_declaration_properties AS properties
   ON properties.blob_id=bridge.blob_id AND properties.declaration_id=bridge.declaration_id
-CROSS JOIN rust_crate_container_sources AS sources INDEXED BY rust_crate_containers_blob
-  ON sources.blob_id=site.blob_id
-CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=sources.topology_id
+CROSS JOIN main.resolution_unit_summary_members AS members
+  INDEXED BY resolution_unit_summary_members_blob
+  ON members.blob_id=site.blob_id
+CROSS JOIN selected_rust_unit_summaries AS owner
+  ON owner.summary_id=members.summary_id
+CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
+  ON context.summary_id=owner.summary_id
 WHERE units.blob_id=?1
 "#;
 pub(crate) const CONTRACT_OWNER_SQL: &str = "SELECT target_mount.persisted_relative_path, owner_site.source_site, owner.member_kind FROM temp.selected_resolution_mounts AS target_mount CROSS JOIN resolution_member_owner_properties AS owner ON owner.blob_id=target_mount.blob_id AND owner.definition_semantic_key=?2 CROSS JOIN resolution_semantic_sites AS owner_site ON owner_site.blob_id=owner.blob_id AND owner_site.semantic_key=owner.owner_definition_semantic_key AND owner_site.semantic_role='definition' WHERE target_mount.mount_ordinal=?1";
@@ -77,31 +110,40 @@ const OTHER_TARGET_WORKSPACE_DEPENDENCY_SQL: &str = r#"
 SELECT
  EXISTS(
    SELECT 1
-   FROM selected_rust_module_placements AS placement
-   JOIN rust_crate_dependencies AS dependency USING(topology_id)
-   WHERE placement.mount_ordinal=?1 AND dependency.extern_name=?2
+   FROM temp.selected_rust_module_placements AS placement
+   CROSS JOIN selected_rust_unit_summaries AS current
+     ON current.topology_id=placement.topology_id
+   CROSS JOIN main.rust_resolution_unit_summary_dependency_names AS dependency_name
+     INDEXED BY rust_resolution_unit_summary_dependency_names_extern
+     ON dependency_name.summary_id=current.summary_id
+    AND dependency_name.extern_name=?2
+   WHERE placement.mount_ordinal=?1
  ),
  EXISTS(
    SELECT 1
-   FROM selected_rust_module_placements AS placement
-   JOIN rust_crate_versions AS current_version
-     ON current_version.topology_id=placement.topology_id
-    AND current_version.valid_until IS NULL
-    AND current_version.manifest_file_version_id IS NOT NULL
-   JOIN selected_rust_crates AS sibling
-     ON sibling.topology_id<>current_version.topology_id
-   JOIN rust_crate_versions AS sibling_version
-     ON sibling_version.topology_id=sibling.topology_id
-    AND sibling_version.workspace_id=current_version.workspace_id
-    AND sibling_version.lang=current_version.lang
-    AND sibling_version.generation=current_version.generation
-    AND sibling_version.manifest_file_version_id=current_version.manifest_file_version_id
-    AND sibling_version.valid_until IS NULL
-   JOIN rust_crate_dependencies AS sibling_dependency
-     ON sibling_dependency.topology_id=sibling_version.topology_id
-    AND sibling_dependency.extern_name=?2
-    AND sibling_dependency.boundary='workspace'
+   FROM temp.selected_rust_module_placements AS placement
+   CROSS JOIN selected_rust_unit_summaries AS current
+     ON current.topology_id=placement.topology_id
+   CROSS JOIN main.rust_resolution_unit_summary_versions AS sibling_version
+     INDEXED BY rust_resolution_unit_summary_versions_manifest
+     ON sibling_version.workspace_id=current.workspace_id
+    AND sibling_version.generation=current.generation
+    AND sibling_version.manifest_file_version_id=current.manifest_file_version_id
+    AND sibling_version.unit_key<>current.unit_key
+   CROSS JOIN selected_rust_unit_summaries AS sibling
+     ON sibling.summary_id=sibling_version.summary_id
+    AND sibling.workspace_id=current.workspace_id
+    AND sibling.generation=current.generation
+   CROSS JOIN main.rust_resolution_unit_summary_dependency_names AS dependency_name
+     INDEXED BY rust_resolution_unit_summary_dependency_names_extern
+     ON dependency_name.summary_id=sibling.summary_id
+    AND dependency_name.extern_name=?2
+   CROSS JOIN main.resolution_unit_summary_dependencies AS dependency
+     ON dependency.summary_id=sibling.summary_id
+    AND dependency.dependency_ordinal=dependency_name.dependency_ordinal
+    AND dependency.boundary='workspace'
    WHERE placement.mount_ordinal=?1
+     AND current.manifest_file_version_id IS NOT NULL
  )
 "#;
 const REFERENCE_ROOT_LOOKUP_SQL: &str = "SELECT root_identity.spelling
@@ -122,7 +164,62 @@ const REFERENCE_ROOT_LOOKUP_SQL: &str = "SELECT root_identity.spelling
 /// file collapsed every owning target into one request, in which `crate::error`
 /// in a dual-owned module named the library's `error` and the binary's at once
 /// and neither owner could claim the site.
-pub(crate) const CALLER_ROOTS_SQL: &str = "WITH source(blob_id,persisted_relative_path) AS (SELECT blob_id,persisted_relative_path FROM temp.selected_resolution_mounts WHERE storage_language='rust' AND persisted_relative_path=?1 UNION ALL SELECT blob.id,mask.persisted_relative_path FROM temp.selected_resolution_overlay_masks AS mask CROSS JOIN workspace_file_versions AS version ON version.file_version_id=mask.masked_file_version_id CROSS JOIN blobs AS blob ON blob.blob_oid=version.blob_oid AND blob.lang=version.lang AND blob.generation=version.generation WHERE mask.storage_language='rust' AND mask.persisted_relative_path=?1) SELECT DISTINCT roots.rel_path FROM source CROSS JOIN rust_crate_container_sources AS placement INDEXED BY rust_crate_containers_blob ON placement.blob_id=source.blob_id AND placement.rel_path=source.persisted_relative_path CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=placement.topology_id CROSS JOIN rust_crate_container_sources AS roots ON roots.topology_id=owner.topology_id AND roots.container_path='crate' WHERE roots.source_kind='declared' AND (owner.target_kind<>'detached' OR NOT EXISTS(SELECT 1 FROM rust_crate_container_sources AS parent INDEXED BY rust_crate_containers_blob CROSS JOIN selected_rust_crates AS container ON container.topology_id=parent.topology_id WHERE parent.blob_id=roots.blob_id AND parent.rel_path=roots.rel_path AND parent.topology_id<>owner.topology_id AND parent.container_path<>'crate' AND container.target_kind='detached'))";
+pub(crate) const CALLER_ROOTS_SQL: &str = r#"
+WITH source(blob_id,persisted_relative_path) AS (
+  SELECT blob_id,persisted_relative_path
+  FROM temp.selected_resolution_mounts
+  WHERE storage_language='rust' AND persisted_relative_path=?1
+  UNION ALL
+  SELECT blob.id,mask.persisted_relative_path
+  FROM temp.selected_resolution_overlay_masks AS mask
+  CROSS JOIN workspace_file_versions AS version
+    ON version.file_version_id=mask.masked_file_version_id
+  CROSS JOIN blobs AS blob
+    ON blob.blob_oid=version.blob_oid AND blob.lang=version.lang
+   AND blob.generation=version.generation
+  WHERE mask.storage_language='rust' AND mask.persisted_relative_path=?1
+)
+SELECT DISTINCT roots.rel_path
+FROM source
+CROSS JOIN main.resolution_unit_summary_members AS source_members
+  INDEXED BY resolution_unit_summary_members_blob
+  ON source_members.blob_id=source.blob_id
+ AND source_members.rel_path=source.persisted_relative_path
+CROSS JOIN selected_rust_unit_summaries AS owner
+  ON owner.summary_id=source_members.summary_id
+CROSS JOIN main.rust_resolution_unit_summary_contexts AS owner_context
+  ON owner_context.summary_id=owner.summary_id
+CROSS JOIN main.rust_resolution_unit_summary_placements AS source_placement
+  INDEXED BY rust_resolution_unit_summary_placements_member
+  ON source_placement.summary_id=owner.summary_id
+ AND source_placement.member_ordinal=source_members.member_ordinal
+CROSS JOIN main.rust_resolution_unit_summary_placements AS root_placement
+  ON root_placement.summary_id=owner.summary_id
+ AND root_placement.module_path='crate'
+ AND root_placement.source_kind='declared'
+CROSS JOIN main.resolution_unit_summary_members AS roots
+  ON roots.summary_id=root_placement.summary_id
+ AND roots.member_ordinal=root_placement.member_ordinal
+WHERE owner_context.target_kind<>'detached'
+   OR NOT EXISTS (
+     SELECT 1
+     FROM main.resolution_unit_summary_members AS parent_member
+       INDEXED BY resolution_unit_summary_members_blob
+     CROSS JOIN selected_rust_unit_summaries AS container
+       ON container.summary_id=parent_member.summary_id
+     CROSS JOIN main.rust_resolution_unit_summary_contexts AS container_context
+       ON container_context.summary_id=container.summary_id
+      AND container_context.target_kind='detached'
+     CROSS JOIN main.rust_resolution_unit_summary_placements AS parent_placement
+       INDEXED BY rust_resolution_unit_summary_placements_member
+       ON parent_placement.summary_id=parent_member.summary_id
+      AND parent_placement.member_ordinal=parent_member.member_ordinal
+      AND parent_placement.module_path<>'crate'
+     WHERE parent_member.blob_id=roots.blob_id
+       AND parent_member.rel_path=roots.rel_path
+       AND container.unit_key<>owner.unit_key
+   )
+"#;
 /// The declaration site of the owner a member declaration belongs to, keyed by
 /// the member's own blob and source site.
 ///
@@ -185,10 +282,51 @@ pub(crate) const EXPORTS_SQL: &str = include_str!("../rust_reverse_exports.sql")
 // A cfg-alternative definition can share one CodeUnit with its active sibling
 // while only the sibling has a selected export row. Keep the sibling routes
 // available to reverse discovery; forward confirmation checks each candidate.
-pub(crate) const SAME_BLOB_TYPE_EXPORTS_SQL: &str = "SELECT exports.topology_id, owner.crate_key, exports.module_path, 'type', exports.name, exports.visibility, 0 FROM rust_crate_exports AS exports INDEXED BY rust_crate_exports_declaration CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=exports.topology_id CROSS JOIN source_native_declaration_bridges AS export_bridge ON export_bridge.blob_id=exports.declaration_blob_id AND export_bridge.source_site=exports.declaration_site CROSS JOIN source_declaration_units AS export_unit ON export_unit.blob_id=export_bridge.blob_id AND export_unit.declaration_id=export_bridge.declaration_id CROSS JOIN source_native_declaration_bridges AS target_bridge ON target_bridge.blob_id=exports.declaration_blob_id AND target_bridge.source_site=?3 CROSS JOIN source_declaration_units AS target_unit ON target_unit.blob_id=target_bridge.blob_id AND target_unit.declaration_id=target_bridge.declaration_id AND target_unit.unit_key=export_unit.unit_key WHERE exports.declaration_blob_id=?1 AND exports.namespace='type' AND exports.name=?2 AND exports.declaration_site<>?3 AND EXISTS (SELECT 1 FROM rust_crate_container_sources AS source INDEXED BY rust_crate_containers_path WHERE source.topology_id=exports.topology_id AND source.container_path=exports.module_path AND source.blob_id=exports.declaration_blob_id AND source.rel_path=?4)";
-pub(crate) const IMPORTS_SQL: &str = "SELECT sources.blob_id, imports.bound_name, CASE WHEN sources.blob_id=imports.blob_id THEN imports.binder_scope END, imports.topology_id, owner.crate_key, imports.module_path FROM rust_crate_imports AS imports INDEXED BY rust_crate_imports_target CROSS JOIN selected_rust_crates AS owner ON owner.topology_id = imports.topology_id CROSS JOIN rust_crate_container_sources AS sources ON sources.topology_id=imports.topology_id AND sources.container_path=imports.module_path WHERE imports.target_crate_key = ?1 AND imports.target_module_path = ?2 AND imports.target_name = ?3";
-pub(crate) const GLOBS_SQL: &str = "SELECT sources.blob_id, CASE WHEN sources.blob_id=imports.blob_id THEN imports.binder_scope END, imports.topology_id, owner.crate_key, imports.module_path FROM rust_crate_glob_imports AS imports INDEXED BY rust_crate_glob_imports_target CROSS JOIN selected_rust_crates AS owner ON owner.topology_id = imports.topology_id CROSS JOIN rust_crate_container_sources AS sources ON sources.topology_id=imports.topology_id AND sources.container_path=imports.module_path WHERE imports.target_crate_key = ?1 AND imports.target_module_path = ?2";
-pub(crate) const MODULE_SOURCES_SQL: &str = "SELECT candidate.blob_id FROM rust_crate_container_sources AS candidate CROSS JOIN selected_rust_crate_containers AS selected ON selected.topology_id=candidate.topology_id AND selected.container_path=candidate.container_path AND selected.rel_path=candidate.rel_path AND selected.blob_id=candidate.blob_id WHERE candidate.topology_id=?1 AND candidate.container_path=?2";
+pub(crate) const SAME_BLOB_TYPE_EXPORTS_SQL: &str = r#"
+SELECT owner.topology_id, owner.unit_key, exports.module_path, 'type',
+       exports.name, exports.visibility, 0
+FROM main.resolution_unit_summary_members AS candidate
+  INDEXED BY resolution_unit_summary_members_blob
+CROSS JOIN selected_rust_unit_summaries AS owner
+  ON owner.summary_id=candidate.summary_id
+CROSS JOIN main.rust_resolution_unit_summary_placements AS placement
+  INDEXED BY rust_resolution_unit_summary_placements_member
+  ON placement.summary_id=owner.summary_id
+ AND placement.member_ordinal=candidate.member_ordinal
+CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
+  INDEXED BY rust_resolution_unit_summary_exports_declaration
+  ON exports.summary_id=owner.summary_id
+ AND exports.declaration_member_ordinal=candidate.member_ordinal
+ AND exports.module_path=placement.module_path
+ AND exports.origin='declaration'
+CROSS JOIN source_native_declaration_bridges AS export_bridge
+  ON export_bridge.blob_id=candidate.blob_id
+ AND export_bridge.source_site=exports.declaration_site
+CROSS JOIN source_declaration_units AS export_unit
+  ON export_unit.blob_id=export_bridge.blob_id
+ AND export_unit.declaration_id=export_bridge.declaration_id
+CROSS JOIN source_native_declaration_bridges AS target_bridge
+  ON target_bridge.blob_id=candidate.blob_id AND target_bridge.source_site=?3
+CROSS JOIN source_declaration_units AS target_unit
+  ON target_unit.blob_id=target_bridge.blob_id
+ AND target_unit.declaration_id=target_bridge.declaration_id
+ AND target_unit.unit_key=export_unit.unit_key
+WHERE candidate.blob_id=?1 AND candidate.rel_path=?4
+  AND exports.namespace='type' AND exports.name=?2
+  AND exports.declaration_site<>?3
+"#;
+pub(crate) const IMPORTS_SQL: &str = "SELECT DISTINCT sources.blob_id, route.bound_name, CASE WHEN sources.blob_id=bound_member.blob_id THEN route.binder_scope END, owner.topology_id, owner.unit_key, route.module_path FROM main.rust_resolution_unit_summary_import_routes AS route INDEXED BY rust_resolution_unit_summary_import_routes_target_identity CROSS JOIN selected_rust_unit_summaries AS owner ON owner.summary_id=route.summary_id CROSS JOIN main.resolution_unit_summary_members AS bound_member ON bound_member.summary_id=route.summary_id AND bound_member.member_ordinal=route.member_ordinal CROSS JOIN main.rust_resolution_unit_summary_placements AS placement ON placement.summary_id=route.summary_id AND placement.module_path=route.module_path CROSS JOIN main.resolution_unit_summary_members AS sources ON sources.summary_id=placement.summary_id AND sources.member_ordinal=placement.member_ordinal WHERE route.target_unit_key=?1 AND route.target_module_path=?2 AND route.target_name=?3";
+pub(crate) const GLOBS_SQL: &str = "SELECT DISTINCT sources.blob_id, CASE WHEN sources.blob_id=bound_member.blob_id THEN route.binder_scope END, owner.topology_id, owner.unit_key, route.module_path FROM main.rust_resolution_unit_summary_glob_imports AS route INDEXED BY rust_resolution_unit_summary_glob_imports_target_identity CROSS JOIN selected_rust_unit_summaries AS owner ON owner.summary_id=route.summary_id CROSS JOIN main.resolution_unit_summary_members AS bound_member ON bound_member.summary_id=route.summary_id AND bound_member.member_ordinal=route.member_ordinal CROSS JOIN main.rust_resolution_unit_summary_placements AS placement ON placement.summary_id=route.summary_id AND placement.module_path=route.module_path CROSS JOIN main.resolution_unit_summary_members AS sources ON sources.summary_id=placement.summary_id AND sources.member_ordinal=placement.member_ordinal WHERE route.target_unit_key=?1 AND route.target_module_path=?2";
+pub(crate) const MODULE_SOURCES_SQL: &str = r#"
+SELECT members.blob_id
+FROM selected_rust_unit_summaries AS owner
+CROSS JOIN main.rust_resolution_unit_summary_placements AS placement
+  ON placement.summary_id=owner.summary_id AND placement.module_path=?2
+CROSS JOIN selected_rust_unit_members AS members
+  ON members.summary_id=placement.summary_id
+ AND members.member_ordinal=placement.member_ordinal
+WHERE owner.unit_key=?1
+"#;
 /// Every selected blob of every crate that compiles one blob.
 ///
 /// A `macro_rules!` macro reaches the rest of its crate by textual scope:
@@ -197,9 +335,32 @@ pub(crate) const MODULE_SOURCES_SQL: &str = "SELECT candidate.blob_id FROM rust_
 /// import or export row names those files. The crate's own files are the
 /// superset textual scope can reach; forward confirmation decides which
 /// definition each invocation's textual scope holds.
-pub(crate) const TEXTUAL_MACRO_SOURCES_SQL: &str = "SELECT member.blob_id FROM rust_crate_container_sources AS placement INDEXED BY rust_crate_containers_blob CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=placement.topology_id CROSS JOIN rust_crate_container_sources AS member INDEXED BY rust_crate_containers_path ON member.topology_id=placement.topology_id WHERE placement.blob_id=?1 AND EXISTS(SELECT 1 FROM temp.selected_resolution_mounts AS selected INDEXED BY selected_resolution_mounts_blob_ordinal WHERE selected.blob_id=member.blob_id AND selected.storage_language='rust' AND selected.persisted_relative_path=member.rel_path)";
+pub(crate) const TEXTUAL_MACRO_SOURCES_SQL: &str = r#"
+SELECT DISTINCT members.blob_id
+FROM main.resolution_unit_summary_members AS target
+  INDEXED BY resolution_unit_summary_members_blob
+CROSS JOIN selected_rust_unit_summaries AS owner
+  ON owner.summary_id=target.summary_id
+CROSS JOIN selected_rust_unit_members AS members
+  ON members.summary_id=owner.summary_id
+WHERE target.blob_id=?1
+"#;
 const TEXTUAL_MACRO_INVOCATION_RANGES_SQL: &str = "SELECT selected.persisted_relative_path, invocation.start_byte, invocation.macro_name FROM source_rust_macro_invocations AS invocation CROSS JOIN temp.selected_resolution_mounts AS selected ON selected.blob_id=invocation.blob_id WHERE invocation.blob_id=?1 AND invocation.macro_name=?2 AND selected.storage_language='rust'";
-pub(crate) const ROOT_REFERENCES_SQL: &str = "SELECT routes.blob_id, routes.reference_source_site FROM rust_crate_root_references AS routes INDEXED BY rust_crate_root_references_target CROSS JOIN rust_crate_container_sources AS placement ON placement.topology_id=routes.topology_id AND placement.container_path=routes.module_path AND placement.blob_id=routes.blob_id WHERE EXISTS(SELECT 1 FROM selected_rust_crates AS owner WHERE owner.topology_id=routes.topology_id) AND routes.target_crate_key=?1 AND routes.target_module_path=?2 AND routes.target_name=?3 AND EXISTS(SELECT 1 FROM temp.selected_resolution_mounts AS selected INDEXED BY selected_resolution_mounts_blob_ordinal WHERE selected.blob_id=routes.blob_id AND selected.storage_language='rust' AND selected.persisted_relative_path=placement.rel_path)";
+pub(crate) const ROOT_REFERENCES_SQL: &str = r#"
+SELECT members.blob_id, routes.reference_source_site
+FROM main.rust_resolution_unit_summary_root_routes AS routes
+  INDEXED BY rust_resolution_unit_summary_root_routes_target
+CROSS JOIN main.resolution_unit_summary_members AS members
+  ON members.summary_id=routes.summary_id AND members.member_ordinal=routes.member_ordinal
+WHERE routes.target_unit_key=?1 AND routes.target_module_path=?2
+  AND routes.target_name=?3
+  AND EXISTS(SELECT 1 FROM selected_rust_unit_summary_route_owners AS owner
+    WHERE owner.summary_id=routes.summary_id)
+  AND EXISTS(SELECT 1 FROM temp.selected_resolution_mounts AS selected
+    INDEXED BY selected_resolution_mounts_blob_ordinal
+    WHERE selected.blob_id=members.blob_id AND selected.storage_language='rust'
+      AND selected.persisted_relative_path=members.rel_path)
+"#;
 /// Which selected Rust blobs carry a reference that looks one shared identity
 /// up. This is the tier-1 discovery half of every cross-blob reverse question:
 /// the blobs it names then answer from their own interiors.
@@ -994,7 +1155,7 @@ impl SelectedResolutionOperation<'_, '_> {
             }
             for row in conn
                 .prepare_cached(MODULE_SOURCES_SQL)?
-                .query_map(params![topology, module], |row| row.get::<_, i64>(0))?
+                .query_map(params![key, module], |row| row.get::<_, i64>(0))?
             {
                 sources.insert((row?, name.clone(), None));
             }
@@ -1210,7 +1371,9 @@ pub(crate) enum RustReverseConfirmation {
     /// blobs keep the answers they already proved. Raising it as an error
     /// discarded 137 other candidate blobs of one tract target and reported an
     /// analysis budget as an internal store error.
-    Bounded,
+    Bounded {
+        limit: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit,
+    },
     /// The request's soft time budget stopped confirmation before this blob
     /// could be confirmed across every selected root.
     TimeBudgetExceeded,
@@ -1652,7 +1815,7 @@ impl RustReverseQueries<'_, '_, '_> {
             let found = match confirm(selected, Path::new(&root), locators)? {
                 RustReverseConfirmation::Confirmed(found) => found,
                 outcome @ (RustReverseConfirmation::Cancelled
-                | RustReverseConfirmation::Bounded
+                | RustReverseConfirmation::Bounded { .. }
                 | RustReverseConfirmation::TimeBudgetExceeded) => return Ok(outcome),
             };
             assert_eq!(
@@ -1808,7 +1971,7 @@ impl RustReverseQueries<'_, '_, '_> {
                 RustReverseConfirmation::Cancelled => {
                     return Ok(RustContractCompletion::Cancelled);
                 }
-                RustReverseConfirmation::Bounded => {
+                RustReverseConfirmation::Bounded { .. } => {
                     return Ok(RustContractCompletion::Incomplete(
                         ResolutionCompletion::incomplete([
                             ResolutionIncompleteReason::ReceiverBudgetExhausted(definition),
@@ -2310,7 +2473,7 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
                     // The declared budget stopped this blob. Its sites stay
                     // unproven and say so; the target keeps every other blob's
                     // proved answers instead of losing the whole scan.
-                    RustReverseConfirmation::Bounded => {
+                    RustReverseConfirmation::Bounded { .. } => {
                         inventory.include(&ResolutionCompletion::incomplete([
                             ResolutionIncompleteReason::ReceiverBudgetExhausted(definition),
                         ]));
@@ -2896,7 +3059,7 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
     fn resolve_references(
         &mut self,
         references: &[SemanticId],
-    ) -> Result<Option<Vec<FactResolutionAnswer>>> {
+    ) -> Result<Option<Vec<ReferenceResolution>>> {
         let lexical = self.selected.ready.lexical_source();
         let observed_lexical = SeamProfiled::observing(&lexical);
         let Some(sites) = selected_reference_source_sites(
@@ -2936,32 +3099,60 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
                 .push((index, locator));
         }
         let mut answers_by_reference = std::iter::repeat_with(Vec::new)
+            .map(ReferenceResolution::Answered)
             .take(references.len())
-            .collect::<Vec<Vec<FactResolutionAnswer>>>();
+            .collect::<Vec<_>>();
         let mut evaluations = 0;
+        let mut time_budget_exceeded = false;
         for file_locators in locators_by_file.values() {
+            if time_budget_exceeded {
+                for (index, _) in file_locators {
+                    answers_by_reference[*index] =
+                        ReferenceResolution::Omitted(ReferenceOmission::TimeBudgetExceeded);
+                }
+                continue;
+            }
             let locators = file_locators
                 .iter()
                 .map(|(_, locator)| locator)
                 .collect::<Vec<_>>();
-            let RustReverseConfirmation::Confirmed(mut confirmed) = Self::confirm_locators(
+            let confirmation = Self::confirm_locators(
                 self.selected,
                 self.cancellation,
                 self.confirm,
                 &locators,
                 &HashSet::default(),
                 &mut evaluations,
-            )?
-            else {
-                return Ok(None);
+            )?;
+            let mut confirmed = match confirmation {
+                RustReverseConfirmation::Confirmed(confirmed) => confirmed,
+                RustReverseConfirmation::Cancelled => return Ok(None),
+                RustReverseConfirmation::Bounded { limit } => {
+                    for (index, _) in file_locators {
+                        answers_by_reference[*index] =
+                            ReferenceResolution::Omitted(ReferenceOmission::ReceiverBudget(limit));
+                    }
+                    continue;
+                }
+                RustReverseConfirmation::TimeBudgetExceeded => {
+                    time_budget_exceeded = true;
+                    for (index, _) in file_locators {
+                        answers_by_reference[*index] =
+                            ReferenceResolution::Omitted(ReferenceOmission::TimeBudgetExceeded);
+                    }
+                    continue;
+                }
             };
             assert_eq!(confirmed.len(), file_locators.len());
             for ((index, _), site_answers) in file_locators.iter().zip(confirmed.drain(..)) {
-                answers_by_reference[*index]
-                    .extend(site_answers.into_iter().map(|answer| answer.resolution));
+                let ReferenceResolution::Answered(answers) = &mut answers_by_reference[*index]
+                else {
+                    unreachable!("a confirmed reference has an answer slot");
+                };
+                answers.extend(site_answers.into_iter().map(|answer| answer.resolution));
             }
         }
-        Ok(Some(answers_by_reference.into_iter().flatten().collect()))
+        Ok(Some(answers_by_reference))
     }
 
     #[cfg(test)]
@@ -3183,9 +3374,49 @@ mod tests {
                 "{state:?}: target completeness must seek named gap rows: {plan:?}"
             );
             assert!(
+                plan.iter().any(|line| {
+                    line.contains(
+                        "SEARCH terminal USING COVERING INDEX source_rust_type_segments_name (name=? AND blob_id=?)",
+                    )
+                }),
+                "{state:?}: type-alias closure must seek segments by target name and host blob: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|line| {
+                    line.contains("SEARCH alias_unit USING PRIMARY KEY (blob_id=? AND unit_key=?)")
+                }),
+                "{state:?}: type-alias closure must seek declarations by blob and unit key: {plan:?}"
+            );
+            assert!(
                 plan.iter()
-                    .any(|line| line.contains("source_rust_type_segments_name")),
-                "{state:?}: type-alias closure must seek segments by target name: {plan:?}"
+                    .any(|line| line.contains("resolution_unit_summary_dependencies_unit")),
+                "{state:?}: reverse dependency closure must seek live child summaries by unit key: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|line| {
+                    line.contains(
+                        "rust_resolution_unit_summary_placements_member (summary_id=? AND member_ordinal=?)",
+                    )
+                }),
+                "{state:?}: selected module placements must seek summary placements by member: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|line| {
+                    line.contains("rust_resolution_unit_summary_import_routes_site")
+                }),
+                "{state:?}: alias closure must seek routes by source import identity: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|line| {
+                    line.contains("rust_resolution_unit_summary_dependency_names_extern")
+                }),
+                "{state:?}: external-route classification must seek the Rust dependency alias: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|line| { line.contains("SCAN gap USING INDEX resolution_gaps_identity") }),
+                "{state:?}: candidate completeness must not scan every gap: {plan:?}"
             );
             // Each name-keyed candidate branch seeks the name index per name. The
             // wildcard branches seek their constant key. None may scan the index.
@@ -3206,6 +3437,20 @@ mod tests {
                     line.contains("SCAN candidate USING COVERING INDEX resolution_rust_reverse_gap_candidates_name")
                 }),
                 "{state:?}: no candidate branch may scan the name index: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|line| {
+                    line.contains("idx_source_imports_identifier (identifier=? AND blob_id=?)")
+                }),
+                "{state:?}: bound import aliases must seek source imports by name and host blob: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|line| {
+                    line.contains(
+                        "idx_rust_import_targets_imported_name (imported_name=? AND blob_id=?",
+                    )
+                }),
+                "{state:?}: unresolved import aliases must seek by name and host blob: {plan:?}"
             );
             // The unresolved-alias closure arm drives from the unresolved source
             // imports, so each alias is reached by its source import key. Driving
@@ -3566,6 +3811,16 @@ mod tests {
                         |row| row.get(0),
                     )
                     .unwrap();
+                let mut root_pin = pinned("rust_reverse_root_references");
+                root_pin.params = vec![
+                    Value::Blob(key.clone()),
+                    Value::Text("crate".into()),
+                    Value::Text("target".into()),
+                ];
+                eprintln!(
+                    "root candidate plan unrelated={unrelated} {state}: {:?}",
+                    explain_pin(&conn, &root_pin)
+                );
                 let mut statement = conn.prepare(ROOT_REFERENCES_SQL).unwrap();
                 let rows = statement
                     .query_map(params![key, "crate", "target"], |row| {
@@ -3849,6 +4104,308 @@ mod tests {
     }
 
     #[test]
+    fn same_blob_type_export_readers_use_live_summary_rows() {
+        let fixture = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname='same_blob_exports'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file("src/lib.rs", "#[path=\"shared.rs\"] mod shared;\n")
+            .file(
+                "tests/summary.rs",
+                "#[path=\"../src/shared.rs\"] mod shared;\n",
+            )
+            .file(
+                "src/shared.rs",
+                "#[cfg(test)] pub struct Target;\n#[cfg(not(test))] pub struct Target;\n",
+            )
+            .build();
+        let analyzer = fixture.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let conn = store.conn.lock().unwrap();
+        crate::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
+        conn.execute("DELETE FROM selected_workspace_revisions", [])
+            .unwrap();
+        conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        prepare_pin_context(&conn);
+
+        let declarations: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT declaration_blob_id,declaration_site FROM rust_crate_exports
+                 WHERE namespace='type' AND name='Target' AND origin='declaration'
+                 ORDER BY declaration_site",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            declarations.len(),
+            2,
+            "target cfg alternatives: {declarations:?}"
+        );
+        let (blob, target_site) = declarations[0];
+
+        let legacy_keys_sql = "SELECT DISTINCT sites.semantic_key
+            FROM rust_crate_exports AS exports INDEXED BY rust_crate_exports_declaration
+            CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=exports.topology_id
+            CROSS JOIN source_native_declaration_bridges AS export_bridge
+              ON export_bridge.blob_id=exports.declaration_blob_id
+             AND export_bridge.source_site=exports.declaration_site
+            CROSS JOIN source_declaration_units AS export_unit
+              ON export_unit.blob_id=export_bridge.blob_id
+             AND export_unit.declaration_id=export_bridge.declaration_id
+            CROSS JOIN source_native_declaration_bridges AS target_bridge
+              ON target_bridge.blob_id=exports.declaration_blob_id AND target_bridge.source_site=?3
+            CROSS JOIN source_declaration_units AS target_unit
+              ON target_unit.blob_id=target_bridge.blob_id
+             AND target_unit.declaration_id=target_bridge.declaration_id
+             AND target_unit.unit_key=export_unit.unit_key
+            CROSS JOIN resolution_semantic_sites AS sites
+              ON sites.blob_id=exports.declaration_blob_id
+             AND sites.source_site=exports.declaration_site
+             AND sites.semantic_role='definition'
+            WHERE exports.declaration_blob_id=?1 AND exports.namespace='type'
+              AND exports.name=?2 AND exports.declaration_site<>?3";
+        let legacy_keys: Vec<i64> = conn
+            .prepare(legacy_keys_sql)
+            .unwrap()
+            .query_map(params![blob, "Target", target_site], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let summary_keys: Vec<i64> = conn
+            .prepare(SAME_BLOB_TYPE_EXPORT_KEYS_SQL)
+            .unwrap()
+            .query_map(params![blob, "Target", target_site], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(summary_keys, legacy_keys, "same-blob semantic keys");
+
+        let legacy_exports_sql = "SELECT exports.topology_id, owner.crate_key,
+                exports.module_path, 'type', exports.name, exports.visibility, 0
+            FROM rust_crate_exports AS exports INDEXED BY rust_crate_exports_declaration
+            CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=exports.topology_id
+            CROSS JOIN source_native_declaration_bridges AS export_bridge
+              ON export_bridge.blob_id=exports.declaration_blob_id
+             AND export_bridge.source_site=exports.declaration_site
+            CROSS JOIN source_declaration_units AS export_unit
+              ON export_unit.blob_id=export_bridge.blob_id
+             AND export_unit.declaration_id=export_bridge.declaration_id
+            CROSS JOIN source_native_declaration_bridges AS target_bridge
+              ON target_bridge.blob_id=exports.declaration_blob_id AND target_bridge.source_site=?3
+            CROSS JOIN source_declaration_units AS target_unit
+              ON target_unit.blob_id=target_bridge.blob_id
+             AND target_unit.declaration_id=target_bridge.declaration_id
+             AND target_unit.unit_key=export_unit.unit_key
+            WHERE exports.declaration_blob_id=?1 AND exports.namespace='type'
+              AND exports.name=?2 AND exports.declaration_site<>?3
+              AND EXISTS(SELECT 1 FROM rust_crate_container_sources AS source
+                         INDEXED BY rust_crate_containers_path
+                         WHERE source.topology_id=exports.topology_id
+                           AND source.container_path=exports.module_path
+                           AND source.blob_id=exports.declaration_blob_id
+                           AND source.rel_path=?4)";
+        let legacy_exports = conn
+            .prepare(legacy_exports_sql)
+            .unwrap()
+            .query_map(params![blob, "Target", target_site, "src/lib.rs"], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let summary_exports = conn
+            .prepare(SAME_BLOB_TYPE_EXPORTS_SQL)
+            .unwrap()
+            .query_map(params![blob, "Target", target_site, "src/lib.rs"], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(summary_exports, legacy_exports, "same-blob exports");
+
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            for (name, sql, params, indexes) in [
+                (
+                    "same_blob_type_export_keys",
+                    SAME_BLOB_TYPE_EXPORT_KEYS_SQL,
+                    vec![
+                        Value::Integer(blob),
+                        Value::Text("Target".into()),
+                        Value::Integer(target_site),
+                    ],
+                    &[
+                        "resolution_unit_summary_members_blob",
+                        "rust_resolution_unit_summary_exports_declaration",
+                    ][..],
+                ),
+                (
+                    "same_blob_type_exports",
+                    SAME_BLOB_TYPE_EXPORTS_SQL,
+                    vec![
+                        Value::Integer(blob),
+                        Value::Text("Target".into()),
+                        Value::Integer(target_site),
+                        Value::Text("src/lib.rs".into()),
+                    ],
+                    &[
+                        "resolution_unit_summary_members_blob",
+                        "rust_resolution_unit_summary_placements_member",
+                        "rust_resolution_unit_summary_exports_declaration",
+                    ][..],
+                ),
+            ] {
+                let pin = crate::analyzer::store::planner_statistics::pinned_plans::PinnedQuery {
+                    name: name.to_owned(),
+                    sql: sql.to_owned(),
+                    params,
+                };
+                let plan = explain_pin(&conn, &pin);
+                for index in indexes {
+                    assert!(
+                        plan.iter().any(|row| row.contains(index)),
+                        "{state:?} {name} requires {index}: {plan:?}"
+                    );
+                }
+                assert!(
+                    !plan.iter().any(|row| row.contains("AUTOMATIC")),
+                    "{state:?} {name}: {plan:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_target_workspace_dependency_uses_live_summary_aliases() {
+        let fixture = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[workspace]\nmembers=['api','app']\nresolver='2'\n",
+            )
+            .file(
+                "api/Cargo.toml",
+                "[package]\nname='api'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file("api/src/lib.rs", "pub fn target() {}\n")
+            .file(
+                "app/Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dev-dependencies]\nrenamed_api={package='api',path='../api'}\n",
+            )
+            .file("app/src/lib.rs", "pub fn app() {}\n")
+            .file("app/tests/integration.rs", "#[test] fn test() {}\n")
+            .build();
+        let analyzer = fixture.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let conn = store.conn.lock().unwrap();
+        crate::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
+        conn.execute("DELETE FROM selected_workspace_revisions", [])
+            .unwrap();
+        conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        prepare_pin_context(&conn);
+        conn.execute(
+            "INSERT INTO temp.selected_resolution_mounts(
+                mount_ordinal,blob_id,storage_language,persisted_relative_path)
+             SELECT 0,blob_id,'rust','app/src/lib.rs'
+             FROM selected_rust_crate_containers WHERE rel_path='app/src/lib.rs' LIMIT 1",
+            [],
+        )
+        .unwrap();
+
+        let legacy_sql = r#"
+SELECT
+ EXISTS(
+   SELECT 1
+   FROM selected_rust_module_placements AS placement
+   JOIN rust_crate_dependencies AS dependency USING(topology_id)
+   WHERE placement.mount_ordinal=?1 AND dependency.extern_name=?2
+ ),
+ EXISTS(
+   SELECT 1
+   FROM selected_rust_module_placements AS placement
+   JOIN rust_crate_versions AS current_version
+     ON current_version.topology_id=placement.topology_id
+    AND current_version.valid_until IS NULL
+    AND current_version.manifest_file_version_id IS NOT NULL
+   JOIN selected_rust_crates AS sibling
+     ON sibling.topology_id<>current_version.topology_id
+   JOIN rust_crate_versions AS sibling_version
+     ON sibling_version.topology_id=sibling.topology_id
+    AND sibling_version.workspace_id=current_version.workspace_id
+    AND sibling_version.lang=current_version.lang
+    AND sibling_version.generation=current_version.generation
+    AND sibling_version.manifest_file_version_id=current_version.manifest_file_version_id
+    AND sibling_version.valid_until IS NULL
+   JOIN rust_crate_dependencies AS sibling_dependency
+     ON sibling_dependency.topology_id=sibling_version.topology_id
+    AND sibling_dependency.extern_name=?2
+    AND sibling_dependency.boundary='workspace'
+   WHERE placement.mount_ordinal=?1
+ )
+"#;
+        let legacy: (bool, bool) = conn
+            .query_row(legacy_sql, params![0, "renamed_api"], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        let summary: (bool, bool) = conn
+            .query_row(
+                OTHER_TARGET_WORKSPACE_DEPENDENCY_SQL,
+                params![0, "renamed_api"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(summary, legacy, "cross-target dependency alias");
+        assert!(
+            summary.1,
+            "the sibling target sees the dev dependency: {summary:?}"
+        );
+
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            let pin = crate::analyzer::store::planner_statistics::pinned_plans::PinnedQuery {
+                name: "other_target_workspace_dependency".to_owned(),
+                sql: OTHER_TARGET_WORKSPACE_DEPENDENCY_SQL.to_owned(),
+                params: vec![Value::Integer(0), Value::Text("renamed_api".into())],
+            };
+            let plan = explain_pin(&conn, &pin);
+            for index in [
+                "rust_resolution_unit_summary_dependency_names_extern",
+                "rust_resolution_unit_summary_versions_manifest",
+            ] {
+                assert!(
+                    plan.iter().any(|row| row.contains(index)),
+                    "{state:?} other-target dependency requires {index}: {plan:?}"
+                );
+            }
+            assert!(
+                !plan.iter().any(|row| row.contains("AUTOMATIC")),
+                "{state:?}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
     fn reverse_rows_export_and_import_work_is_independent_of_unrelated_inventory() {
         let mut measurements = Vec::new();
         for unrelated in [0, 32] {
@@ -3858,8 +4415,10 @@ mod tests {
                 .file("barrel/Cargo.toml", "[package]\nname='barrel'\nversion='0.1.0'\nedition='2021'\n[dependencies]\napi={path='../api'}\n")
                 .file("client/Cargo.toml", "[package]\nname='client'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nbarrel={path='../barrel'}\n")
                 .file("barrel/src/lib.rs", "pub use api::target as renamed; pub use api::*;\n")
-                .file("client/src/lib.rs", "use barrel::renamed as local; pub fn caller() { local(); }\n");
-            let mut api = "pub fn target() {}\n".to_owned();
+                .file("client/src/lib.rs", "use barrel::renamed as local; use barrel::*; pub fn caller() { local(); }\n");
+            let mut api =
+                "pub fn target() {}\n#[macro_export]\nmacro_rules! sample { () => {}; }\n"
+                    .to_owned();
             for index in 0..unrelated {
                 api.push_str(&format!("pub mod decoy{index};\n"));
                 builder = builder.file(
@@ -3879,8 +4438,121 @@ mod tests {
             conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,semantic_language,producer_epoch,interior_digest,persisted_relative_path) SELECT row_number() OVER(), member.blob_id, 'rust', interior.semantic_language, interior.producer_epoch, interior.interior_digest, member.rel_path FROM (SELECT DISTINCT blob_id,rel_path FROM selected_rust_crate_containers) AS member JOIN resolution_fragment_interiors AS interior USING(blob_id)", []).unwrap();
 
             let (blob, site): (i64, i64) = conn.query_row("SELECT declaration_blob_id,declaration_site FROM rust_crate_exports e JOIN rust_crate_topologies t USING(topology_id) WHERE t.crate_name='api' AND e.name='target'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
-            let (topology, key): (i64, Vec<u8>) = conn.query_row("SELECT topology_id,crate_key FROM selected_rust_crates WHERE crate_name='barrel'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+            let key: Vec<u8> = conn
+                .query_row(
+                    "SELECT crate_key FROM selected_rust_crates WHERE crate_name='barrel'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let legacy_activation_sql = r#"
+SELECT properties.cfg_condition, json(owner.cfg_atoms), owner.target_kind
+FROM source_declaration_units AS units
+CROSS JOIN source_native_declaration_bridges AS bridge
+  ON bridge.blob_id=units.blob_id AND bridge.declaration_id=units.declaration_id
+CROSS JOIN resolution_semantic_sites AS site
+  ON site.blob_id=bridge.blob_id AND site.source_site=bridge.source_site
+ AND site.semantic_role='definition'
+CROSS JOIN source_rust_declaration_properties AS properties
+  ON properties.blob_id=bridge.blob_id AND properties.declaration_id=bridge.declaration_id
+CROSS JOIN rust_crate_container_sources AS sources INDEXED BY rust_crate_containers_blob
+  ON sources.blob_id=site.blob_id
+CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=sources.topology_id
+WHERE units.blob_id=?1 AND units.unit_key=(
+  SELECT target_units.unit_key
+  FROM source_native_declaration_bridges AS target_bridge
+  CROSS JOIN source_declaration_units AS target_units
+    ON target_units.blob_id=target_bridge.blob_id
+   AND target_units.declaration_id=target_bridge.declaration_id
+  WHERE target_bridge.blob_id=?1 AND target_bridge.source_site=?2
+)
+"#;
+            let legacy_activation = conn
+                .prepare(legacy_activation_sql)
+                .unwrap()
+                .query_map(params![blob, site], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let summary_activation = conn
+                .prepare(BASE_TARGET_ACTIVATION_SQL)
+                .unwrap()
+                .query_map(params![blob, site], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(summary_activation, legacy_activation, "target activation");
             let client_blob: i64 = conn.query_row("SELECT blob_id FROM selected_rust_crate_containers WHERE rel_path='client/src/lib.rs'", [], |row| row.get(0)).unwrap();
+            let legacy_caller_roots_sql = r#"
+WITH source(blob_id,persisted_relative_path) AS (
+ SELECT blob_id,persisted_relative_path FROM temp.selected_resolution_mounts
+ WHERE storage_language='rust' AND persisted_relative_path=?1
+ UNION ALL
+ SELECT blob.id,mask.persisted_relative_path
+ FROM temp.selected_resolution_overlay_masks AS mask
+ CROSS JOIN workspace_file_versions AS version
+   ON version.file_version_id=mask.masked_file_version_id
+ CROSS JOIN blobs AS blob
+   ON blob.blob_oid=version.blob_oid AND blob.lang=version.lang
+  AND blob.generation=version.generation
+ WHERE mask.storage_language='rust' AND mask.persisted_relative_path=?1
+)
+SELECT DISTINCT roots.rel_path
+FROM source
+CROSS JOIN rust_crate_container_sources AS placement INDEXED BY rust_crate_containers_blob
+  ON placement.blob_id=source.blob_id AND placement.rel_path=source.persisted_relative_path
+CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=placement.topology_id
+CROSS JOIN rust_crate_container_sources AS roots
+  ON roots.topology_id=owner.topology_id AND roots.container_path='crate'
+WHERE roots.source_kind='declared'
+  AND (owner.target_kind<>'detached' OR NOT EXISTS(
+    SELECT 1
+    FROM rust_crate_container_sources AS parent INDEXED BY rust_crate_containers_blob
+    CROSS JOIN selected_rust_crates AS container ON container.topology_id=parent.topology_id
+    WHERE parent.blob_id=roots.blob_id AND parent.rel_path=roots.rel_path
+      AND parent.topology_id<>owner.topology_id AND parent.container_path<>'crate'
+      AND container.target_kind='detached'
+  ))
+"#;
+            let caller_paths = if unrelated > 0 {
+                vec!["client/src/lib.rs", "api/src/decoy0.rs"]
+            } else {
+                vec!["client/src/lib.rs"]
+            };
+            for candidate_path in caller_paths {
+                let mut legacy_roots = conn
+                    .prepare(legacy_caller_roots_sql)
+                    .unwrap()
+                    .query_map([candidate_path], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                let mut summary_roots = conn
+                    .prepare(CALLER_ROOTS_SQL)
+                    .unwrap()
+                    .query_map([candidate_path], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                legacy_roots.sort();
+                summary_roots.sort();
+                assert_eq!(
+                    summary_roots, legacy_roots,
+                    "caller roots for {candidate_path}"
+                );
+            }
             let oracle = conn.prepare("SELECT topology_id,module_path,namespace,name FROM rust_crate_exports_reachable WHERE declaration_blob_id=?1 AND declaration_site=?2 ORDER BY 1,2,3,4").unwrap().query_map(params![blob, site], |row| Ok((row.get::<_, i64>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
             assert_eq!(oracle.len(), 3, "{oracle:?}");
             for state in PlannerStatisticsState::BOTH {
@@ -3908,6 +4580,130 @@ mod tests {
                 rows.dedup();
                 assert_eq!(rows, oracle, "{state:?}");
                 let export_work = statement.get_status(rusqlite::StatementStatus::VmStep);
+                let mut legacy_module_statement = conn
+                    .prepare(
+                        "SELECT candidate.blob_id
+                         FROM rust_crate_container_sources AS candidate
+                         CROSS JOIN selected_rust_crate_containers AS selected
+                           ON selected.topology_id=candidate.topology_id
+                          AND selected.container_path=candidate.container_path
+                          AND selected.rel_path=candidate.rel_path
+                          AND selected.blob_id=candidate.blob_id
+                         WHERE candidate.topology_id=(
+                           SELECT topology_id FROM selected_rust_crates WHERE crate_key=?1)
+                           AND candidate.container_path=?2",
+                    )
+                    .unwrap();
+                let mut legacy_module_sources = legacy_module_statement
+                    .query_map(params![key, "crate"], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                let mut summary_module_statement = conn.prepare(MODULE_SOURCES_SQL).unwrap();
+                let mut summary_module_sources = summary_module_statement
+                    .query_map(params![key, "crate"], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                legacy_module_sources.sort_unstable();
+                legacy_module_sources.dedup();
+                summary_module_sources.sort_unstable();
+                summary_module_sources.dedup();
+                assert_eq!(
+                    summary_module_sources, legacy_module_sources,
+                    "{state:?} module sources"
+                );
+                assert_eq!(summary_module_sources.len(), 1, "{state:?} module source");
+                let mut legacy_macro_statement = conn
+                    .prepare(
+                        "SELECT member.blob_id
+                         FROM rust_crate_container_sources AS placement
+                           INDEXED BY rust_crate_containers_blob
+                         CROSS JOIN selected_rust_crates AS owner
+                           ON owner.topology_id=placement.topology_id
+                         CROSS JOIN rust_crate_container_sources AS member
+                           INDEXED BY rust_crate_containers_path
+                           ON member.topology_id=placement.topology_id
+                         WHERE placement.blob_id=?1 AND EXISTS(
+                           SELECT 1 FROM temp.selected_resolution_mounts AS selected
+                             INDEXED BY selected_resolution_mounts_blob_ordinal
+                           WHERE selected.blob_id=member.blob_id
+                             AND selected.storage_language='rust'
+                             AND selected.persisted_relative_path=member.rel_path)",
+                    )
+                    .unwrap();
+                let mut legacy_macro_sources = legacy_macro_statement
+                    .query_map([blob], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                let mut summary_macro_statement = conn.prepare(TEXTUAL_MACRO_SOURCES_SQL).unwrap();
+                let mut summary_macro_sources = summary_macro_statement
+                    .query_map([blob], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                legacy_macro_sources.sort_unstable();
+                legacy_macro_sources.dedup();
+                summary_macro_sources.sort_unstable();
+                summary_macro_sources.dedup();
+                assert_eq!(
+                    summary_macro_sources, legacy_macro_sources,
+                    "{state:?} macro sources"
+                );
+                assert_eq!(
+                    summary_macro_sources.len(),
+                    unrelated as usize + 1,
+                    "{state:?} textual macro scope"
+                );
+                let mut legacy_import_statement = conn
+                    .prepare(
+                        "SELECT sources.blob_id, imports.bound_name,
+                                CASE WHEN sources.blob_id=imports.blob_id
+                                     THEN imports.binder_scope END,
+                                imports.topology_id, owner.crate_key, imports.module_path
+                         FROM rust_crate_imports AS imports
+                         CROSS JOIN selected_rust_crates AS owner
+                           ON owner.topology_id=imports.topology_id
+                         CROSS JOIN rust_crate_container_sources AS sources
+                           ON sources.topology_id=imports.topology_id
+                          AND sources.container_path=imports.module_path
+                         WHERE imports.target_crate_key=?1
+                           AND imports.target_module_path=?2 AND imports.target_name=?3",
+                    )
+                    .unwrap();
+                let mut legacy_imports = legacy_import_statement
+                    .query_map(params![key, "crate", "renamed"], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<u32>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                let mut summary_import_statement = conn.prepare(IMPORTS_SQL).unwrap();
+                let mut summary_imports = summary_import_statement
+                    .query_map(params![key, "crate", "renamed"], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<u32>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                legacy_imports.sort();
+                summary_imports.sort();
+                assert_eq!(summary_imports, legacy_imports, "{state:?} imports");
                 let mut import_pin = pinned("rust_reverse_imports");
                 import_pin.params = vec![
                     Value::Blob(key.clone()),
@@ -3924,6 +4720,52 @@ mod tests {
                     .unwrap();
                 assert_eq!(bindings, [(client_blob, "local".into())]);
                 let import_work = imports.get_status(rusqlite::StatementStatus::VmStep);
+                let mut legacy_glob_statement = conn
+                    .prepare(
+                        "SELECT sources.blob_id,
+                                CASE WHEN sources.blob_id=imports.blob_id
+                                     THEN imports.binder_scope END,
+                                imports.topology_id, owner.crate_key, imports.module_path
+                         FROM rust_crate_glob_imports AS imports
+                         CROSS JOIN selected_rust_crates AS owner
+                           ON owner.topology_id=imports.topology_id
+                         CROSS JOIN rust_crate_container_sources AS sources
+                           ON sources.topology_id=imports.topology_id
+                          AND sources.container_path=imports.module_path
+                         WHERE imports.target_crate_key=?1 AND imports.target_module_path=?2",
+                    )
+                    .unwrap();
+                let mut legacy_globs = legacy_glob_statement
+                    .query_map(params![key, "crate"], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<u32>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                let mut summary_glob_statement = conn.prepare(GLOBS_SQL).unwrap();
+                let mut summary_globs = summary_glob_statement
+                    .query_map(params![key, "crate"], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<u32>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                legacy_globs.sort();
+                summary_globs.sort();
+                assert_eq!(summary_globs, legacy_globs, "{state:?} globs");
+                assert_eq!(summary_globs.len(), 1, "{state:?} glob route");
                 measurements.push((unrelated, state, export_work, import_work));
                 let cases = [
                     (
@@ -3964,7 +4806,7 @@ mod tests {
                             p.params = vec![Value::Integer(blob), Value::Integer(site)];
                             p
                         },
-                        "rust_crate_containers_blob",
+                        "resolution_unit_summary_members_blob",
                     ),
                     (
                         {
@@ -3984,7 +4826,7 @@ mod tests {
                             ];
                             p
                         },
-                        "rust_crate_root_references_target",
+                        "rust_resolution_unit_summary_root_routes_target",
                     ),
                     (
                         {
@@ -3992,7 +4834,7 @@ mod tests {
                             p.params = vec![Value::Integer(0), Value::Integer(0)];
                             p
                         },
-                        "rust_crate_containers_blob",
+                        "resolution_unit_summary_members_blob",
                     ),
                     (
                         {
@@ -4025,26 +4867,40 @@ mod tests {
                             p.params = vec![Value::Text("client/src/lib.rs".into())];
                             p
                         },
-                        "rust_crate_containers_blob",
+                        "resolution_unit_summary_members_blob",
                     ),
                     (pinned("rust_graph_definitions"), "SEARCH site USING"),
-                    (export_pin, "rust_crate_exports_declaration"),
-                    (import_pin, "rust_crate_imports_target"),
+                    (
+                        export_pin,
+                        "rust_resolution_unit_summary_exports_declaration",
+                    ),
+                    (
+                        import_pin,
+                        "rust_resolution_unit_summary_import_routes_target_identity",
+                    ),
                     (
                         {
                             let mut p = pinned("rust_reverse_globs");
                             p.params = vec![Value::Blob(key.clone()), Value::Text("crate".into())];
                             p
                         },
-                        "rust_crate_glob_imports_target",
+                        "rust_resolution_unit_summary_glob_imports_target_identity",
                     ),
                     (
                         {
                             let mut p = pinned("rust_reverse_module_sources");
-                            p.params = vec![Value::Integer(topology), Value::Text("crate".into())];
+                            p.params = vec![Value::Blob(key.clone()), Value::Text("crate".into())];
                             p
                         },
-                        "SEARCH candidate USING PRIMARY KEY",
+                        "SEARCH placement USING PRIMARY KEY",
+                    ),
+                    (
+                        {
+                            let mut p = pinned("rust_reverse_textual_macro_sources");
+                            p.params = vec![Value::Integer(blob)];
+                            p
+                        },
+                        "resolution_unit_summary_members_blob",
                     ),
                     (
                         {
@@ -4067,6 +4923,27 @@ mod tests {
                         "{state:?} {}: {plan:?}",
                         pin.name
                     );
+                    if pin.name == "rust_reverse_root_references" {
+                        assert!(
+                            plan.iter().any(|row| {
+                                row.contains("rust_resolution_unit_summary_root_routes_target")
+                            }),
+                            "{state:?} {} must seek live root routes by target identity: {plan:?}",
+                            pin.name
+                        );
+                    }
+                    if pin.name == "rust_reverse_exports" {
+                        for index in [
+                            "rust_resolution_unit_summary_reexport_routes_target_identity",
+                            "rust_resolution_unit_summary_glob_reexport_routes_target_identity",
+                        ] {
+                            assert!(
+                                plan.iter().any(|row| row.contains(index)),
+                                "{state:?} {} must seek route targets with {index}: {plan:?}",
+                                pin.name
+                            );
+                        }
+                    }
                     for table in [
                         "exports", "routes", "imports", "paths", "sites", "names", "sources",
                     ] {

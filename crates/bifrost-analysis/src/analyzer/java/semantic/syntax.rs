@@ -3,6 +3,33 @@ use crate::analyzer::common::is_comment_kind;
 use crate::analyzer::semantic::lowering::field_matches;
 pub(super) use brokk_bifrost_jvm::java::declarations::java_field_access_is_selector_object;
 
+/// Find the first direct explicit constructor invocation, charging each named
+/// child inspected through the caller-owned traversal budget and cancellation.
+/// Java requires this invocation to precede every other non-comment body child.
+pub(super) fn first_explicit_constructor_invocation<'tree, E>(
+    body: Node<'tree>,
+    mut visit: impl FnMut() -> Result<(), E>,
+) -> Result<Option<Node<'tree>>, E> {
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        visit()?;
+        if is_comment_kind(child.kind()) {
+            continue;
+        }
+        return Ok((child.kind() == "explicit_constructor_invocation").then_some(child));
+    }
+    Ok(None)
+}
+
+/// Whether an already identified explicit constructor invocation delegates to
+/// `this`. The `constructor` field is the `this`/`super` target; `object` is
+/// only an optional qualifier such as `Outer.super`.
+pub(super) fn invocation_delegates_to_this(invocation: Node<'_>) -> bool {
+    invocation
+        .child_by_field_name("constructor")
+        .is_some_and(|constructor| constructor.kind() == "this")
+}
+
 pub(super) fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
     match node.kind() {
         "class_declaration"
@@ -135,7 +162,11 @@ pub(super) fn callable_shape<'tree>(
             dispatch_extensibility,
             call_boundary: ProcedureCallBoundary::Direct,
             receiver_binding: Default::default(),
-            construction_return: Default::default(),
+            construction_return: if kind == ProcedureKind::Constructor {
+                ConstructionReturn::PreservesAllocation
+            } else {
+                ConstructionReturn::default()
+            },
         },
     ))
 }

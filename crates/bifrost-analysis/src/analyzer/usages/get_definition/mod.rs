@@ -909,9 +909,26 @@ pub(crate) struct ExactExternalCallProof {
     /// binding that promoted this proof.
     python_formal_slots: Option<Box<[crate::analyzer::lexical_definitions::FormalParameterSlot]>>,
     python_model_manifest_sha256: Option<Box<str>>,
+    external_member_identity: Option<crate::analyzer::resolution::ExternalMemberIdentity>,
 }
 
 impl ExactExternalCallProof {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_external_member_identity(
+        mut self,
+        identity: Option<crate::analyzer::resolution::ExternalMemberIdentity>,
+    ) -> Self {
+        self.external_member_identity = identity;
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn external_member_identity(
+        &self,
+    ) -> Option<&crate::analyzer::resolution::ExternalMemberIdentity> {
+        self.external_member_identity.as_ref()
+    }
+
     fn package_function(canonical_callee: impl Into<Box<str>>, parameter_count: u32) -> Self {
         Self {
             canonical_callee: canonical_callee.into(),
@@ -922,6 +939,7 @@ impl ExactExternalCallProof {
             python_runtime_artifact: None,
             python_model_manifest_sha256: None,
             python_formal_slots: None,
+            external_member_identity: None,
         }
     }
 
@@ -935,6 +953,7 @@ impl ExactExternalCallProof {
             python_runtime_artifact: None,
             python_model_manifest_sha256: None,
             python_formal_slots: None,
+            external_member_identity: None,
         }
     }
 
@@ -958,6 +977,7 @@ impl ExactExternalCallProof {
             python_runtime_artifact: None,
             python_model_manifest_sha256: None,
             python_formal_slots: None,
+            external_member_identity: None,
         }
     }
 
@@ -974,6 +994,7 @@ impl ExactExternalCallProof {
             python_runtime_artifact: None,
             python_model_manifest_sha256: None,
             python_formal_slots: None,
+            external_member_identity: None,
         }
     }
 
@@ -994,6 +1015,7 @@ impl ExactExternalCallProof {
             python_runtime_artifact: None,
             python_model_manifest_sha256: None,
             python_formal_slots: None,
+            external_member_identity: None,
         }
     }
 
@@ -1019,6 +1041,7 @@ impl ExactExternalCallProof {
             python_runtime_artifact: None,
             python_model_manifest_sha256: None,
             python_formal_slots: None,
+            external_member_identity: None,
         }
     }
 
@@ -1229,6 +1252,7 @@ impl ExactExternalCallProof {
             python_runtime_artifact: None,
             python_model_manifest_sha256: None,
             python_formal_slots: None,
+            external_member_identity: None,
         }
     }
 
@@ -1282,6 +1306,7 @@ impl ExactExternalCallProof {
             python_runtime_artifact: None,
             python_model_manifest_sha256: None,
             python_formal_slots: None,
+            external_member_identity: None,
         }
     }
 
@@ -1305,6 +1330,7 @@ impl ExactExternalCallProof {
             python_runtime_artifact: None,
             python_model_manifest_sha256: None,
             python_formal_slots: None,
+            external_member_identity: None,
         }
     }
 
@@ -4546,6 +4572,41 @@ fn resolve_one_with_evidence<'a, 'batch, 'factory>(
             }
             None => {}
         }
+    }
+    // The native Java route keeps the richer entry point so that the call
+    // evidence it proves reaches the call-graph consumers, which the
+    // outcome-only JVM rollout points cannot carry.
+    #[cfg(any(test, feature = "test-support"))]
+    if language == Language::Java && std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some() {
+        let query = crate::analyzer::languages::BoundedReceiverQuery {
+            analyzer,
+            file: &request.file,
+            source: &source,
+            tree: tree.as_ref(),
+            site: &site,
+            budget: crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            cancellation,
+        };
+        return match crate::analyzer::java::native_points::resolve_java_definition_with_evidence_bounded(
+            query,
+            || {},
+        ) {
+            BoundedResolution::Complete { value, .. } => DefinitionResolution {
+                outcome: value.outcome,
+                evidence: value.evidence,
+            },
+            BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
+                limit,
+                format!(
+                    "{language:?} definition resolution exceeded its {} budget",
+                    limit.as_str()
+                ),
+            )
+            .into(),
+            BoundedResolution::Cancelled { .. } => {
+                cancelled(format!("{language:?} definition resolution was cancelled")).into()
+            }
+        };
     }
     #[cfg(any(test, feature = "test-support"))]
     if (language == Language::Scala && std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some())

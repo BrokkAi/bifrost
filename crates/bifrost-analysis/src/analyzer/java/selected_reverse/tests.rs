@@ -605,11 +605,15 @@ fn java_native_rename_refuses_unproven_method_call_before_counterfactual() {
         &CancellationToken::new(),
     )
     .expect_err("the replacement method would capture the child call site");
-    assert_eq!(error.kind, "incomplete_analysis", "{error:?}");
-    assert!(error.message.contains("original Java inverse evidence"));
+    // The call's evidence is complete: the unindexed Object superclass of
+    // `Base` cannot declare `oldName`. The rename is still refused, by the
+    // counterfactual capture check instead of before it.
+    assert_eq!(error.kind, "capture_or_rebinding", "{error:?}");
     assert!(
-        error.message.contains("InverseIndexResolutionIncomplete"),
-        "method-call applicability remains explicitly incomplete: {error:?}"
+        error
+            .message
+            .contains("Java rename changes selected binding sites"),
+        "{error:?}"
     );
 }
 

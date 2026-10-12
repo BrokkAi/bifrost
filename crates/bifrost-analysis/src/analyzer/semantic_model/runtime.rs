@@ -328,6 +328,18 @@ pub struct ActiveSemanticModelShard {
 }
 
 impl ActiveSemanticModelShard {
+    pub(crate) fn independently_enumerates_jvm_owner(&self, owner: &TypeFact) -> bool {
+        owner.guard.is_none()
+            && (matches!(
+                self.source_kind,
+                CatalogPackSourceKind::Generated | CatalogPackSourceKind::WorkspaceProduced
+            ) || (self.source_kind == CatalogPackSourceKind::Installed
+                && matches!(
+                    owner.locator,
+                    super::Locator::Artifact { .. } | super::Locator::Source { .. }
+                )))
+    }
+
     /// Whether the evidence this shard activated against proves the guarded
     /// record absent.
     ///
@@ -2860,6 +2872,7 @@ pub(crate) fn degrade_pack_gap_absences(
 pub(crate) struct SemanticModelRuntimeCache {
     values: CompleteValueCache<String, ResolvedActiveSemanticModels>,
     published: Mutex<PublishedSemanticModelState>,
+    inventory_store: std::sync::OnceLock<std::sync::Weak<AnalyzerStore>>,
 }
 
 #[derive(Default)]
@@ -2888,7 +2901,22 @@ impl SemanticModelRuntimeCache {
                 |_, active| u32::try_from(active.retained_bytes()).unwrap_or(u32::MAX),
             ),
             published: Mutex::new(PublishedSemanticModelState::default()),
+            inventory_store: std::sync::OnceLock::new(),
         }
+    }
+
+    pub(crate) fn bind_inventory_store(&self, store: &Arc<AnalyzerStore>) {
+        let bound = self.inventory_store.get_or_init(|| Arc::downgrade(store));
+        assert!(
+            std::sync::Weak::ptr_eq(bound, &Arc::downgrade(store)),
+            "one analyzer snapshot cache belongs to one native store"
+        );
+    }
+
+    pub(crate) fn native_inventory_store(&self) -> Option<Arc<AnalyzerStore>> {
+        self.inventory_store
+            .get()
+            .and_then(std::sync::Weak::upgrade)
     }
 
     /// Retain discovery evidence for trace tests without invoking discovery
@@ -3627,7 +3655,7 @@ pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
             return stale_generation_outcome(request.limits);
         }
         if let SemanticModelResolutionOutcome::Ready(active) = &outcome
-            && let Err(error) = publish_active_models(catalog, persistence, active)
+            && let Err(error) = publish_active_models(analyzer, catalog, persistence, active)
         {
             return catalog_lifecycle_error(request.limits, "publish", error);
         }
@@ -3644,7 +3672,7 @@ pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
             if !content_is_current() {
                 return stale_generation_outcome(request.limits);
             }
-            if let Err(error) = publish_active_models(catalog, persistence, &value) {
+            if let Err(error) = publish_active_models(analyzer, catalog, persistence, &value) {
                 return catalog_lifecycle_error(request.limits, "publish", error);
             }
             let snapshot = match caches.semantic_models().publish_overlay(
@@ -3681,7 +3709,7 @@ pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
                 return stale_generation_outcome(request.limits);
             }
             let active = Arc::new(active);
-            if let Err(error) = publish_active_models(catalog, persistence, &active) {
+            if let Err(error) = publish_active_models(analyzer, catalog, persistence, &active) {
                 return catalog_lifecycle_error(request.limits, "publish", error);
             }
             let snapshot = match caches.semantic_models().publish_overlay(
@@ -3740,14 +3768,28 @@ fn overlay_build_outcome(
 }
 
 fn publish_active_models(
+    analyzer: &dyn IAnalyzer,
     catalog: &SemanticPackCatalog,
     persistence: Option<SemanticModelActivationPersistence<'_>>,
     active: &ResolvedActiveSemanticModels,
 ) -> Result<(), super::CatalogError> {
     let _scope = crate::profiling::scope("semantic_pack.publish_active_set");
+    let native_store = analyzer
+        .snapshot_caches()
+        .and_then(|caches| caches.semantic_models().inventory_store.get())
+        .and_then(std::sync::Weak::upgrade);
+    if let Some(store) = native_store.as_ref() {
+        publish_jvm_inventory_rows(store, active)?;
+    }
     let Some(persistence) = persistence else {
         return Ok(());
     };
+    if native_store
+        .as_ref()
+        .is_none_or(|store| !std::ptr::eq(store.as_ref(), persistence.store))
+    {
+        publish_jvm_inventory_rows(persistence.store, active)?;
+    }
     let mut members = active
         .shards
         .iter()
@@ -3763,6 +3805,22 @@ fn publish_active_models(
     catalog
         .replace_workspace_active_set(persistence.scope_id, persistence.store, &members)
         .map(|_| ())
+}
+
+fn publish_jvm_inventory_rows(
+    store: &AnalyzerStore,
+    active: &ResolvedActiveSemanticModels,
+) -> Result<(), super::CatalogError> {
+    for shard in &active.shards {
+        store
+            .publish_jvm_external_owner_inventory(shard)
+            .map_err(|error| {
+                super::CatalogError::Integrity(format!(
+                    "JVM external owner publication failed: {error}"
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 fn activation_source_kind(kind: CatalogPackSourceKind) -> SemanticPackActivationSourceKind {

@@ -172,7 +172,7 @@ pub(crate) fn lower_metadata(
         return (Vec::new(), Vec::new());
     }
     facts.validate_package_relations();
-    let index = FactIndex::new(facts);
+    let index = FactIndex::new(language, facts);
     let domain = domain(identities, language);
     let mut references = Vec::new();
     for fact in &facts.package_references {
@@ -252,6 +252,9 @@ pub(crate) fn lower_metadata(
                 .filter(|fact| fact.declaration == export.member)
                 .map(|fact| fact.namespace),
         );
+        if index.value_aliased_callables.contains(&export.member) {
+            namespaces.push(ResolutionNamespace::Value);
+        }
         namespaces.sort_unstable();
         namespaces.dedup();
         for namespace in namespaces {
@@ -324,7 +327,7 @@ pub(super) fn lower_paths(
         return;
     }
     let (references, members) = lower_metadata(identities, language, facts);
-    let index = FactIndex::new(facts);
+    let index = FactIndex::new(language, facts);
     let scope_reasons = root_scope_gap_reasons(identities, &index, gap_sources);
     let mut emitted_reference_groups = HashSet::default();
     let mut reference_rows = references.iter();
@@ -611,7 +614,7 @@ mod tests {
             .join("\n");
         let source = format!("package p\nfunc use() {{\n{uses}\n}}\n");
         let (facts, lowered) = parsed("go-shared-package-reference", &source);
-        let index = FactIndex::new(&facts);
+        let index = FactIndex::new(Language::Go, &facts);
         let mut names = BTreeMap::<String, usize>::new();
         for fact in &facts.package_references {
             let identifier = index.identifiers_by_site[&fact.reference]

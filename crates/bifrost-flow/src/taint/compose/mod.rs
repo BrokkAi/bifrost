@@ -76,6 +76,8 @@ impl std::error::Error for ComposeError {}
 pub struct ComposeOutcome {
     pub report: TaintFindingReport,
     pub incompleteness: Vec<Incompleteness>,
+    /// Causes retained on partial findings, separate from run completion.
+    pub finding_incompleteness: Vec<Incompleteness>,
     pub abstained: Vec<DurableCallSiteKey>,
     pub stats: SearchStats,
 }
@@ -153,12 +155,13 @@ pub fn compose_taint_batch(
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.source_evidence");
         judge_reported_sources(provider, &mut outcome, &mut labeled, request)?;
     }
-    let report = {
+    let (report, finding_incompleteness) = {
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.report");
         report::build_report(plan, provider, budget, &outcome, labeled, request)?
     };
     Ok(ComposeOutcome {
         report,
+        finding_incompleteness,
         incompleteness: outcome.incomplete,
         abstained: outcome.abstained,
         stats: outcome.stats,

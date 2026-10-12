@@ -207,11 +207,24 @@ for policy_manifest in "$repo_root"/crates/bifrost-policy/policy-packs/*/manifes
 done
 
 require_archive_file brokk-bifrost-mcp resources/agent-guidance/bifrost-agents.md
-require_archive_file brokk-bifrost schemas/semantic-model-pack-v2.schema.json
-require_archive_file brokk-bifrost schemas/semantic-model-pack-v3.schema.json
-require_archive_file brokk-bifrost schemas/semantic-model-pack-v4.schema.json
-require_archive_file brokk-bifrost schemas/semantic-model-pack-v5.schema.json
-require_archive_file brokk-bifrost schemas/semantic-model-pack-v8.schema.json
+# Use the reader's supported versions; schema seven has no published JSON
+# Schema resource. Do not infer the contract from files present in the archive.
+semantic_model_schema_versions=$(node --input-type=module <<'EOF'
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const model = readFileSync("crates/bifrost-analysis/src/analyzer/semantic_model/model.rs", "utf8");
+const declaration = model.match(/pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &\[u32\]\s*=\s*&\[([\d,\s]+)\];/u);
+assert(declaration, "cannot read SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS");
+const versions = JSON.parse(`[${declaration[1].replace(/,\s*$/u, "")}]`);
+assert(versions.length > 0, "supported semantic-model schema versions must not be empty");
+console.log(versions.filter(version => version !== 7).join(" "));
+EOF
+)
+read -r -a published_schema_versions <<<"$semantic_model_schema_versions"
+for schema_version in "${published_schema_versions[@]}"; do
+  require_archive_file brokk-bifrost "schemas/semantic-model-pack-v${schema_version}.schema.json"
+done
 require_archive_file brokk-bifrost schemas/workspace-packs-v1.schema.json
 
 root_archive=$(archive_for brokk-bifrost)

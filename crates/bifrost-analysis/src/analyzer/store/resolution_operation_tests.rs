@@ -1303,7 +1303,9 @@ fn rust_row_reverse_answers(
                     &mut ResolutionBatchMetrics::default(),
                 )? {
                     BoundedResolution::Cancelled { .. } => Ok(RustReverseConfirmation::Cancelled),
-                    BoundedResolution::Exceeded { .. } => Ok(RustReverseConfirmation::Bounded),
+                    BoundedResolution::Exceeded { limit, .. } => {
+                        Ok(RustReverseConfirmation::Bounded { limit })
+                    }
                     BoundedResolution::Complete { value, .. } => match value {
                         SelectedRustCallerReferencesOutcome::Operation(
                             SelectedResolutionOperationOutcome::Native(located),
@@ -4019,8 +4021,12 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
                     // Unresolved imports retain a terminal root route. Its
                     // source-site bridge joins the exact import occurrence;
                     // this is not a reader of the deleted tier-2 interior.
+                    // The summary root route is keyed by its member, so its
+                    // bridge joins on the member's blob (the route carries no
+                    // blob of its own); the key is the same (blob, source site).
                     || (sql.contains("source_rust_import_targets AS imported")
-                        && sql.contains("bridge.blob_id=route.blob_id")
+                        && (sql.contains("bridge.blob_id=route.blob_id")
+                            || sql.contains("bridge.blob_id=member.blob_id"))
                         && sql.contains("bridge.source_site=route.reference_source_site")
                         && sql.contains("reference.source_occurrence=imported.target_occurrence_id"))
             }),
@@ -4100,7 +4106,8 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
         // Rust reason ownership probes the five mounted blobs in this fixture
         // once each: +5 indexed statements and no decoded rows. On the merged
         // line the reductions above (321 cold) carry the probes: 326.
-        (233, 214, 326, 205),
+        // M5 summary views add three cold-open statements and rows.
+        (236, 217, 326, 205),
         "production Rust cold point SQL changed; the crate-key open and row-backed point search have exact statement and decoded-row counts"
     );
     assert_eq!(
@@ -4299,10 +4306,13 @@ fn production_go_point_statement_decoded_row_and_engine_work_is_repeatable() {
             ProductionGoPointKind::Type => 440,
         };
         // These generic-free fixtures no longer open the optional formal-row
-        // table and its indexes during cold point setup.
+        // table and its indexes during cold point setup. The cold open is
+        // +3/+3 over the master pin because the shared selection schema now
+        // creates the three Rust unit-summary TEMP views (M5 step 2); the Go
+        // search itself is unchanged.
         let (cold_open, cold_search, warm_open, warm_search) = match kind {
-            ProductionGoPointKind::Definition => ((233, 214), (216, 179), (5, 4), (167, 112)),
-            ProductionGoPointKind::Type => ((233, 214), (234, 175), (5, 4), (185, 108)),
+            ProductionGoPointKind::Definition => ((236, 217), (216, 179), (5, 4), (167, 112)),
+            ProductionGoPointKind::Type => ((236, 217), (234, 175), (5, 4), (185, 108)),
         };
         for measurement in [&cold, &first_warm, &second_warm] {
             assert_eq!(measurement.work.setup_nodes, 0);

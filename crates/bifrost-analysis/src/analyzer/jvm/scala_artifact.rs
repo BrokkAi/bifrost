@@ -413,6 +413,7 @@ fn scala_entry_facts(
         }
         type_parameters_by_declaration.insert(declaration.clone(), type_parameters.clone());
         let fact = TypeFact {
+            jvm_inventory: None,
             ambient_use: scala_declaration_ambient_use(node),
             id: type_id,
             name,

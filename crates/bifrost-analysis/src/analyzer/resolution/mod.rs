@@ -421,6 +421,7 @@ pub use fact_resolution::PreloadedFactResolutionService;
 pub(crate) use fact_resolution::call_applicability::{
     ArgumentFormalBinding, CallApplicabilityAdapter, CandidateAssessment, ConversionEvidence,
     ConversionKind, MappingAssessment, PartialOrder, TypeInCallPosition, map_call_shape,
+    map_scala_call_shape,
 };
 pub(crate) use fact_resolution::{
     AnswerMap, CallCandidateApplicability, DemandAcyclicOutcome, DemandClosureDischarges,
@@ -454,21 +455,23 @@ pub(crate) use fact_source::{
     CompanionTypeRelation, DeclarationAccessDecision, DeclarationAccessRequest,
     DeclarationAccessRow, JvmDeclarationAccessRules, JvmImplicitRootProvider, ReasonOwnerRow,
     RustDeclarationContextSource, RustReferenceContextSource, SelectedDeclarationAccessSource,
-    SubclassAccessContext, language_direct_member_miss_stays_open, language_has_jvm_semantics,
-    language_implicit_root_providers, language_jvm_declaration_access_rules,
-    language_type_qualifiers_search_companion_members, visit_mapped_typed_pages,
+    SubclassAccessContext, language_callables_occupy_value_namespace, language_has_jvm_semantics,
+    language_implicit_root_member_names, language_implicit_root_providers,
+    language_jvm_declaration_access_rules, language_type_qualifiers_search_companion_members,
+    visit_mapped_typed_pages,
 };
 pub use fact_source::{
-    DeferredMemberOwnerLookupName, FactPageVisitor, FactReadOutcome, FactReadTerminal, FactRequest,
-    FactResolutionSource, GoInterfaceMethod, GoMemberDeclaration, GoMemberDeclarationKind,
-    GoStructField, JavaAccessEndpoint, JavaInheritanceDeclaration, JavaInheritanceDeclarationKind,
-    JvmAccessEndpoint, LoweredIntrinsicTypeDescriptor, LoweredRustDeclarationAuthority,
-    LoweredRustReferenceContext, MAX_FACT_REQUESTS_PER_BATCH, MAX_FACT_ROWS_PER_PAGE,
-    MAX_TYPED_FACT_REQUESTS_PER_BATCH, MAX_TYPED_FACT_ROWS_PER_PAGE, NamedArgumentLabel,
-    NamedArgumentLabelRead, QualifiedRouteSlotLookup, RustImplementedTraits, SelectedFactRow,
-    SelectedGapReasonProvenance, SelectedQualifiedRoute, SelectedTypeFrontierCompletion,
-    SelectedTypedFactSource, SelectedTypedRow, TypedFactPageVisitor, TypedFactReadOutcome,
-    TypedFactReadTerminal, TypedFactRequest,
+    DeferredMemberOwnerLookupName, ExternalMemberIdentity, ExternalOwnerIdentity, FactPageVisitor,
+    FactReadOutcome, FactReadTerminal, FactRequest, FactResolutionSource, GoInterfaceMethod,
+    GoMemberDeclaration, GoMemberDeclarationKind, GoStructField, JavaAccessEndpoint,
+    JavaInheritanceDeclaration, JavaInheritanceDeclarationKind, JvmAccessEndpoint,
+    LoweredIntrinsicTypeDescriptor, LoweredRustDeclarationAuthority, LoweredRustReferenceContext,
+    MAX_FACT_REQUESTS_PER_BATCH, MAX_FACT_ROWS_PER_PAGE, MAX_TYPED_FACT_REQUESTS_PER_BATCH,
+    MAX_TYPED_FACT_ROWS_PER_PAGE, NamedArgumentLabel, NamedArgumentLabelRead,
+    QualifiedRouteSlotLookup, RustImplementedTraits, SelectedFactRow, SelectedGapReasonProvenance,
+    SelectedInvocationRole, SelectedQualifiedRoute, SelectedTypeFrontierCompletion,
+    SelectedTypedFactSource, SelectedTypedRow, SelectedTypedRowIdentity, SelectedTypedRowKey,
+    TypedFactPageVisitor, TypedFactReadOutcome, TypedFactReadTerminal, TypedFactRequest,
 };
 pub(crate) use local_identity::ResolutionRegisteredIdentities;
 pub(crate) use local_identity::SUPPLEMENTAL_LOCAL_KEY_BASE;
@@ -518,14 +521,15 @@ pub(crate) use selected_context::{
 };
 pub(crate) use typed_fact_lowering::call_semantic_identity;
 pub use typed_fact_lowering::{
-    LoweredBindingProjection, LoweredCallApplicabilityObligation, LoweredCallArgumentProperty,
-    LoweredCallableParameterApplicability, LoweredCallableParameterProperty,
-    LoweredCallableResultBinding, LoweredCallableResultTypeProperty,
-    LoweredCallableSignatureProperty, LoweredConstructionRequirementProperty,
-    LoweredDeclarationTypeProperty, LoweredDeclarationVisibilityProperty,
-    LoweredDeclaredTypeArgument, LoweredDefinitionPropertyGap, LoweredGenericFormal,
-    LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed, LoweredMemberOwnerProperty,
-    LoweredMemberScopeProperty, LoweredQualifiedSeededRoute, LoweredSupertypeProperty,
+    ExternalMemberCoverage, LoweredBindingProjection, LoweredCallApplicabilityObligation,
+    LoweredCallArgumentProperty, LoweredCallableParameterApplicability,
+    LoweredCallableParameterProperty, LoweredCallableResultBinding,
+    LoweredCallableResultTypeProperty, LoweredCallableSignatureProperty,
+    LoweredConstructionRequirementProperty, LoweredDeclarationTypeProperty,
+    LoweredDeclarationVisibilityProperty, LoweredDeclaredTypeArgument,
+    LoweredDefinitionPropertyGap, LoweredGenericFormal, LoweredGenericTypeAliasParameter,
+    LoweredIntrinsicSeed, LoweredMemberOwnerProperty, LoweredMemberScopeProperty,
+    LoweredQualifiedSeededRoute, LoweredSupertypeProperty, LoweredSupertypeTarget,
     LoweredTypeArgument, LoweredTypeComponent, LoweredTypeTransfer, LoweredTypedFragment,
     LoweredTypedFrontier, LoweredUnderlyingType,
 };

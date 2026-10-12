@@ -580,7 +580,7 @@ fn partial_flows_of(
 /// equal to the computed value.
 #[test]
 fn partial_flows_round_trip_through_rows() {
-    let source = "pub struct Holder {\n    field: u32,\n}\n\nimpl Holder {\n    pub fn store(&mut self, value: u32) {\n        self.field = value;\n    }\n}\n\npub fn identity(value: u32) -> u32 {\n    value\n}\n\npub fn forward(value: u32) {\n    sink(value);\n}\n\nfn sink(_value: u32) {}\n\npub fn capture(value: u32) -> impl Fn() -> u32 {\n    move || value\n}\n\npub fn around(value: u32) -> u32 {\n    sink(0);\n    value\n}\n\n#[derive(core::clone::Clone, core::marker::Copy)]\npub struct Pair {\n    value: u32,\n}\n\npub fn copy_derivation() {\n    let original = Pair { value: 1 };\n    let copied = original;\n    sink(copied.value);\n}\n";
+    let source = "pub struct Holder {\n    field: u32,\n}\n\nimpl Holder {\n    pub fn store(&mut self, value: u32) {\n        self.field = value;\n    }\n}\n\npub fn identity(value: u32) -> u32 {\n    value\n}\n\npub fn forward(value: u32) {\n    sink(value);\n}\n\nfn sink(_value: u32) {}\n\npub fn capture(value: u32) -> impl Fn() -> u32 {\n    move || value\n}\n\npub fn around(value: u32) -> u32 {\n    sink(0);\n    value\n}\n\npub fn dynamic_index(values: &[u32], index: usize) -> u32 {\n    values[index]\n}\n";
     let (file, parts, flows) = partial_flows_of(source);
     assert!(
         flows.iter().any(|procedure| !procedure.flows.is_empty()),
@@ -594,7 +594,8 @@ fn partial_flows_round_trip_through_rows() {
         "the fixture has a flow that crosses a call: {flows:#?}"
     );
     // Both values of the head's relation-proof fact are stored and read back:
-    // the copy derivation's load of `copied.value` is a partial relation.
+    // the dynamic element read names an index this procedure cannot prove
+    // constant, so its relation stays partial.
     assert!(
         flows.iter().any(|procedure| procedure.relations_complete)
             && flows.iter().any(|procedure| !procedure.relations_complete),

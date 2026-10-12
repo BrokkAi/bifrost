@@ -211,8 +211,7 @@ impl AnalyzerStore {
                     snapshot.generation.0, snapshot.revision
                 )
             });
-            self.reconcile_rust_unit_summaries(snapshot);
-            return Ok(());
+            return self.reconcile_rust_unit_summaries(snapshot);
         }
         // The marker names the last complete pass under this derivation
         // version. The paths the revision log changed since then reach the
@@ -269,22 +268,16 @@ impl AnalyzerStore {
 
     /// Keep shared crate summaries current even when topology rows already
     /// match this revision. A previous per-unit failure must be retried on a
-    /// warm start, and the Rust topology readers remain the fail-open path.
-    fn reconcile_rust_unit_summaries(&self, snapshot: &WorkspaceSnapshotId) {
-        match self.reconcile_unit_summaries(
+    /// warm start. The Rust point and reverse readers answer from these
+    /// summary rows, so a failed pass is an error for the caller: nothing
+    /// falls back to older rows.
+    fn reconcile_rust_unit_summaries(&self, snapshot: &WorkspaceSnapshotId) -> Result<()> {
+        let report = self.reconcile_unit_summaries(
             snapshot,
             super::rust_unit_summaries::RustUnitSummaries,
             &crate::CancellationToken::default(),
-        ) {
-            Ok(report) => {
-                crate::profiling::note_with(|| format!("rust_unit_summaries.reconcile: {report:?}"))
-            }
-            Err(error) => crate::profiling::note_with(|| {
-                format!(
-                    "rust_unit_summaries.reconcile: failed open to existing Rust topology readers: {error}"
-                )
-            }),
-        }
+        )?;
+        crate::profiling::note_with(|| format!("rust_unit_summaries.reconcile: {report:?}"));
         #[cfg(test)]
         {
             let conn = self
@@ -292,6 +285,7 @@ impl AnalyzerStore {
                 .expect("open the Rust summary differential reader");
             super::rust_unit_summaries::assert_differential(&conn, snapshot);
         }
+        Ok(())
     }
 
     /// Reconcile the crates a set of changed paths reached.
@@ -895,8 +889,7 @@ impl AnalyzerStore {
                 derived_count
             )
         });
-        self.reconcile_rust_unit_summaries(&summary_snapshot);
-        Ok(())
+        self.reconcile_rust_unit_summaries(&summary_snapshot)
     }
 
     /// Run the module walk to a fixpoint over its item-position macro
@@ -1593,10 +1586,17 @@ impl Drop for StatementTrace<'_> {
     }
 }
 
+// A topology is bound by a crate version row or by a Rust summary version row
+// (`rust_resolution_unit_summary_versions.topology_id` has no cascade), so the
+// sweep must spare both. Callers withdraw the summary versions first, so a
+// topology released by the same workspace or epoch is collected in that pass.
 pub(super) const SQL_RUST_CRATE_TOPOLOGIES_1: &str =
     "DELETE FROM rust_crate_topologies WHERE NOT EXISTS (
          SELECT 1 FROM rust_crate_versions AS versions
-         WHERE versions.topology_id = rust_crate_topologies.topology_id)";
+         WHERE versions.topology_id = rust_crate_topologies.topology_id)
+       AND NOT EXISTS (
+         SELECT 1 FROM rust_resolution_unit_summary_versions AS summary_versions
+         WHERE summary_versions.topology_id = rust_crate_topologies.topology_id)";
 pub(super) const SQL_WORKSPACE_FILE_VERSIONS_2: &str = "SELECT versions.file_version_id, versions.rel_path, versions.blob_oid, sources.source_bytes
                  FROM workspace_file_versions AS versions
                  LEFT JOIN workspace_input_sources AS sources ON sources.content_oid = versions.blob_oid
@@ -3210,6 +3210,8 @@ mod tests {
             let snapshot = store.conn.execute(|conn| -> Result<_> {
                 let snapshot = conn.query_row("SELECT workspace_id, generation, revision FROM workspace_heads WHERE lang='rust'", [], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))?;
                 conn.execute("DELETE FROM rust_crate_versions", [])?;
+                conn.execute(super::super::unit_summaries::DELETE_LANGUAGE_VERSIONS_SQL, ["rust"])?;
+                conn.execute(super::super::unit_summaries::DELETE_UNBOUND_SUMMARIES_SQL, [])?;
                 conn.execute(DELETE_UNBOUND_TOPOLOGIES_SQL, [])?;
                 Ok(snapshot)
             }).unwrap();
@@ -4981,6 +4983,248 @@ mod outer {
         let local_trait = declaration("app", "crate::tr", "LocalTrait");
         let dep_type = declaration("dep", "crate", "DepType");
         let dep_trait = declaration("dep", "crate", "DepTrait");
+        let placed_declaration = |(blob_id, source_site): (i64, i64), rel_path: &str| {
+            let oid: String = conn
+                .query_row("SELECT blob_oid FROM blobs WHERE id=?1", [blob_id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let declaration_id: u32 = conn
+                .query_row(
+                    "SELECT declaration_id FROM source_native_declaration_bridges
+                     WHERE blob_id=?1 AND source_site=?2",
+                    params![blob_id, source_site],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (
+                Oid::from_str(&oid).unwrap(),
+                declaration_id,
+                rel_path.to_owned(),
+            )
+        };
+        let placed_trait = placed_declaration(implemented, "app/src/tr.rs");
+        let placed_foo = placed_declaration(foo, "app/src/ty.rs");
+        let expected_impl_rows = conn
+            .prepare(
+                "SELECT DISTINCT impl_keys.blob_oid, impls.impl_rel_path,
+                        impls.impl_declaration_id, subject_keys.blob_oid,
+                        subject.declaration_id, impls.subject_rel_path
+                 FROM rust_crate_trait_impls AS impls
+                 JOIN blobs AS impl_keys ON impl_keys.id=impls.impl_blob_id
+                 LEFT JOIN source_native_declaration_bridges AS subject
+                   ON subject.blob_id=impls.subject_declaration_blob_id
+                  AND subject.source_site=impls.subject_declaration_site
+                 LEFT JOIN blobs AS subject_keys ON subject_keys.id=subject.blob_id
+                 WHERE impls.topology_id=?1
+                   AND impls.trait_declaration_blob_id=?2
+                   AND impls.trait_declaration_site=?3
+                   AND impls.trait_rel_path=?4
+                 ORDER BY 1, 2, 3, 4, 5, 6",
+            )
+            .unwrap()
+            .query_map(
+                params![app, implemented.0, implemented.1, "app/src/tr.rs"],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<u32>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<u32>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let actual_impl_rows = store
+            .rust_trait_impl_rows(placed_trait.0, placed_trait.1, &placed_trait.2)
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.impl_blob.to_string(),
+                    row.impl_rel_path,
+                    row.impl_declaration,
+                    row.subject
+                        .map(|(blob, declaration, path)| (blob.to_string(), declaration, path)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_impl_rows = expected_impl_rows
+            .into_iter()
+            .map(
+                |(blob, path, declaration, subject_blob, subject_declaration, subject_path)| {
+                    (
+                        blob,
+                        path,
+                        declaration,
+                        subject_blob
+                            .zip(subject_declaration)
+                            .map(|(blob, declaration)| (blob, declaration, subject_path)),
+                    )
+                },
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_impl_rows, expected_impl_rows,
+            "Rust summary endpoints preserve the legacy placed impl and subject rows"
+        );
+        let actual_trait_spellings = store
+            .rust_trait_impl_spellings(placed_trait.0, placed_trait.1, &placed_trait.2)
+            .unwrap();
+        let expected_trait_spellings = conn
+            .prepare(
+                "SELECT DISTINCT spelled.terminal_spelling
+                 FROM rust_crate_trait_impls AS impls
+                 JOIN resolution_trait_implementations AS spelled
+                   ON spelled.blob_id=impls.impl_blob_id
+                  AND spelled.side='trait' AND spelled.impl_site=impls.impl_site
+                 WHERE impls.topology_id=?1
+                   AND impls.trait_declaration_blob_id=?2
+                   AND impls.trait_declaration_site=?3
+                   AND impls.trait_rel_path=?4
+                   AND spelled.terminal_spelling IS NOT NULL
+                 ORDER BY 1",
+            )
+            .unwrap()
+            .query_map(
+                params![app, implemented.0, implemented.1, "app/src/tr.rs"],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            actual_trait_spellings, expected_trait_spellings,
+            "Rust summary endpoints preserve the resolved source spellings"
+        );
+        let actual_types = store
+            .rust_types_implementing(placed_trait.0, placed_trait.1, &placed_trait.2)
+            .unwrap()
+            .into_iter()
+            .map(|(blob, declaration, path)| (blob.to_string(), declaration, path))
+            .collect::<Vec<_>>();
+        let expected_types = conn
+            .prepare(
+                "SELECT DISTINCT keys.blob_oid, bridge.declaration_id, impls.subject_rel_path
+                 FROM rust_crate_trait_impls AS impls
+                 JOIN source_native_declaration_bridges AS bridge
+                   ON bridge.blob_id=impls.subject_declaration_blob_id
+                  AND bridge.source_site=impls.subject_declaration_site
+                 JOIN blobs AS keys ON keys.id=bridge.blob_id
+                 WHERE impls.topology_id=?1
+                   AND impls.trait_declaration_blob_id=?2
+                   AND impls.trait_declaration_site=?3
+                   AND impls.trait_rel_path=?4
+                 ORDER BY 1, 2, 3",
+            )
+            .unwrap()
+            .query_map(
+                params![app, implemented.0, implemented.1, "app/src/tr.rs"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<(String, u32, String)>>>()
+            .unwrap();
+        assert_eq!(
+            actual_types, expected_types,
+            "Rust summary endpoints preserve the types implementing a placed trait"
+        );
+        let actual_traits = store
+            .rust_traits_implemented_by(placed_foo.0, placed_foo.1, &placed_foo.2)
+            .unwrap()
+            .into_iter()
+            .map(|(blob, declaration, path)| (blob.to_string(), declaration, path))
+            .collect::<Vec<_>>();
+        let expected_traits = conn
+            .prepare(
+                "SELECT DISTINCT keys.blob_oid, bridge.declaration_id, impls.trait_rel_path
+                 FROM rust_crate_trait_impls AS impls
+                 JOIN source_native_declaration_bridges AS bridge
+                   ON bridge.blob_id=impls.trait_declaration_blob_id
+                  AND bridge.source_site=impls.trait_declaration_site
+                 JOIN blobs AS keys ON keys.id=bridge.blob_id
+                 WHERE impls.topology_id=?1
+                   AND impls.subject_declaration_blob_id=?2
+                   AND impls.subject_declaration_site=?3
+                   AND impls.subject_rel_path=?4
+                 ORDER BY 1, 2, 3",
+            )
+            .unwrap()
+            .query_map(params![app, foo.0, foo.1, "app/src/ty.rs"], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<(String, u32, String)>>>()
+            .unwrap();
+        assert_eq!(
+            actual_traits, expected_traits,
+            "Rust summary endpoints preserve traits implemented by a placed type"
+        );
+        let (impl_blob_id, impl_declaration, impl_rel_path): (i64, u32, String) = conn
+            .query_row(
+                "SELECT impl_blob_id, impl_declaration_id, impl_rel_path
+                 FROM rust_crate_trait_impls
+                 WHERE topology_id=?1 AND subject_declaration_blob_id=?2
+                   AND subject_declaration_site=?3 AND subject_rel_path=?4
+                   AND trait_declaration_blob_id=?5 AND trait_declaration_site=?6
+                   AND impl_declaration_id IS NOT NULL
+                 ORDER BY impl_site LIMIT 1",
+                params![
+                    app,
+                    foo.0,
+                    foo.1,
+                    "app/src/ty.rs",
+                    implemented.0,
+                    implemented.1
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let impl_oid: String = conn
+            .query_row(
+                "SELECT blob_oid FROM blobs WHERE id=?1",
+                [impl_blob_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let actual_impl_traits = store
+            .rust_traits_of_impl(
+                Oid::from_str(&impl_oid).unwrap(),
+                impl_declaration,
+                &impl_rel_path,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(blob, declaration, path)| (blob.to_string(), declaration, path))
+            .collect::<Vec<_>>();
+        let expected_impl_traits = conn
+            .prepare(
+                "SELECT DISTINCT keys.blob_oid, bridge.declaration_id, impls.trait_rel_path
+                 FROM rust_crate_trait_impls AS impls
+                 JOIN source_native_declaration_bridges AS bridge
+                   ON bridge.blob_id=impls.trait_declaration_blob_id
+                  AND bridge.source_site=impls.trait_declaration_site
+                 JOIN blobs AS keys ON keys.id=bridge.blob_id
+                 WHERE impls.impl_blob_id=?1 AND impls.impl_declaration_id=?2
+                   AND impls.impl_rel_path=?3
+                 ORDER BY 1, 2, 3",
+            )
+            .unwrap()
+            .query_map(
+                params![impl_blob_id, impl_declaration, impl_rel_path],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<(String, u32, String)>>>()
+            .unwrap();
+        assert_eq!(
+            actual_impl_traits, expected_impl_traits,
+            "Rust summary endpoints preserve the trait declared by one placed impl item"
+        );
         let mut expected = [
             (foo, implemented),
             (foo, implemented),
@@ -5017,6 +5261,104 @@ mod outer {
             "a half that reaches no declaration names the half, the spelling, why it \
              reached none and the container its route reached, and its impl contributes \
              no row"
+        );
+        let summary_id: i64 = conn
+            .query_row(
+                "SELECT rust_summary.summary_id
+                 FROM rust_crate_versions AS versions
+                 JOIN rust_crate_topologies AS topology USING(topology_id)
+                 JOIN rust_resolution_unit_summary_versions AS rust_summary
+                   ON rust_summary.workspace_id=versions.workspace_id
+                  AND rust_summary.lang=versions.lang
+                  AND rust_summary.generation=versions.generation
+                  AND rust_summary.unit_key=versions.crate_key
+                  AND rust_summary.valid_from=versions.valid_from
+                 WHERE versions.topology_id=?1 AND versions.valid_until IS NULL",
+                [app],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let resolved_endpoint_count: usize = conn
+            .query_row(
+                "SELECT count(*) FROM rust_resolution_unit_summary_trait_endpoints
+                 WHERE summary_id=?1 AND endpoint_state='resolved'",
+                [summary_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let expected_resolved_endpoint_count: usize = conn
+            .query_row(
+                "SELECT count(*) * 2 FROM rust_crate_trait_impls WHERE topology_id=?1",
+                [app],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved_endpoint_count, expected_resolved_endpoint_count,
+            "each resolved legacy trait relation publishes both endpoints once, including inline modules"
+        );
+        let inline_endpoint_count: usize = conn
+            .query_row(
+                "SELECT count(*) FROM rust_resolution_unit_summary_trait_endpoints
+                 WHERE summary_id=?1 AND endpoint_state='resolved'
+                   AND owner_module_path='crate::im::deep'",
+                [summary_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            inline_endpoint_count, 2,
+            "the inline impl's subject and trait stay in its innermost module placement"
+        );
+        let unresolved_endpoint_count: usize = conn
+            .query_row(
+                "SELECT count(*) FROM rust_resolution_unit_summary_trait_endpoints
+                 WHERE summary_id=?1 AND endpoint_state='unresolved'",
+                [summary_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let expected_unresolved_endpoint_count: usize = conn
+            .query_row(
+                "SELECT count(*) FROM rust_crate_unresolved_trait_impls WHERE topology_id=?1",
+                [app],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unresolved_endpoint_count, expected_unresolved_endpoint_count,
+            "each unresolved trait impl half is attached to its owning summary exactly once"
+        );
+        let expected_unresolved_files = conn
+            .prepare(
+                "SELECT DISTINCT blobs.blob_oid, unresolved.impl_rel_path,
+                        unresolved.impl_declaration_id
+                 FROM rust_crate_unresolved_trait_impls AS unresolved
+                 JOIN blobs ON blobs.id=unresolved.impl_blob_id
+                 WHERE unresolved.topology_id=?1 AND unresolved.side='trait'
+                   AND unresolved.spelling='Absent'
+                 ORDER BY 1, 2, 3",
+            )
+            .unwrap()
+            .query_map([app], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<u32>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let actual_unresolved_files = store
+            .rust_unresolved_trait_impl_files("Absent")
+            .unwrap()
+            .into_iter()
+            .map(|(blob, path, declaration)| (blob.to_string(), path, declaration))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_unresolved_files, expected_unresolved_files,
+            "the live-summary spelling seek preserves the legacy unresolved trait candidates"
         );
     }
     /// `use super::*;` brings in what the parent module can name, and that

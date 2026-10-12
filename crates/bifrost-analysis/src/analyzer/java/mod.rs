@@ -379,6 +379,7 @@ impl JavaAnalyzer {
             &self.external_index,
             &self.java_config,
             self.inner.project(),
+            self.inner.analyzer_store(),
         )
     }
 
@@ -1290,6 +1291,13 @@ fn statement_nested_procedure(node: tree_sitter::Node<'_>) -> bool {
 pub(crate) struct JavaSupport;
 
 impl LanguageSupport for JavaSupport {
+    fn external_inventory_providers(
+        &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+    ) -> Vec<String> {
+        crate::analyzer::jvm::external::java_inventory_providers(analyzer)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn native_rollout_points(
         &self,

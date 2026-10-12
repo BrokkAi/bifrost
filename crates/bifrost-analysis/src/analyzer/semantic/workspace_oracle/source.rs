@@ -26,12 +26,11 @@ use crate::analyzer::semantic::ids::{
 };
 use crate::analyzer::semantic::{
     AbstractObject, CallSiteHandle, CandidateCoverage, DispatchBoundary, DispatchBoundaryKind,
-    DispatchCandidate, DispatchOracle, DispatchResult, EvidenceCompleteness, HeapOracle,
-    LengthDelimitedDigest, ObservationPhase, OracleCallContext, OracleCandidate, PointsToResult,
-    ProofStatus, SemanticArtifact, SemanticBudgetExceeded, SemanticBudgetScopeIdentity,
-    SemanticCapability, SemanticLanguage, SemanticLocator, SemanticOutcome, SemanticProviderError,
-    SemanticRequest, SemanticValueKind, SemanticWork, SourceSpan, StableDigest, ValueAtPoint,
-    ValueHandle,
+    DispatchCandidate, DispatchResult, HeapOracle, LengthDelimitedDigest, ObservationPhase,
+    OracleCallContext, OracleCandidate, PointsToResult, SemanticArtifact, SemanticBudgetExceeded,
+    SemanticBudgetScopeIdentity, SemanticCapability, SemanticLocator, SemanticOutcome,
+    SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork, SourceSpan,
+    StableDigest, ValueAtPoint, ValueHandle,
 };
 use tree_sitter::Node;
 
@@ -266,7 +265,6 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                         observations: Vec::new().into_boxed_slice(),
                         coverage: CandidateCoverage::Exhaustive,
                         source_observations_complete: true,
-                        runtime_value_macro_observation_complete: false,
                     },
                     work,
                 });
@@ -327,23 +325,10 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         } else if coverage == CandidateCoverage::Truncated {
             quality.absorb(SourceOutcomeQuality::Unproven);
         }
-        let runtime_value_macro_observation_complete =
-            if matches!(quality, SourceOutcomeQuality::Unknown) && source_observations_complete {
-                self.rust_builtin_macro_source_observation_complete(
-                    file,
-                    range,
-                    &observations,
-                    request,
-                    &mut work,
-                )?
-            } else {
-                false
-            };
         let result = (!points_to.is_empty()).then(|| SourcePointsToResult {
             observations: points_to.into_boxed_slice(),
             coverage,
             source_observations_complete,
-            runtime_value_macro_observation_complete,
         });
         Ok(quality.publish(result, work))
     }
@@ -478,45 +463,6 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             quality,
             work,
         }))
-    }
-
-    /// Prove a selected runtime expression through an exact built-in macro
-    /// call when the exact source observations are complete but their points-to
-    /// query is otherwise inconclusive.
-    fn rust_builtin_macro_source_observation_complete(
-        &self,
-        file: &ProjectFile,
-        range: Range,
-        observations: &[ValueAtPoint],
-        request: &mut SemanticRequest<'_>,
-        work: &mut SemanticWork,
-    ) -> Result<bool, SemanticProviderError> {
-        if crate::analyzer::common::language_for_file(file) != Language::Rust {
-            return Ok(false);
-        }
-        let Some(source) = self.workspace.analyzer().indexed_source(file) else {
-            return Ok(false);
-        };
-        let Some(macro_range) = rust_value_macro_argument_range(file, &source, range) else {
-            return Ok(false);
-        };
-        let Some(calls) =
-            source_macro_calls(observations, macro_range, self.limits.source_observations())
-        else {
-            return Ok(false);
-        };
-        for call in calls {
-            let outcome = self.resolve_call(&call, request)?;
-            *work = work.conservative_add(outcome.work());
-            let SemanticOutcome::Complete { value, .. } = outcome else {
-                return Ok(false);
-            };
-            let complete = complete_rust_builtin_value_macro_dispatch(&value);
-            if !complete {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     /// Whether `range` selects a Rust parameter on a signature without an
@@ -1168,7 +1114,6 @@ pub struct SourcePointsToResult {
     observations: Box<[PointsToResult]>,
     coverage: CandidateCoverage,
     source_observations_complete: bool,
-    runtime_value_macro_observation_complete: bool,
 }
 
 impl SourcePointsToResult {
@@ -1192,21 +1137,6 @@ impl SourcePointsToResult {
         self.observations
             .iter()
             .all(|result| result.objects().candidates().is_empty())
-    }
-
-    /// Whether every source value observation for this exact range is present.
-    ///
-    /// This is independent of whether each value's points-to object set is
-    /// complete. A structurally selected value can still be a point-sensitive
-    /// taint source when receiver or object identity is unknown.
-    pub fn source_observations_complete(&self) -> bool {
-        self.source_observations_complete
-    }
-
-    /// Whether this exact source row is a runtime value inside a built-in Rust
-    /// macro with complete identity and value semantics.
-    pub fn runtime_value_macro_observation_complete(&self) -> bool {
-        self.runtime_value_macro_observation_complete
     }
 
     /// Whether this exact source range produced a complete observation set
@@ -1384,138 +1314,6 @@ fn source_outcome_without_value<T>(
             unreachable!("available semantic outcomes always retain their value")
         }
     }
-}
-
-/// Return the source span of a built-in value macro when range is inside one
-/// of its expression arguments. Token-tree parsing stays in the Rust adapter;
-/// this query uses the same argument ranges to distinguish values from patterns.
-fn rust_value_macro_argument_range(
-    file: &ProjectFile,
-    source: &str,
-    range: Range,
-) -> Option<tree_sitter::Range> {
-    let tree = parse_tree_for_language(file, Language::Rust, source)?;
-    let mut node =
-        smallest_named_node_covering(tree.root_node(), range.start_byte, range.end_byte)?;
-    loop {
-        if node.kind() == "macro_invocation"
-            && let Some(path) = node.child_by_field_name("macro")
-            && let Some(segments) = brokk_bifrost_rust::graph_support::rust_path_segments(path)
-            && let Some(terminal) = segments.last()
-            && let Some(terminal_name) = source.get(terminal.byte_range())
-        {
-            let terminal_name =
-                brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
-                    terminal_name,
-                );
-            if let Some(value_macro) =
-                brokk_bifrost_rust::format_args::rust_value_macro(terminal_name)
-            {
-                let arguments = match value_macro {
-                    brokk_bifrost_rust::format_args::RustValueMacro::Matches => {
-                        brokk_bifrost_rust::format_args::rust_matches_macro_scrutinee(node, source)
-                            .map(|argument| vec![argument])
-                    }
-                    brokk_bifrost_rust::format_args::RustValueMacro::Vec => {
-                        brokk_bifrost_rust::format_args::rust_vec_macro_arguments(node, source).map(
-                            |arguments| {
-                                match arguments {
-                                brokk_bifrost_rust::format_args::RustVecMacroArguments::Elements(
-                                    elements,
-                                ) => elements,
-                                brokk_bifrost_rust::format_args::RustVecMacroArguments::Repeated(
-                                    repeated,
-                                ) => vec![repeated.element, repeated.count],
-                            }
-                            },
-                        )
-                    }
-                    _ => brokk_bifrost_rust::format_args::rust_format_macro_arguments(node, source),
-                };
-                if arguments.is_ok_and(|arguments| {
-                    arguments.iter().any(|argument| {
-                        argument.value_range.start_byte <= range.start_byte
-                            && argument.value_range.end_byte >= range.end_byte
-                    })
-                }) {
-                    return Some(node.range());
-                }
-            }
-        }
-        node = node.parent()?;
-    }
-}
-
-/// Find each semantic call corresponding to one exact macro invocation across
-/// the selected point-specialized observations. Returning None means the
-/// source mapping did not identify that call unambiguously.
-fn source_macro_calls(
-    observations: &[ValueAtPoint],
-    macro_range: tree_sitter::Range,
-    limit: usize,
-) -> Option<Vec<CallSiteHandle>> {
-    let start_byte = u32::try_from(macro_range.start_byte).ok()?;
-    let end_byte = u32::try_from(macro_range.end_byte).ok()?;
-    let mut calls = Vec::new();
-    for observation in observations {
-        let procedure = observation.point().procedure();
-        let mut found = false;
-        for call in procedure.semantics().call_sites() {
-            let Some(mapping) = procedure.semantics().source_mapping(call.source) else {
-                continue;
-            };
-            let span = mapping.locator.anchor().span();
-            if span.start_byte() != start_byte || span.end_byte() != end_byte {
-                continue;
-            }
-            let handle = procedure.call_site_handle(call.id)?;
-            found = true;
-            if !calls.contains(&handle) {
-                calls.push(handle);
-                if calls.len() > limit {
-                    return None;
-                }
-            }
-        }
-        if !found {
-            return None;
-        }
-    }
-    (!calls.is_empty()).then_some(calls)
-}
-
-/// Require an exhaustive dispatch to an exact modeled standard-library effect.
-/// A matching macro spelling or a source-defined macro identity is insufficient.
-fn complete_rust_builtin_value_macro_dispatch(result: &DispatchResult) -> bool {
-    !result.boundaries().is_empty()
-        && result.coverage().is_exhaustive()
-        && result.candidates().is_empty()
-        && result.boundaries().iter().all(|boundary| {
-            let Some(identity) = boundary.external_callee_identity() else {
-                return false;
-            };
-            let Some(target) = boundary.unmaterialized_external_target() else {
-                return false;
-            };
-            let modeled_identity = identity.language() == Language::Rust
-                && matches!(
-                    (identity.owner_fqn(), identity.member()),
-                    ("core.panicking", "panic_fmt" | "assert_failed")
-                        | ("std.io.stdio", "_print" | "_eprint")
-                        | ("core", "matches")
-                        | ("alloc", "vec")
-                );
-            modeled_identity
-                && target.language() == SemanticLanguage::Standard(Language::Rust)
-                && target.owner_fqn() == identity.owner_fqn()
-                && target.member() == identity.member()
-                && matches!(
-                    &boundary.kind,
-                    DispatchBoundaryKind::External(Some(locator)) if locator == target.locator()
-                )
-                && matches!(&boundary.proof, ProofStatus::Proven)
-                && matches!(&boundary.completeness, EvidenceCompleteness::Complete)
-        })
 }
 
 /// Locate the call sites whose source mapping is the narrowest one containing

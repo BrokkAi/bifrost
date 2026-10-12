@@ -2051,9 +2051,9 @@ fn read_cached_inventory(
         ))
     })?;
     if index.schema_version != INVENTORY_SCHEMA_VERSION || index.source.as_ref() != source {
-        return Err(OpenPackError::integrity(
-            "cached open-pack manifest index has an unsupported schema or source identity",
-        ));
+        // A previous binary or a different configured source can leave a valid index
+        // that does not apply to this request. Let the caller rediscover it.
+        return Ok(None);
     }
     let fetched_at_ms = parse_iso_utc_millis(&index.fetched_at).ok_or_else(|| {
         OpenPackError::integrity("cached open-pack manifest index has an invalid timestamp")
@@ -4966,6 +4966,77 @@ mod tests {
             }
         ));
         assert_eq!(offline_transport.call_count(), 0);
+    }
+
+    #[test]
+    #[hardwon("#4906: stale-schema and foreign-source indexes must be cache misses at startup")]
+    fn runtime_bootstrap_rediscovers_inapplicable_cached_indexes() {
+        let profile = engine_profile("9.9.0");
+        for (field, value) in [
+            ("schema_version", json!(INVENTORY_SCHEMA_VERSION - 1)),
+            (
+                "source",
+                json!({
+                    "repository": "https://github.com/example/previous-packs",
+                    "inventory_url": null,
+                    "inventory_sha256": null,
+                }),
+            ),
+        ] {
+            let cache = tempdir().expect("temporary inapplicable cache");
+            write_empty_cached_inventory(cache.path(), SystemTime::now());
+            let index_path = cache.path().join("manifest-index.json");
+            let mut index: Value =
+                serde_json::from_slice(&fs::read(&index_path).expect("read cached index"))
+                    .expect("decode cached index");
+            index[field] = value;
+            let bytes = serde_json::to_vec(&index).expect("encode inapplicable index");
+            fs::write(&index_path, &bytes).expect("write inapplicable index");
+
+            let transport = FakeTransport::new(BTreeMap::from([(
+                release_listing_url(REPOSITORY_URL),
+                b"[]".to_vec(),
+            )]));
+            let offline =
+                prepare_runtime_with_transport(cache.path(), &profile, true, false, &transport)
+                    .expect("inapplicable offline index must not fail startup");
+            assert!(matches!(
+                offline,
+                OpenPackRuntimeOutcome::EmbeddedFallback {
+                    kind: OpenPackFallbackKind::OfflineCacheMiss,
+                    ..
+                }
+            ));
+            assert_eq!(transport.call_count(), 0);
+            assert_eq!(fs::read(&index_path).expect("read offline index"), bytes);
+
+            let online =
+                prepare_runtime_with_transport(cache.path(), &profile, false, false, &transport)
+                    .expect("inapplicable online index must rediscover");
+            assert!(matches!(
+                online,
+                OpenPackRuntimeOutcome::EmbeddedFallback {
+                    kind: OpenPackFallbackKind::NoCompatibleRelease,
+                    ..
+                }
+            ));
+            assert_eq!(
+                transport.called_urls(),
+                vec![release_listing_url(REPOSITORY_URL)]
+            );
+            let refreshed: ManifestIndex =
+                serde_json::from_slice(&fs::read(&index_path).expect("read refreshed index"))
+                    .expect("decode refreshed index");
+            assert_eq!(refreshed.schema_version, INVENTORY_SCHEMA_VERSION);
+            assert_eq!(
+                refreshed
+                    .source
+                    .as_ref()
+                    .expect("refreshed source")
+                    .repository,
+                REPOSITORY_URL
+            );
+        }
     }
 
     #[test]

@@ -906,9 +906,10 @@ mod tests {
 
         let updated = analyzer.update_all();
         let updated_scope = AnalyzerQueryScope::new(&updated);
-        // Warm the Cargo routes on the new generation: the constructor's own
+        // Warm the Cargo routes in this query scope: the constructor's own
         // cancellation point is not what this test is about, and a cold build
-        // there would stop the walker before it ever walked.
+        // there would stop the walker before it ever walked. The route memo
+        // lives in the open scope and is returned without polling keep_going.
         let module = RustUsageWalks::new(&updated, updated_scope.token())
             .expect("Cargo routes available after update")
             .physical_root_of(&head)

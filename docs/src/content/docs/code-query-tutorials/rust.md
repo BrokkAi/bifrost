@@ -174,10 +174,10 @@ projects that source match to its unique suspension point.
         "completeness": "complete",
         "proof": "proven"
       },
-      "id": "b584199882f7fc231c855fb73e594103e0942b1fb644f074e612da17033b9d75",
+      "id": "5fb24806fe461a1d5e98280cc39ecc70aa7c713adb2e5336790d43e7316101cb",
       "language": "rust",
       "path": "rust/lib.rs",
-      "procedure_id": "b10f3f0466902307e941966d7bf8a5da3ed5d32c1aa23112f06567d0ca2cc13c",
+      "procedure_id": "609308a9b08e859530fb04e94dd651dae7f9b8de075928d1906d4ebc73bca579",
       "provenance": [
         {
           "seed": {
@@ -191,9 +191,9 @@ projects that source match to its unique suspension point.
             {
               "op": "program_point_of",
               "result": {
-                "id": "b584199882f7fc231c855fb73e594103e0942b1fb644f074e612da17033b9d75",
+                "id": "5fb24806fe461a1d5e98280cc39ecc70aa7c713adb2e5336790d43e7316101cb",
                 "path": "rust/lib.rs",
-                "procedure_id": "b10f3f0466902307e941966d7bf8a5da3ed5d32c1aa23112f06567d0ca2cc13c",
+                "procedure_id": "609308a9b08e859530fb04e94dd651dae7f9b8de075928d1906d4ebc73bca579",
                 "range": {
                   "end_column": 24,
                   "end_line": 24,

@@ -3061,6 +3061,20 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
+        if let Some(context) = self.build_context.as_ref() {
+            self.snapshot_caches
+                .semantic_models()
+                .bind_inventory_store(context.store());
+        } else if let Some(store) = self.delegates.values().find_map(|delegate| {
+            delegate
+                .analyzer()
+                .snapshot_caches()
+                .and_then(|caches| caches.semantic_models().native_inventory_store())
+        }) {
+            self.snapshot_caches
+                .semantic_models()
+                .bind_inventory_store(&store);
+        }
         Some(&self.snapshot_caches)
     }
 

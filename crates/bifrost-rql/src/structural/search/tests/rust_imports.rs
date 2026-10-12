@@ -81,7 +81,7 @@ fn reexport_workspace() -> BuiltInlineTestProject {
         )
         .file(
             "module_client/src/lib.rs",
-            "use module_facade::inner::exported_target;\npub fn run() { exported_target(); }\n",
+            "pub use module_facade::inner::exported_target;\npub fn run() { exported_target(); }\n",
         )
         .file(
             "chain_helper_client/Cargo.toml",
@@ -367,6 +367,7 @@ fn persistent_rust_import_graph_reuses_edges_and_invalidates_reexport_routes() {
 }
 
 #[test]
+#[hardwon("#4955: reused Rust consumer summaries lost moved re-export origins")]
 fn auto_import_queries_reuse_persisted_sql_graph_across_workspace_builds() {
     let project = reexport_workspace();
     let query = importer_query_at("exported_target", "source/src/inner.rs");
@@ -439,6 +440,7 @@ fn auto_import_queries_reuse_persisted_sql_graph_across_workspace_builds() {
 }
 
 #[test]
+#[hardwon("#4955: missing Rust modules forced whole-workspace import refreshes")]
 fn rust_candidate_dependencies_cover_add_edit_reexport_and_glob_changes() {
     let project = candidate_dependency_workspace();
     let mut workspace = project.workspace_analyzer(AnalyzerConfig::default());
@@ -572,7 +574,7 @@ fn rust_candidate_dependencies_cover_add_edit_reexport_and_glob_changes() {
 }
 
 #[test]
-#[hardwon("#3829: follow Rust pub-use re-exports back to the defining file")]
+#[hardwon("#3829+#4955: follow Rust module and named re-exports back to the defining file")]
 fn rust_importers_follow_named_chained_glob_and_module_reexports_across_crates() {
     let project = reexport_workspace();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
@@ -635,6 +637,22 @@ fn rust_importers_follow_named_chained_glob_and_module_reexports_across_crates()
     assert_eq!(trace.steps[1].op, "importers_of");
     assert_eq!(trace.steps[2].op, "importers_of");
     assert_eq!(file_ref_path(&trace.steps[0].result), "source/src/inner.rs");
+
+    let source_root = project.file("source/src/lib.rs");
+    source_root
+        .write("pub fn root_marker() {}\npub mod other;\npub mod inner;\n")
+        .expect("reorder source declarations without changing its exported names");
+    let updated = workspace.update(&BTreeSet::from([source_root]));
+    let module_after_reorder = execute_code_query_detailed_eager_index(
+        updated.analyzer(),
+        &importer_query("root_marker", 1),
+        CodeQueryExecutionLimits::default(),
+        None,
+    );
+    assert_eq!(
+        file_paths(&module_after_reorder),
+        BTreeSet::from(["module_facade/src/lib.rs".to_string()])
+    );
 }
 
 #[test]

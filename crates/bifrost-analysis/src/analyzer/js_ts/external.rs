@@ -1918,6 +1918,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
         self.type_index_by_name
             .insert(name.to_owned(), self.types.len());
         self.types.push(TypeFact {
+            jvm_inventory: None,
             ambient_use: None,
             id: id.clone(),
             name: name.to_owned(),

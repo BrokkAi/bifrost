@@ -1293,15 +1293,14 @@ fn ordinary_call_identity_conflicts_even_with_new_callee_reference() {
 #[test]
 fn ordinary_property_provenance_requires_same_owner_without_rejecting_new_frontier() {
     use crate::analyzer::store::resolution_selection::SelectedResolutionTempTransaction;
-    // Java's direct default-construction proof emits an implicit-constructor
-    // property gap for this class through the actual producer.
-    let fixture = SelectionFixture::custom_source(1, "package demo; public class Model {}\n");
+    // The actual Java producer emits a hierarchy property gap for an interface.
+    let fixture = SelectionFixture::custom_source(1, "package demo; public interface Model {}\n");
     let selection = fixture.open_ready(&[]);
     let (definition,reason,site):(u32,u32,u32)=selection.connection().query_row(
         "SELECT old.definition,old.reason,old.site FROM temp.selected_resolution_mounts mount JOIN main.resolution_definition_property_gaps old ON old.blob_id=mount.blob_id WHERE mount.mount_ordinal=0 AND old.kind=?1 LIMIT 1",
-        [code(ALL_RESOLUTION_GAP_KINDS,ResolutionGapKind::ImplicitConstructor)],
+        [code(ALL_RESOLUTION_GAP_KINDS,ResolutionGapKind::UnsupportedHierarchyTraversal)],
         |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-    ).expect("parsed default-constructible class publishes property provenance");
+    ).expect("parsed interface publishes property provenance");
     for owner in [
         SemanticId::local(0, definition),
         SemanticId::context_local(990),
@@ -1328,7 +1327,7 @@ fn ordinary_property_provenance_requires_same_owner_without_rejecting_new_fronti
             vec![LoweredDefinitionPropertyGap::new(
                 owner,
                 ResolutionSiteId::new(site),
-                ResolutionGapKind::ImplicitConstructor,
+                ResolutionGapKind::UnsupportedHierarchyTraversal,
                 frontier,
                 SemanticId::local(0, reason),
             )],

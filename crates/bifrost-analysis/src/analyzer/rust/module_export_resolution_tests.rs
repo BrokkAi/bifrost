@@ -14,13 +14,66 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_rust::cargo_routes::RustCargoRouteIndex;
 use brokk_bifrost_rust::graph_support::{
     ReferenceContextError, ReferenceContextResult, RustCargoRouteError,
-    RustDeclarationSourceProperties, RustPackageFileIndex, RustSource,
-    forward_exported_targets_from_files, resolve_module_files,
+    RustDeclarationSourceProperties, RustPackageFileIndex, RustPackageFileRow, RustSource,
+    forward_exported_targets_from_files, resolve_direct_import_files, resolve_module_files,
 };
 use brokk_bifrost_test_macros::hardwon;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+fn package_files(files: &[ProjectFile]) -> Arc<RustPackageFileIndex> {
+    Arc::new(RustPackageFileIndex::from_summary_rows(
+        files
+            .iter()
+            .map(|file| RustPackageFileRow {
+                file: file.clone(),
+                package_components: brokk_bifrost_rust::declarations::rust_package_name(file)
+                    .split('.')
+                    .map(str::to_owned)
+                    .collect(),
+                crate_name: String::new(),
+                target_kind: String::new(),
+                is_root_member: false,
+            })
+            .collect(),
+    ))
+}
+
+#[test]
+fn package_file_index_reads_live_summary_members_and_crate_roots() {
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"package-index\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("src/lib.rs", "pub mod nested; pub mod consumer;\n")
+        .file("src/nested.rs", "pub fn item() {}\n")
+        .file("src/consumer.rs", "use package_index::nested;\n")
+        .build();
+    let workspace = fixture.workspace_analyzer(crate::AnalyzerConfig::default());
+    let analyzer = crate::analyzer::resolve_analyzer::<RustAnalyzer>(workspace.analyzer())
+        .expect("workspace contains the Rust analyzer");
+    let consumer = fixture.file("src/consumer.rs");
+    let nested = fixture.file("src/nested.rs");
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let package_files = analyzer
+        .package_file_index_while(scope.token(), &|| true)
+        .expect("read the live Rust summary package and member rows");
+
+    assert!(package_files.contains(&fixture.file("src/lib.rs")));
+    assert!(package_files.contains(&consumer));
+    assert!(package_files.contains(&nested));
+    assert_eq!(
+        resolve_direct_import_files(
+            &package_files,
+            &consumer,
+            &["package_index".to_string(), "nested".to_string()],
+        ),
+        vec![nested],
+        "the normalized crate root routes to its live member summary rows"
+    );
+}
 
 struct ExportWalkSource {
     project: Arc<dyn Project>,
@@ -176,8 +229,16 @@ impl RustSource for ExportWalkSource {
         }
     }
 
-    fn package_file_index(&self) -> Arc<RustPackageFileIndex> {
-        Arc::clone(&self.package_files)
+    fn package_file_index_while(
+        &self,
+        _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustPackageFileIndex>, RustCargoRouteError> {
+        if keep_going() {
+            Ok(Arc::clone(&self.package_files))
+        } else {
+            Err(RustCargoRouteError::Cancelled)
+        }
     }
 
     fn import_binder_of(&self, _file: &ProjectFile) -> ImportBinder {
@@ -270,9 +331,7 @@ fn module_reexport_chain_uses_an_explicit_stack() {
         "leaf",
     );
     assert_eq!(terminal_module.fq_name(), "fixture.src.terminal.leaf");
-    let package_files = Arc::new(RustPackageFileIndex::build(
-        analyzed_files.iter().cloned().collect(),
-    ));
+    let package_files = package_files(&analyzed_files);
     let project = fixture.project_dyn();
     let source = ExportWalkSource {
         project: Arc::clone(&project),
@@ -310,9 +369,7 @@ fn rust_reexport_cycle_does_not_reenter_a_live_module_path_lookup() {
     let mut export_indices = HashMap::default();
     export_indices.insert(root.clone(), Arc::new(exports));
     let analyzed_files = vec![root.clone()];
-    let package_files = Arc::new(RustPackageFileIndex::build(
-        analyzed_files.iter().cloned().collect(),
-    ));
+    let package_files = package_files(&analyzed_files);
     let project = fixture.project_dyn();
     let source = ExportWalkSource {
         project: Arc::clone(&project),
@@ -375,9 +432,7 @@ fn rust_diamond_reexports_reuse_repeated_alias_path_frames() {
     export_indices.insert(left.clone(), Arc::new(left_exports));
     export_indices.insert(right.clone(), Arc::new(right_exports));
     export_indices.insert(shared.clone(), Arc::new(shared_exports));
-    let package_files = Arc::new(RustPackageFileIndex::build(
-        analyzed_files.iter().cloned().collect(),
-    ));
+    let package_files = package_files(&analyzed_files);
     let project = fixture.project_dyn();
     let source = ExportWalkSource {
         project: Arc::clone(&project),

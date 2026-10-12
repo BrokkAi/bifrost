@@ -790,6 +790,7 @@ fn produce_document(
             type_shape(item, document, &type_ids, limits, &mut diagnostics);
         type_position.insert(item.id, types.len());
         types.push(TypeFact {
+            jvm_inventory: None,
             ambient_use: None,
             id: id.clone(),
             name: name.clone(),

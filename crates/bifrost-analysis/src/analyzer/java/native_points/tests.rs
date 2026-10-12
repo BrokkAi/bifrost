@@ -227,6 +227,9 @@ fn java_native_overload_selection_uses_strict_primitive_widening() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#2771: a same-arity array overload blocked external String calls"
+)]
 fn java_native_call_adapter_proves_external_receiver_and_static_import_shapes() {
     use crate::analyzer::jvm::external::{TestClassFile, TestClassMethod, write_test_class_jar};
     use crate::{AnalyzerConfig, JvmAnalyzerConfig, JvmExternalArtifact, JvmExternalDependencies};
@@ -246,11 +249,18 @@ fn java_native_call_adapter_proves_external_receiver_and_static_import_shapes() 
             TestClassFile {
                 internal_name: "java/net/URLDecoder",
                 super_internal_name: "java/lang/Object",
-                methods: &[TestClassMethod {
-                    name: "decode",
-                    descriptor: "(Ljava/lang/String;)Ljava/lang/String;",
-                    is_static: true,
-                }],
+                methods: &[
+                    TestClassMethod {
+                        name: "decode",
+                        descriptor: "(Ljava/lang/String;)Ljava/lang/String;",
+                        is_static: true,
+                    },
+                    TestClassMethod {
+                        name: "decode",
+                        descriptor: "([Ljava/lang/String;)Ljava/lang/String;",
+                        is_static: true,
+                    },
+                ],
                 private_nested: false,
             },
         ],
@@ -573,18 +583,11 @@ fn java_native_point_infers_var_receiver_from_factory_result() {
     ));
     assert_eq!(
         outcome.status,
-        DefinitionLookupStatus::Incomplete,
+        DefinitionLookupStatus::Resolved,
         "{outcome:?}"
     );
     assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
     assert_eq!(outcome.definitions[0].fq_name(), "p.Store.put");
-    assert!(
-        outcome
-            .diagnostics
-            .iter()
-            .any(|reason| reason.kind == "incomplete_binding"),
-        "{outcome:?}"
-    );
 }
 
 #[test]

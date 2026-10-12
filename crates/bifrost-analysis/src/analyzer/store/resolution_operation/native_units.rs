@@ -21,9 +21,16 @@ pub(crate) enum SelectedNativeDefinitions {
     Cancelled,
 }
 
+pub(crate) struct ProjectedNativeExternalMember {
+    pub(crate) identity: crate::analyzer::resolution::ExternalMemberIdentity,
+    pub(crate) member_name: String,
+    pub(crate) is_static: bool,
+}
+
 pub(crate) struct SelectedNativeReferenceUnits {
     pub(crate) answer: FactResolutionAnswer,
     pub(crate) definitions: SelectedNativeDefinitions,
+    pub(crate) external_members: Vec<ProjectedNativeExternalMember>,
     pub(crate) named_argument: Option<SelectedNativeNamedArgument>,
     pub(crate) predeclared_go_symbol: bool,
     pub(crate) callable_applicability_candidates: Vec<(SemanticId, CodeUnit)>,
@@ -299,6 +306,19 @@ impl SelectedResolutionOperation<'_, '_> {
                     .iter()
                     .map(|candidate| candidate.target())
                     .collect::<Vec<_>>();
+                let mut external_members = Vec::new();
+                for &target in answer.binding().targets() {
+                    if let Some((owner, ordinal)) = ready.context_identities.external_member_identity(target) {
+                        let (member_name, is_static) = ready.inventory.connection().query_row(
+                            "SELECT member_name,is_static FROM jvm_external_owner_members WHERE provider_id=?1 AND owner_fqn=?2 AND ordinal=?3",
+                            rusqlite::params![owner.provider_id.as_ref(),owner.owner_fqn.as_ref(),ordinal],
+                            |row| Ok((row.get(0)?,row.get(1)?)))?;
+                        external_members.push(ProjectedNativeExternalMember {
+                            identity: crate::analyzer::resolution::ExternalMemberIdentity { owner, ordinal },
+                            member_name, is_static,
+                        });
+                    }
+                }
                 let mut definitions = project_native_definition_units(
                     ready,
                     answer.binding().targets(),
@@ -361,6 +381,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 Ok(SelectedNativeReferenceUnits {
                     answer,
                     definitions,
+                    external_members,
                     named_argument,
                     predeclared_go_symbol,
                     callable_applicability_candidates,
@@ -682,7 +703,16 @@ pub(super) fn project_native_definition_units(
 ) -> Result<SelectedNativeDefinitions> {
     let lexical = ready.lexical_source();
     let mut coordinates = Vec::with_capacity(definitions.len());
+    let mut source_definitions = Vec::with_capacity(definitions.len());
     for &definition in definitions {
+        if ready
+            .context_identities
+            .external_member_identity(definition)
+            .is_some()
+        {
+            continue;
+        }
+        source_definitions.push(definition);
         if cancellation.is_cancelled() || !session.scope_step() {
             return Ok(SelectedNativeDefinitions::Cancelled);
         }
@@ -699,7 +729,7 @@ pub(super) fn project_native_definition_units(
         return Ok(SelectedNativeDefinitions::Cancelled);
     };
     let mut projected = Vec::with_capacity(definitions.len());
-    for (&definition, coordinate) in definitions.iter().zip(coordinates) {
+    for (&definition, coordinate) in source_definitions.iter().zip(coordinates) {
         if cancellation.is_cancelled() || !session.scope_step() {
             return Ok(SelectedNativeDefinitions::Cancelled);
         }

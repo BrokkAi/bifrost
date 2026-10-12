@@ -2,8 +2,8 @@
 //!
 //! `RustCargoRouteIndex` and the canonical module-route fact reader it consumes
 //! live in [`brokk_bifrost_rust::cargo_routes`]; only the assertions that reach
-//! the analyzer -- its `cargo_routes()` memo, and the store rows analysis wrote
-//! for it to read -- have to be built from a real `RustAnalyzer`, so they stay
+//! the analyzer's live summary queries and the store rows analysis wrote for
+//! them to read -- have to be built from a real `RustAnalyzer`, so they stay
 //! here (the Go block-2 precedent).
 //!
 //! The direct half of passthrough-macro discovery -- that coordinated
@@ -72,7 +72,6 @@ mod tests {
             ));
             assert!(scope.store_error().is_some());
         }
-        assert!(!analyzer.cargo_routes_ready_for_test());
         analyzer.warm_usage_facts();
         assert!(analyzer.rust_usage_facts_ready());
         let routes = analyzer
@@ -85,14 +84,13 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_canonical_route_build_does_not_poison_a_retry() {
+    fn cancelled_route_read_can_be_retried() {
         let fixture = readiness_fixture();
         let analyzer = RustAnalyzer::new(fixture.project_dyn());
         assert!(matches!(
             analyzer.cargo_routes_while(&|| false),
             Err(RustCargoRouteError::Cancelled)
         ));
-        assert!(!analyzer.cargo_routes_ready_for_test());
         assert!(analyzer.cargo_routes_while(&|| true).is_ok());
     }
     #[test]
@@ -389,7 +387,7 @@ inline_only! { mod escaped_inline; }
         write(
             &root,
             "Cargo.toml",
-            "[workspace]\nmembers = [\"app\", \"engine\"]\nresolver = \"2\"\n",
+            "[workspace]\nmembers = [\"app\", \"engine\", \"devonly\"]\nresolver = \"2\"\n",
         );
         write(
             &root,
@@ -400,8 +398,14 @@ inline_only! { mod escaped_inline; }
         write(&root, "engine/src/part.rs", "pub struct Part;\n");
         write(
             &root,
+            "devonly/Cargo.toml",
+            "[package]\nname = \"devonly\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(&root, "devonly/src/lib.rs", "pub struct DevOnly;\n");
+        write(
+            &root,
             "app/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nengine = { path = \"../engine\" }\n",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ntest = false\n\n[dependencies]\nengine = { path = \"../engine\" }\n\n[dev-dependencies]\ndevonly = { path = \"../devonly\" }\n",
         );
         write(
             &root,
@@ -436,6 +440,11 @@ inline_only! { mod escaped_inline; }
             routes.resolve_crate_root_file(&feature, "engine"),
             Some(engine_library.clone()),
             "a path dependency still resolves across crates"
+        );
+        assert_eq!(
+            routes.resolve_crate_root_file(&feature, "devonly"),
+            None,
+            "a library with test routing disabled cannot resolve a dev dependency"
         );
         assert_eq!(
             routes.target_relation(&feature, &part),
@@ -499,7 +508,6 @@ inline_only! { mod escaped_inline; }
             ));
             assert!(scope.store_error().is_some());
         }
-        assert!(!analyzer.cargo_routes_ready_for_test());
         assert_eq!(analyzer.module_route_fact_fallback_count_for_test(), 0);
         assert!(!analyzer.rust_usage_facts_ready());
         analyzer.warm_usage_facts();
@@ -511,7 +519,6 @@ inline_only! { mod escaped_inline; }
             routes.target_roots_for_file(&fixture.file("src/part.rs")),
             vec![fixture.file("src/lib.rs")]
         );
-        assert!(analyzer.cargo_routes_ready_for_test());
     }
 
     #[test]
@@ -534,7 +541,6 @@ inline_only! { mod escaped_inline; }
                 .contains("canonical Rust Cargo-route publication"),
             "{error}"
         );
-        assert!(!analyzer.cargo_routes_ready_for_test());
         assert_eq!(analyzer.module_route_fact_fallback_count_for_test(), 0);
     }
 

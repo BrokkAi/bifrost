@@ -16,12 +16,16 @@ impl CallApplicabilityAdapter for ScalaCallApplicabilityAdapter {
         TypeInCallPosition::ApplyMembers
     }
 
+    fn result_application_member_names(&self) -> &'static [&'static str] {
+        &["apply"]
+    }
+
     fn map_arguments(
         &self,
         call: &LoweredCallApplicabilityObligation,
         signature: &LoweredCallableSignatureProperty,
     ) -> MappingAssessment {
-        crate::analyzer::resolution::map_call_shape(
+        crate::analyzer::resolution::map_scala_call_shape(
             call,
             signature,
             false,

@@ -164,12 +164,15 @@ seam_methods! {
     RustImplementedTraitsNameableAt => "rust_implemented_traits_nameable_at", "SelectedTypedFactSource";
     RustImplItemTraits => "rust_impl_item_traits", "SelectedTypedFactSource";
     SelectionHasJavaSemantics => "selection_has_java_semantics", "SelectedTypedFactSource";
+    LookupNamespace => "lookup_namespace", "SelectedTypedFactSource";
     SelectionHasJvmSemantics => "selection_has_jvm_semantics", "SelectedTypedFactSource";
     FragmentTypeQualifiersSearchCompanionMembers => "fragment_type_qualifiers_search_companion_members", "SelectedTypedFactSource";
     IntrinsicReverseIndexUsesSharedTypeNames => "intrinsic_reverse_index_uses_shared_type_names", "SelectedTypedFactSource";
     JavaAccessEndpoints => "java_access_endpoints", "SelectedTypedFactSource";
     JvmAccessEndpoints => "jvm_access_endpoints", "SelectedTypedFactSource";
     GoCallableLookups => "go_callable_lookups", "SelectedTypedFactSource";
+    InvocationRolesForReferences => "invocation_roles_for_references", "SelectedTypedFactSource";
+    LookupsOutsideImplicitRoot => "lookups_outside_implicit_root", "SelectedTypedFactSource";
     GoMemberDeclarations => "go_member_declarations", "SelectedTypedFactSource";
     JavaInheritanceDeclarations => "java_inheritance_declarations", "SelectedTypedFactSource";
     RustSupertraitOwners => "rust_supertrait_owners", "SelectedTypedFactSource";
@@ -1412,6 +1415,16 @@ where
         outcome
     }
 
+    fn lookup_namespace(
+        &self,
+        lookup: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace>>
+    {
+        record_call(SeamMethod::LookupNamespace, 1);
+        self.inner.lookup_namespace(lookup, cancellation)
+    }
+
     fn selection_has_java_semantics(&self) -> bool {
         record_call(SeamMethod::SelectionHasJavaSemantics, 0);
         self.inner.selection_has_java_semantics()
@@ -1472,6 +1485,36 @@ where
         let outcome = self.inner.go_callable_lookups(lookups, cancellation);
         if let Ok(Some(rows)) = &outcome {
             record_rows(SeamMethod::GoCallableLookups, rows.len());
+        }
+        outcome
+    }
+
+    fn invocation_roles_for_references(
+        &self,
+        references: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<super::fact_source::SelectedInvocationRole>>> {
+        record_call(SeamMethod::InvocationRolesForReferences, references.len());
+        let outcome = self
+            .inner
+            .invocation_roles_for_references(references, cancellation);
+        if let Ok(Some(rows)) = &outcome {
+            record_rows(SeamMethod::InvocationRolesForReferences, rows.len());
+        }
+        outcome
+    }
+
+    fn lookups_outside_implicit_root(
+        &self,
+        lookups: &[(BindingFragmentId, SemanticId)],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        record_call(SeamMethod::LookupsOutsideImplicitRoot, lookups.len());
+        let outcome = self
+            .inner
+            .lookups_outside_implicit_root(lookups, cancellation);
+        if let Ok(Some(rows)) = &outcome {
+            record_rows(SeamMethod::LookupsOutsideImplicitRoot, rows.len());
         }
         outcome
     }
@@ -1919,7 +1962,7 @@ mod tests {
             typed
         );
         assert_eq!(batch.len(), 29, "BatchResolutionFragmentSource: {batch:?}");
-        assert_eq!(typed.len(), 68, "SelectedTypedFactSource: {typed:?}");
+        assert_eq!(typed.len(), 71, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = SeamMethod::ALL
             .iter()
@@ -1938,7 +1981,7 @@ mod tests {
             declared, forwarded,
             "the reader seam and SeamProfiled disagree; declared {declared:?}, forwarded {forwarded:?}"
         );
-        assert_eq!(METHOD_COUNT, 97);
+        assert_eq!(METHOD_COUNT, 100);
     }
 
     /// The instrument is off unless the variable names a file, and nothing in

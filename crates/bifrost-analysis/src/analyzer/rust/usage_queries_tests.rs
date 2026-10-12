@@ -947,6 +947,9 @@ items! {
         let seeds = usage_binding_seeds_while(&analyzer, scope.token(), &roots, &|| true)
             .expect("complete seed query after cancellation")
             .expect("complete seeds after cancellation");
+        // The seeds built the routes in this query scope, so the route memo
+        // answers before the keep_going poll and the candidate read itself
+        // is what reports the cancellation.
         assert!(matches!(
             usage_candidate_files_from_binding_seeds_while(
                 &analyzer,

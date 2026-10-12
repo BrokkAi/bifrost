@@ -748,22 +748,24 @@ pub(super) const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
 ];
 
 /// One sole producer-identity bump point for the complete persisted bundle.
+/// Changes to shared lowering invalidate every language, including producers
+/// whose source facts are unchanged.
 pub(crate) const fn resolution_bundle_epoch(language: Language) -> &'static str {
     match language {
-        Language::Java => "resolution-bundle-java-v36",
-        Language::Go => "resolution-bundle-go-v50",
-        Language::Cpp => "resolution-bundle-cpp-v19",
-        Language::JavaScript => "resolution-bundle-javascript-v18",
-        Language::TypeScript => "resolution-bundle-typescript-v18",
-        Language::Python => "resolution-bundle-python-v18",
+        Language::Java => "resolution-bundle-java-v38-jvm-batch-3-merge-2026-10",
+        Language::Go => "resolution-bundle-go-v51",
+        Language::Cpp => "resolution-bundle-cpp-v20",
+        Language::JavaScript => "resolution-bundle-javascript-v19",
+        Language::TypeScript => "resolution-bundle-typescript-v19",
+        Language::Python => "resolution-bundle-python-v19",
         // Macro-head references are already indexed at their invocation sites;
         // do not add the macro name as a candidate from its own argument gap.
-        Language::Rust => "resolution-bundle-rust-v99",
-        Language::Php => "resolution-bundle-php-v18",
-        Language::Scala => "resolution-bundle-scala-v46",
-        Language::CSharp => "resolution-bundle-csharp-v18",
-        Language::Ruby => "resolution-bundle-ruby-v18",
-        Language::Kotlin => "resolution-bundle-kotlin-v36",
+        Language::Rust => "resolution-bundle-rust-v98",
+        Language::Php => "resolution-bundle-php-v19",
+        Language::Scala => "resolution-bundle-scala-v55-jvm-batch-3-merge-2026-10",
+        Language::CSharp => "resolution-bundle-csharp-v19",
+        Language::Ruby => "resolution-bundle-ruby-v19",
+        Language::Kotlin => "resolution-bundle-kotlin-v39-jvm-batch-3-merge-2026-10",
         Language::None => panic!("a resolution bundle needs an analyzable language"),
     }
 }

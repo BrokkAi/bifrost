@@ -52,7 +52,10 @@ test("rejects a Codex adapter that silently falls back to the package cwd", asyn
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "bifrost-post-release-contract-"));
   try {
     const fixture = path.join(tempRoot, "bifrost-agent");
-    await fs.cp(packageDir, fixture, { recursive: true });
+    await fs.cp(packageDir, fixture, {
+      recursive: true,
+      filter: (sourcePath) => path.basename(sourcePath) !== "node_modules",
+    });
     const mcpPath = path.join(fixture, ".mcp.json");
     const mcp = JSON.parse(await fs.readFile(mcpPath, "utf8"));
     mcp.mcpServers.bifrost.cwd = "..";

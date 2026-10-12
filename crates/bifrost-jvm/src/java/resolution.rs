@@ -6,6 +6,7 @@
 //! references project properties of whichever declaration a selected revision
 //! later binds.
 
+use crate::constructor_site::ConstructorSite;
 use brokk_bifrost_core::analyzer::model::{DeclarationKind, JavaTypeConstructorShape};
 use brokk_bifrost_core::analyzer::resolution_facts::{
     BindingProjectionFact, BindingProjectionKind, DeclarationTypeRole, DeclarationTypeSlotFact,
@@ -35,7 +36,9 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
 use brokk_bifrost_core::analyzer::source_facts::{
     PrimarySourceFactCollector, SourceDeclarationId, SourceFactRows, SourceOccurrenceId,
 };
-use brokk_bifrost_core::analyzer::structural::adapter_helpers::first_named_child;
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
+    first_named_child, nearest_ancestor,
+};
 use brokk_bifrost_core::analyzer::structural::resolution::{DeclaredVisibility, HoistingClass};
 use brokk_bifrost_core::analyzer::tree_walk::{
     TreeWalkAction, first_named_child_of_kind, named_children,
@@ -147,7 +150,6 @@ struct TypeContext {
     body_scope: Option<ResolutionScopeId>,
     name: Option<ResolutionNameId>,
     flavor: TypeFlavor,
-    direct_default_construction_proof_eligible: bool,
     constructor_shape: Option<JavaTypeConstructorShape>,
     is_java_lang_object: bool,
     has_explicit_superclass: bool,
@@ -752,12 +754,22 @@ impl<'source> JavaResolutionBuilder<'source> {
             _ => {}
         }
 
-        if self.is_unsupported_semantic_subtree(node) {
-            return self.suppress_with_gap(
-                node,
-                ResolutionSiteKind::UnsupportedDeclaration,
-                ResolutionGapKind::UnsupportedScopeOrBinder,
-            );
+        if let Some(parent) = node.parent()
+            && parent.kind() == "for_statement"
+            && node.kind() != "local_variable_declaration"
+            && ["init", "condition", "update"].iter().any(|field| {
+                let mut cursor = parent.walk();
+                parent
+                    .children_by_field_name(field, &mut cursor)
+                    .any(|child| child == node)
+            })
+        {
+            self.lower_expression(node);
+            return TreeWalkAction::Descend;
+        }
+
+        if node.kind() == "module_declaration" {
+            return self.lower_module_declaration(node);
         }
 
         if self.gapped_semantic_subtrees.contains(&node.id()) {
@@ -778,6 +790,13 @@ impl<'source> JavaResolutionBuilder<'source> {
 
         if node.kind() == "switch_expression" {
             self.lower_switch_selector(node);
+        } else if node.kind() == "guard" {
+            if let Some(condition) = named_children(node)
+                .into_iter()
+                .find(|child| !child.is_extra())
+            {
+                self.lower_expression(condition);
+            }
         } else if node.kind() == "switch_label" {
             self.lower_switch_label(node);
         } else if node.kind() == "synchronized_statement"
@@ -843,6 +862,9 @@ impl<'source> JavaResolutionBuilder<'source> {
                 });
             self.scope_stack.push(scope);
             self.exit_actions.push(ExitAction::Scope);
+            if node.kind() == "enhanced_for_statement" {
+                self.lower_enhanced_for(node);
+            }
             return TreeWalkAction::DescendWithExit;
         }
 
@@ -900,7 +922,9 @@ impl<'source> JavaResolutionBuilder<'source> {
                     );
                 }
             }
-            "type_pattern" => self.lower_type_pattern(node),
+            "resource" => self.lower_resource(node),
+            "record_pattern" => self.lower_record_pattern_type(node),
+            "type_pattern" | "record_pattern_component" => self.lower_type_pattern(node),
             "spread_parameter" => {
                 return if self.lower_spread_parameter(node) {
                     self.suppress_semantics()
@@ -1003,6 +1027,66 @@ impl<'source> JavaResolutionBuilder<'source> {
         TreeWalkAction::DescendWithExit
     }
 
+    fn add_declared_head_local(
+        &mut self,
+        name: Node<'_>,
+        activation: std::ops::Range<usize>,
+    ) -> ResolutionSiteId {
+        let scope = self.current_scope();
+        let declaration = self.add_identifier_site(
+            name,
+            ResolutionSiteKind::ValueDeclaration,
+            scope,
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Value,
+            None,
+        );
+        self.facts.binders.push(ResolutionBinderFact {
+            declaration,
+            scope,
+            kind: ResolutionBinderKind::Local,
+            hoisting: HoistingClass::DeclaredHead,
+            activation_start: activation.start,
+            activation_end: activation.end,
+        });
+        self.register_local_value_binder(scope, name, activation.start, activation.end);
+        declaration
+    }
+
+    fn lower_enhanced_for(&mut self, node: Node<'_>) {
+        let (Some(name), Some(type_node), Some(value), Some(body)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("type"),
+            node.child_by_field_name("value"),
+            node.child_by_field_name("body"),
+        ) else {
+            let site = self.add_site(node, ResolutionSiteKind::UnsupportedDeclaration);
+            self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+            return;
+        };
+        // The iterable is evaluated outside the loop variable's activation.
+        self.lower_expression(value);
+        if name.kind() == "underscore_pattern" {
+            self.lower_type(type_node);
+            return;
+        }
+        assert!(is_spelled_identifier(name));
+        let declaration = self.add_declared_head_local(name, body.start_byte()..body.end_byte());
+        let source_declaration = self.record_declaration_source(node, declaration);
+        self.source_collector
+            .mark_lexical(source_declaration, DeclarationKind::EnhancedForVariable);
+        if let Some(dimensions) = node.child_by_field_name("dimensions") {
+            self.attach_declaration_gap_type(
+                declaration,
+                dimensions,
+                DeclarationTypeRole::Value,
+                ResolutionGapKind::PostfixArrayDimensions,
+            );
+        } else {
+            self.attach_declaration_type(declaration, type_node, DeclarationTypeRole::Value);
+        }
+    }
+
     fn lower_catch_formal_parameter(&mut self, node: Node<'_>) {
         let Some(clause) = node
             .parent()
@@ -1035,32 +1119,13 @@ impl<'source> JavaResolutionBuilder<'source> {
             return;
         }
 
-        let scope = self.current_scope();
-        let declaration = self.add_identifier_site(
-            name,
-            ResolutionSiteKind::ValueDeclaration,
-            scope,
-            ResolutionIdentifierRole::Declaration,
-            ResolutionNamespace::Value,
-            None,
-        );
-        let source_declaration = self.record_declaration_source(node, declaration);
-        self.source_collector
-            .mark_lexical(source_declaration, DeclarationKind::CatchParameter);
         let body = clause
             .child_by_field_name("body")
             .expect("validated Java catch clause has a body");
-        let activation_start = body.start_byte();
-        let activation_end = body.end_byte();
-        self.facts.binders.push(ResolutionBinderFact {
-            declaration,
-            scope,
-            kind: ResolutionBinderKind::Local,
-            hoisting: HoistingClass::DeclaredHead,
-            activation_start,
-            activation_end,
-        });
-        self.register_local_value_binder(scope, name, activation_start, activation_end);
+        let declaration = self.add_declared_head_local(name, body.start_byte()..body.end_byte());
+        let source_declaration = self.record_declaration_source(node, declaration);
+        self.source_collector
+            .mark_lexical(source_declaration, DeclarationKind::CatchParameter);
 
         match types.as_slice() {
             [type_node] => {
@@ -1245,7 +1310,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             match node.kind() {
                 "annotation" | "marker_annotation" => {
                     if let Some(name) = node.child_by_field_name("name") {
-                        self.lower_annotation_type_name(name);
+                        self.lower_named_type_reference(name);
                     } else {
                         let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
                         self.add_gap(site, ResolutionGapKind::MalformedSyntax);
@@ -1291,7 +1356,58 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
     }
 
-    fn lower_annotation_type_name(&mut self, node: Node<'_>) {
+    fn lower_module_declaration(&mut self, node: Node<'_>) -> TreeWalkAction {
+        let Some(body) = node.child_by_field_name("body") else {
+            return self.suppress_with_gap(
+                node,
+                ResolutionSiteKind::UnsupportedDeclaration,
+                ResolutionGapKind::MalformedSyntax,
+            );
+        };
+        for annotation in named_children(node)
+            .into_iter()
+            .filter(|child| matches!(child.kind(), "annotation" | "marker_annotation"))
+        {
+            self.lower_annotation(annotation);
+        }
+        // Modules declare no member-resolution binder. Service and provider
+        // names are type references; requires/exports/opens name modules or
+        // packages and do not participate in member lookup.
+        for directive in named_children(body) {
+            if directive.has_error() || directive.is_missing() {
+                let site = self.add_site(directive, ResolutionSiteKind::UnsupportedDeclaration);
+                self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+            }
+            let type_names = match directive.kind() {
+                "uses_module_directive" => directive
+                    .child_by_field_name("type")
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "provides_module_directive" => {
+                    // The grammar fields the service as provided and later
+                    // providers as provider, but the first provider is an
+                    // unfielded named child. Every direct name is a type.
+                    named_children(directive)
+                        .into_iter()
+                        .filter(|child| matches!(child.kind(), "identifier" | "scoped_identifier"))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            for type_node in type_names {
+                self.lower_named_type_reference(type_node);
+            }
+        }
+        // Keep the existing full-tree legacy type-identifier census, while
+        // excluding non-member module/package names from native occurrences.
+        self.suppress_semantics()
+    }
+
+    fn lower_named_type_reference(&mut self, node: Node<'_>) {
+        if node.has_error() || node.is_missing() {
+            self.lower_gap_type(node, ResolutionGapKind::MalformedSyntax);
+            return;
+        }
         if matches!(node.kind(), "identifier" | "type_identifier") {
             self.lower_plain_type_reference(node);
             return;
@@ -1354,7 +1470,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         );
         route_segments
             .pop()
-            .expect("qualified annotation has a terminal name");
+            .expect("qualified type name has a terminal name");
         self.record_rooted_type_route(terminal, root_reference, route_segments);
         self.add_gap(root_reference, ResolutionGapKind::AmbiguousQualifiedType);
         for site in qualified_sites {
@@ -1828,9 +1944,6 @@ impl<'source> JavaResolutionBuilder<'source> {
                 ResolutionGapKind::UnsupportedHierarchyTraversal,
             );
         }
-        if context.direct_default_construction_proof_eligible {
-            self.add_gap(context.declaration, ResolutionGapKind::ImplicitConstructor);
-        }
     }
 
     fn exit_type_parameter_scope(&mut self) {
@@ -2255,12 +2368,12 @@ impl<'source> JavaResolutionBuilder<'source> {
             _ => unreachable!("caller filters Java type declarations"),
         };
         // Abstract classes have JLS default constructors, but direct `new` is
-        // forbidden. Until those two facts have separate rows, keep this
-        // marker conservative for exact direct-construction proof.
+        // forbidden. Until those two facts have separate rows, an abstract
+        // class publishes no default constructor site.
         let modifiers = self.source_modifiers_for(node);
         let enclosing_type = self.type_contexts.last().copied();
         let source_type_shape = self.source_type_shape_for(node);
-        let direct_default_construction_proof_eligible = flavor == TypeFlavor::Class
+        let publishes_default_constructor = flavor == TypeFlavor::Class
             && !modifiers.is_abstract
             && matches!(
                 source_type_shape.constructor_shape,
@@ -2282,7 +2395,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         );
         let source_declaration = self.record_declaration_source(node, declaration);
         if is_local_type {
-            self.record_scoped_type_visibility(declaration);
+            self.record_scoped_visibility(declaration);
         } else {
             self.add_declaration_visibility(declaration, node, source_declaration);
         }
@@ -2350,6 +2463,15 @@ impl<'source> JavaResolutionBuilder<'source> {
                     "one Java type-body scope per type declaration"
                 );
             }
+            if publishes_default_constructor {
+                self.lower_default_constructor(
+                    body,
+                    declaration,
+                    type_name,
+                    body_scope,
+                    source_declaration,
+                );
+            }
             Some(body_scope)
         } else {
             None
@@ -2359,7 +2481,6 @@ impl<'source> JavaResolutionBuilder<'source> {
             body_scope,
             name: Some(type_name),
             flavor,
-            direct_default_construction_proof_eligible,
             constructor_shape: source_type_shape.constructor_shape,
             is_java_lang_object: enclosing_type.is_none()
                 && binding_scope == ResolutionScopeId::new(0)
@@ -2451,7 +2572,6 @@ impl<'source> JavaResolutionBuilder<'source> {
             body_scope: Some(body_scope),
             name: None,
             flavor: TypeFlavor::Class,
-            direct_default_construction_proof_eligible: false,
             constructor_shape: None,
             is_java_lang_object: false,
             has_explicit_superclass,
@@ -2507,10 +2627,37 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
     }
 
+    fn lower_record_pattern_type(&mut self, pattern: Node<'_>) {
+        // This grammar has positional children, not type/name fields:
+        // the nominal header precedes record_pattern_body. Nested patterns
+        // are visited by the ordinary iterative tree walk.
+        let Some(type_node) = named_children(pattern)
+            .into_iter()
+            .find(|child| !child.is_extra())
+        else {
+            let site = self.add_site(pattern, ResolutionSiteKind::UnsupportedDeclaration);
+            self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+            return;
+        };
+        match type_node.kind() {
+            "identifier" => self.lower_named_type_reference(type_node),
+            "generic_type" => {
+                self.lower_type(type_node);
+            }
+            _ => {
+                let site = self.add_site(pattern, ResolutionSiteKind::UnsupportedDeclaration);
+                self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+            }
+        }
+    }
+
     fn lower_type_pattern(&mut self, pattern: Node<'_>) {
-        // tree-sitter-java has no named fields on `type_pattern`; its named
-        // children are the type syntax followed by the binding identifier.
-        let children = named_children(pattern);
+        // type_pattern and record_pattern_component have positional children:
+        // type syntax followed by the binding identifier or unnamed pattern.
+        let children = named_children(pattern)
+            .into_iter()
+            .filter(|child| !child.is_extra())
+            .collect::<Vec<_>>();
         let Some(type_index) = children
             .iter()
             .position(|child| self.is_type_syntax(child.kind()))
@@ -2527,13 +2674,30 @@ impl<'source> JavaResolutionBuilder<'source> {
         let Some(name) = children.get(type_index + 1).copied() else {
             return;
         };
+        if name.kind() == "underscore_pattern" {
+            return;
+        }
         if !is_spelled_identifier(name) {
             let site = self.add_site(pattern, ResolutionSiteKind::UnsupportedDeclaration);
             self.add_gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
             return;
         }
+        let (Some(head), Some(arm)) = (
+            nearest_ancestor(pattern, |kind| kind == "pattern"),
+            nearest_ancestor(pattern, |kind| {
+                matches!(kind, "switch_rule" | "switch_block_statement_group")
+            }),
+        ) else {
+            // instanceof flow scopes do not have a match arm. Preserve the
+            // type occurrence and report the unmodeled binder locally.
+            let site = self.add_site(pattern, ResolutionSiteKind::UnsupportedDeclaration);
+            self.add_gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
+            return;
+        };
         let scope_id = self.current_scope();
         let scope = *self.scope(scope_id);
+        assert_eq!(scope.start_byte, arm.start_byte());
+        assert_eq!(scope.end_byte, arm.end_byte());
         let declaration = self.add_identifier_site(
             name,
             ResolutionSiteKind::ValueDeclaration,
@@ -2551,9 +2715,10 @@ impl<'source> JavaResolutionBuilder<'source> {
             scope: scope_id,
             kind: ResolutionBinderKind::Pattern,
             hoisting: HoistingClass::DeclaredHead,
-            activation_start: pattern.end_byte(),
+            activation_start: head.end_byte(),
             activation_end: scope.end_byte,
         });
+        self.register_local_value_binder(scope_id, name, head.end_byte(), scope.end_byte);
         self.attach_declaration_type(declaration, type_node, DeclarationTypeRole::Value);
     }
 
@@ -2836,6 +3001,50 @@ impl<'source> JavaResolutionBuilder<'source> {
         })
     }
 
+    /// The constructor Java supplies for a class that writes none (JLS 8.8.9):
+    /// it takes no arguments and has the class's own access. The class itself
+    /// declares it, so its source declaration is the class declaration and a
+    /// call that selects it navigates to the class. The class body anchors the
+    /// site, since a site must lie within its scope and the body scope does not
+    /// reach the class name. The call's result type is the owner.
+    fn lower_default_constructor(
+        &mut self,
+        body: Node<'_>,
+        owner: ResolutionSiteId,
+        owner_name: ResolutionNameId,
+        scope: ResolutionScopeId,
+        class_source: SourceDeclarationId,
+    ) {
+        let site = self.add_site_in_scope(body, ResolutionSiteKind::ConstructorDeclaration, scope);
+        self.declaration_sources.push((site, class_source));
+        let visibility = self
+            .facts
+            .declaration_visibilities
+            .iter()
+            .find(|fact| fact.declaration == owner)
+            .expect("a Java class records its visibility before its default constructor")
+            .visibility;
+        if visibility == DeclaredVisibility::Unknown {
+            self.record_scoped_visibility(site);
+        } else {
+            self.record_declaration_visibility(site, visibility);
+        }
+        ConstructorSite {
+            site,
+            owner,
+            owner_name,
+            scope,
+        }
+        .publish(&mut self.facts);
+        self.facts
+            .callable_signatures
+            .push(ResolutionCallableSignatureFact {
+                callable: site,
+                type_parameter_count: 0,
+                result_types: Vec::new(),
+            });
+    }
+
     fn lower_initializer(&mut self, node: Node<'_>) {
         let site = self.add_site(node, ResolutionSiteKind::Initializer);
         let Some(body) = first_named_child_of_kind(node, "block") else {
@@ -3032,6 +3241,72 @@ impl<'source> JavaResolutionBuilder<'source> {
         true
     }
 
+    fn lower_resource(&mut self, node: Node<'_>) {
+        let Some(name) = node.child_by_field_name("name") else {
+            // Java 9 also permits an existing variable or field as a resource.
+            if let Some(value) = named_children(node)
+                .into_iter()
+                .find(|child| matches!(child.kind(), "identifier" | "field_access"))
+            {
+                self.lower_expression(value);
+            } else {
+                let site = self.add_site(node, ResolutionSiteKind::UnsupportedDeclaration);
+                self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+            }
+            return;
+        };
+        let (Some(type_node), Some(value)) = (
+            node.child_by_field_name("type"),
+            node.child_by_field_name("value"),
+        ) else {
+            let site = self.add_site(node, ResolutionSiteKind::UnsupportedDeclaration);
+            self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+            return;
+        };
+        if name.kind() == "underscore_pattern" {
+            self.lower_type(type_node);
+            self.lower_expression(value);
+            return;
+        }
+        assert!(is_spelled_identifier(name));
+        let statement = node
+            .parent()
+            .and_then(|resources| resources.parent())
+            .expect("a resource belongs to a resource specification and try statement");
+        assert_eq!(statement.kind(), "try_with_resources_statement");
+        let body = statement
+            .child_by_field_name("body")
+            .expect("a try-with-resources statement has a body");
+        // Earlier resources are visible in later initializers, but not in
+        // the catch or finally clauses (JLS 6.3).
+        let declaration = self.add_declared_head_local(name, value.end_byte()..body.end_byte());
+        let source_declaration = self.record_declaration_source(node, declaration);
+        self.source_collector
+            .mark_lexical(source_declaration, DeclarationKind::ResourceVariable);
+        let source_type = self.capture_source_type(type_node);
+        let inferred = node.child_by_field_name("dimensions").is_none()
+            && self.source_types.is_inferred_type(source_type);
+        let initializer = self.lower_expression(value);
+        if inferred {
+            self.attach_inferred_local_type(declaration, type_node, initializer);
+        } else if let Some(dimensions) = node.child_by_field_name("dimensions") {
+            self.attach_declaration_gap_type(
+                declaration,
+                dimensions,
+                DeclarationTypeRole::Value,
+                ResolutionGapKind::PostfixArrayDimensions,
+            );
+        } else {
+            self.attach_declaration_type(declaration, type_node, DeclarationTypeRole::Value);
+        }
+        let observed = self.add_slot(declaration, ResolutionTypeSlotRole::AssignmentValue);
+        self.add_transfer(
+            initializer,
+            observed,
+            ResolutionTypeTransferKind::Assignment,
+        );
+    }
+
     fn lower_variable_declaration(&mut self, declaration_form: Node<'_>) {
         let is_field = matches!(
             declaration_form.kind(),
@@ -3139,32 +3414,7 @@ impl<'source> JavaResolutionBuilder<'source> {
                     .push(declaration);
             }
             if let Some(initializer) = inferred_initializer {
-                // JLS 14.4.1: a local var declaration takes its static type
-                // from the initializer's produced value.
-                assert_eq!(type_node.kind(), "type_identifier");
-                assert!(
-                    self.claimed_identifier_nodes.insert(type_node.id()),
-                    "one inferred local declaration claims its var token"
-                );
-                let value_type = self.add_slot(declaration, ResolutionTypeSlotRole::DeclaredValue);
-                self.facts
-                    .declaration_type_slots
-                    .push(DeclarationTypeSlotFact {
-                        declaration,
-                        slot: value_type,
-                        role: DeclarationTypeRole::Value,
-                    });
-                self.add_transfer(
-                    initializer,
-                    value_type,
-                    ResolutionTypeTransferKind::Initialization,
-                );
-                assert!(
-                    self.declaration_type_slots
-                        .insert(declaration, value_type)
-                        .is_none(),
-                    "one Java declaration has one declared-value slot"
-                );
+                self.attach_inferred_local_type(declaration, type_node, initializer);
             } else if let Some(dimensions) = node.child_by_field_name("dimensions") {
                 self.attach_declaration_gap_type(
                     declaration,
@@ -3200,6 +3450,40 @@ impl<'source> JavaResolutionBuilder<'source> {
                 );
             }
         }
+    }
+
+    fn attach_inferred_local_type(
+        &mut self,
+        declaration: ResolutionSiteId,
+        type_node: Node<'_>,
+        initializer: ResolutionTypeSlotId,
+    ) {
+        // JLS 14.4.1: a local var declaration takes its static type
+        // from the initializer's produced value.
+        assert_eq!(type_node.kind(), "type_identifier");
+        assert!(
+            self.claimed_identifier_nodes.insert(type_node.id()),
+            "one inferred local declaration claims its var token"
+        );
+        let value_type = self.add_slot(declaration, ResolutionTypeSlotRole::DeclaredValue);
+        self.facts
+            .declaration_type_slots
+            .push(DeclarationTypeSlotFact {
+                declaration,
+                slot: value_type,
+                role: DeclarationTypeRole::Value,
+            });
+        self.add_transfer(
+            initializer,
+            value_type,
+            ResolutionTypeTransferKind::Initialization,
+        );
+        assert!(
+            self.declaration_type_slots
+                .insert(declaration, value_type)
+                .is_none(),
+            "one Java declaration has one declared-value slot"
+        );
     }
 
     fn lower_return(&mut self, node: Node<'_>) {
@@ -3420,6 +3704,15 @@ impl<'source> JavaResolutionBuilder<'source> {
             self.add_gap(subtype, ResolutionGapKind::UnsupportedHierarchyTraversal);
             return;
         }
+        // An anonymous creation's type is lowered in its enclosing scope
+        // before the synthetic body owner exists. The same written occurrence
+        // becomes that body's supertype when the body is entered.
+        self.facts
+            .reference_owners
+            .iter_mut()
+            .find(|owner| owner.reference == supertype_reference)
+            .expect("a written supertype reference has an owner row")
+            .owner = Some(subtype);
         let parent_ordinal = self.take_parent_ordinal(subtype);
         self.facts.supertypes.push(ResolutionSupertypeFact {
             subtype,
@@ -3642,7 +3935,7 @@ impl<'source> JavaResolutionBuilder<'source> {
                     pending.push((current, true));
                     pending.push((element, false));
                 }
-                ("type_identifier", JavaTypeSyntaxShape::Named { .. }) => {
+                ("type_identifier" | "identifier", JavaTypeSyntaxShape::Named { .. }) => {
                     self.lower_plain_type_reference(current);
                 }
                 ("type_identifier", JavaTypeSyntaxShape::Unknown)
@@ -4392,6 +4685,9 @@ impl<'source> JavaResolutionBuilder<'source> {
             .into_iter()
             .any(is_java_synthetic_class_body)
         {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                self.lower_type(type_node);
+            }
             // Constructor selection for anonymous creation is outside this
             // producer. The class body lowers the base type as its supertype.
             self.lower_unsupported_expression_preserving_children(node);
@@ -4819,11 +5115,11 @@ impl<'source> JavaResolutionBuilder<'source> {
             .unwrap_or_else(|| panic!("{missing_message}"))
     }
 
-    fn record_scoped_type_visibility(&mut self, declaration: ResolutionSiteId) {
-        assert_eq!(
+    fn record_scoped_visibility(&mut self, declaration: ResolutionSiteId) {
+        assert!(matches!(
             self.site(declaration).kind,
-            ResolutionSiteKind::TypeDeclaration
-        );
+            ResolutionSiteKind::TypeDeclaration | ResolutionSiteKind::ConstructorDeclaration
+        ));
         assert!(
             self.facts
                 .declaration_visibilities
@@ -4832,7 +5128,8 @@ impl<'source> JavaResolutionBuilder<'source> {
         );
         // Local and synthetic types have no Java access modifier. Their
         // lexical or synthetic scope controls reachability; they are never
-        // package or member exports.
+        // package or member exports. The default constructor of a local class
+        // shares that scope.
         self.facts
             .declaration_visibilities
             .push(ResolutionDeclarationVisibilityFact {
@@ -4877,20 +5174,6 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
     }
 
-    fn is_unsupported_semantic_subtree(&self, node: Node<'_>) -> bool {
-        matches!(
-            node.kind(),
-            "throws"
-                | "permits"
-                | "module_declaration"
-                | "resource"
-                | "enhanced_for_statement"
-                | "for_statement"
-                | "record_pattern"
-                | "receiver_parameter"
-        )
-    }
-
     fn is_type_syntax(&self, kind: &str) -> bool {
         matches!(
             kind,
@@ -4908,7 +5191,10 @@ impl<'source> JavaResolutionBuilder<'source> {
     fn is_scope_body(&self, node: Node<'_>) -> bool {
         matches!(
             node.kind(),
-            "class_body"
+            "for_statement"
+                | "enhanced_for_statement"
+                | "try_with_resources_statement"
+                | "class_body"
                 | "interface_body"
                 | "enum_body"
                 | "annotation_type_body"
@@ -5444,8 +5730,10 @@ mod tests {
         "#;
         let facts = parse(source);
 
-        assert_eq!(facts.declaration_visibilities.len(), 32);
-        assert_eq!(facts.visibility_eligibilities.len(), 32);
+        // Thirty-two declarations and the six default constructors of the
+        // classes that write none, which take their class's access.
+        assert_eq!(facts.declaration_visibilities.len(), 38);
+        assert_eq!(facts.visibility_eligibilities.len(), 38);
         assert!(facts.declaration_visibilities.iter().all(|visibility| {
             facts
                 .visibility_eligibilities
@@ -5673,7 +5961,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            facts.member_owners,
+            facts
+                .member_owners
+                .iter()
+                .filter(|owner| owner.kind == ResolutionMemberKind::NestedType)
+                .copied()
+                .collect::<Vec<_>>(),
             vec![ResolutionMemberOwnerFact {
                 member: foo,
                 owner: b,
@@ -5748,16 +6041,8 @@ mod tests {
                     kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
                 },
                 ResolutionGapFact {
-                    site: a,
-                    kind: ResolutionGapKind::ImplicitConstructor,
-                },
-                ResolutionGapFact {
                     site: implicit_superclass_reference(&facts, foo),
                     kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
-                ResolutionGapFact {
-                    site: foo,
-                    kind: ResolutionGapKind::ImplicitConstructor,
                 },
                 ResolutionGapFact {
                     site: b,
@@ -5769,7 +6054,15 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(visibility_gap_sites(&facts), vec![a, b]);
+        // `A` is package-private, and so is the default constructor it supplies.
+        let a_constructor = identifier(
+            &facts,
+            "A",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Constructor,
+        )
+        .site;
+        assert_eq!(visibility_gap_sites(&facts), vec![a, a_constructor, b]);
     }
 
     #[test]
@@ -6097,11 +6390,22 @@ mod tests {
             transfer.kind != ResolutionTypeTransferKind::Return
                 || transfer.output != declared_result
         }));
-        assert_eq!(
+        // The three ordinary classes each supply a default constructor, which
+        // is a declared site now and no longer a marker gap.
+        assert!(
             facts
                 .gaps
                 .iter()
-                .filter(|gap| gap.kind == ResolutionGapKind::ImplicitConstructor)
+                .all(|gap| gap.kind != ResolutionGapKind::ImplicitConstructor)
+        );
+        assert_eq!(
+            facts
+                .identifiers
+                .iter()
+                .filter(
+                    |identifier| identifier.role == ResolutionIdentifierRole::Declaration
+                        && identifier.namespace == ResolutionNamespace::Constructor
+                )
                 .count(),
             3
         );
@@ -6592,7 +6896,7 @@ mod tests {
     }
 
     #[test]
-    fn only_directly_instantiable_classes_publish_default_construction_proof_markers() {
+    fn only_directly_instantiable_classes_publish_a_default_constructor_site() {
         let overloaded = parse("record R(int x) { R() { this(0); } }");
         let r = identifier(
             &overloaded,
@@ -6637,19 +6941,33 @@ mod tests {
             "implicit record-component parameters are not fabricated"
         );
 
+        let constructors = |facts: &FileResolutionFacts| {
+            facts
+                .identifiers
+                .iter()
+                .filter(|identifier| {
+                    identifier.role == ResolutionIdentifierRole::Declaration
+                        && identifier.namespace == ResolutionNamespace::Constructor
+                })
+                .map(|identifier| identifier.site)
+                .collect::<Vec<_>>()
+        };
         let abstract_class = parse("public abstract class AbstractWorker {}");
-        let abstract_worker = identifier(
-            &abstract_class,
-            "AbstractWorker",
+        assert!(constructors(&abstract_class).is_empty());
+
+        let written = parse("public class Written { public Written(int x) {} }");
+        let written_constructor = identifier(
+            &written,
+            "Written",
             ResolutionIdentifierRole::Declaration,
-            ResolutionNamespace::Type,
+            ResolutionNamespace::Constructor,
         )
         .site;
-        assert!(!abstract_class.gaps.contains(&ResolutionGapFact {
-            site: abstract_worker,
-            kind: ResolutionGapKind::ImplicitConstructor,
-        }));
+        assert_eq!(constructors(&written), vec![written_constructor]);
+        assert_eq!(written.callable_signatures.len(), 1);
 
+        // A class that writes no constructor supplies one: no parameters, the
+        // class's own access, declared by the class in its body scope.
         let ordinary = parse("public class Worker {}");
         let worker = identifier(
             &ordinary,
@@ -6658,10 +6976,47 @@ mod tests {
             ResolutionNamespace::Type,
         )
         .site;
-        assert!(ordinary.gaps.contains(&ResolutionGapFact {
-            site: worker,
-            kind: ResolutionGapKind::ImplicitConstructor,
+        let constructor = identifier(
+            &ordinary,
+            "Worker",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Constructor,
+        )
+        .site;
+        assert_eq!(constructors(&ordinary), vec![constructor]);
+        assert_eq!(
+            site(&ordinary, constructor).kind,
+            ResolutionSiteKind::ConstructorDeclaration
+        );
+        let scope = ordinary.scope(site(&ordinary, constructor).scope);
+        assert_eq!(scope.kind, ResolutionScopeKind::TypeBody);
+        assert_eq!(scope.owner, Some(worker));
+        assert!(ordinary.member_owners.contains(&ResolutionMemberOwnerFact {
+            member: constructor,
+            owner: worker,
+            kind: ResolutionMemberKind::Constructor,
+            access: ResolutionMemberAccess::Type,
+            qualifier_compatibility: ResolutionMemberQualifierCompatibility::TypeOnly,
         }));
+        assert!(
+            ordinary
+                .callable_signatures
+                .iter()
+                .any(|signature| signature.callable == constructor
+                    && signature.type_parameter_count == 0)
+        );
+        assert!(
+            ordinary
+                .callable_parameters
+                .iter()
+                .all(|parameter| parameter.callable != constructor)
+        );
+        assert!(
+            ordinary
+                .gaps
+                .iter()
+                .all(|gap| gap.kind != ResolutionGapKind::ImplicitConstructor)
+        );
     }
 
     #[test]
@@ -7320,23 +7675,197 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2771: record-pattern suppression hid nested component bindings and references"
+    )]
+    fn record_pattern_grammar_children_bind_only_their_match_arm() {
+        use brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind;
+        let source = "class A { int f(Object o) { return switch(o) { case Box(int /*binding*/ value, Box(int nested)) when /*guard*/ ok(value) -> value + nested; default -> 0; }; } }";
+        let tree = super::super::declarations::parse_tree(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let records = collect_nodes_by_kind(tree.root_node(), "record_pattern");
+        assert_eq!(records.len(), 2);
+        for record in records {
+            assert!(record.child_by_field_name("type").is_none());
+            assert_eq!(record.named_child(0).unwrap().kind(), "identifier");
+            assert_eq!(record.named_child(1).unwrap().kind(), "record_pattern_body");
+        }
+        let components = collect_nodes_by_kind(tree.root_node(), "record_pattern_component");
+        assert_eq!(components.len(), 2);
+        for component in components {
+            assert!(component.child_by_field_name("name").is_none());
+            let children = named_children(component)
+                .into_iter()
+                .filter(|child| !child.is_extra())
+                .collect::<Vec<_>>();
+            assert_eq!(children[0].kind(), "integral_type");
+            assert_eq!(children[1].kind(), "identifier");
+        }
+        let head = collect_nodes_by_kind(tree.root_node(), "pattern")[0];
+        let arm = nearest_ancestor(head, |kind| kind == "switch_rule").unwrap();
+        let facts = parse(source);
+        for spelling in ["value", "nested"] {
+            let declaration = identifier(
+                &facts,
+                spelling,
+                ResolutionIdentifierRole::Declaration,
+                ResolutionNamespace::Value,
+            )
+            .site;
+            let binder = facts
+                .binders
+                .iter()
+                .find(|binder| binder.declaration == declaration)
+                .unwrap();
+            assert_eq!(binder.kind, ResolutionBinderKind::Pattern);
+            assert_eq!(binder.activation_start, head.end_byte());
+            assert_eq!(binder.activation_end, arm.end_byte());
+        }
+        let guard_call = identifier(
+            &facts,
+            "ok",
+            ResolutionIdentifierRole::Reference,
+            ResolutionNamespace::Callable,
+        )
+        .site;
+        assert!(facts.calls.iter().any(|call| call.callee == guard_call));
+        assert!(
+            facts
+                .gaps
+                .iter()
+                .all(|gap| gap.kind != ResolutionGapKind::UnsupportedScopeOrBinder),
+            "{:?}",
+            facts.gaps
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2771: a for-loop subtree hid every reference and its local binder"
+    )]
+    fn for_initializer_binder_is_bounded_by_the_loop_scope() {
+        let source = "class A { void helper(int x) {} void f() { for (int i = 0; i < 2; i++) helper(i); helper(0); } }";
+        let facts = parse(source);
+        let declaration = identifier(
+            &facts,
+            "i",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Value,
+        )
+        .site;
+        let binder = facts
+            .binders
+            .iter()
+            .find(|binder| binder.declaration == declaration)
+            .unwrap();
+        let scope = facts
+            .scopes
+            .iter()
+            .find(|scope| scope.id == binder.scope)
+            .unwrap();
+        assert_eq!(
+            &source[scope.start_byte..scope.end_byte],
+            "for (int i = 0; i < 2; i++) helper(i);"
+        );
+        assert_eq!(binder.activation_end, scope.end_byte);
+        assert_eq!(binder.hoisting, HoistingClass::SourceOrder);
+        assert_eq!(
+            facts
+                .identifiers
+                .iter()
+                .filter(|identifier| {
+                    identifier.role == ResolutionIdentifierRole::Reference
+                        && facts.names[identifier.name.index()].spelling == "i"
+                })
+                .count(),
+            3
+        );
+        assert!(
+            facts
+                .gaps
+                .iter()
+                .all(|gap| gap.kind != ResolutionGapKind::UnsupportedScopeOrBinder),
+            "{:?}",
+            facts.gaps
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2771: loop and resource suppression hid local bindings and body references"
+    )]
     fn unsupported_binders_cannot_leak_affirmative_rows() {
-        let source = "class A<T> { enum E { ONE } record R(int component) {} Object f() { try {} catch (Exception caught) { caught.toString(); } for (String item : items) { item.toString(); } class Local {} Object a = () -> { return hidden; }; Object b = new Object() { Object m() { return hidden2; } }; return a; } }";
+        let source = "class A<T> { enum E { ONE } record R(int component) {} Object f() { try (A resourceValue = open(); var laterResource = resourceValue; resourceValue) { resourceValue.helper(); } catch (Exception caught) { caught.toString(); } for (String item : items) { item.toString(); } class Local {} Object a = () -> { return hidden; }; Object b = new Object() { Object m() { return hidden2; } }; return a; } }";
         let facts = parse(source);
         let spellings = identifier_spellings(&facts);
 
-        for unsupported in ["component", "item", "items"] {
-            assert!(
-                !spellings.contains(&unsupported),
-                "unsupported subtree leaked {unsupported:?}: {spellings:?}"
-            );
-        }
-        for supported in ["ONE", "Local", "m", "hidden2", "T", "caught", "hidden"] {
+        let unsupported = "component";
+        assert!(
+            !spellings.contains(&unsupported),
+            "unsupported subtree leaked {unsupported:?}: {spellings:?}"
+        );
+        for supported in [
+            "ONE",
+            "Local",
+            "m",
+            "hidden2",
+            "T",
+            "caught",
+            "hidden",
+            "item",
+            "items",
+            "resourceValue",
+            "laterResource",
+            "open",
+            "helper",
+        ] {
             assert!(
                 spellings.contains(&supported),
                 "supported enum, local or anonymous scope omitted {supported:?}: {spellings:?}"
             );
         }
+        for spelling in ["resourceValue", "laterResource"] {
+            let resource = identifier(
+                &facts,
+                spelling,
+                ResolutionIdentifierRole::Declaration,
+                ResolutionNamespace::Value,
+            )
+            .site;
+            let binder = facts
+                .binders
+                .iter()
+                .find(|binder| binder.declaration == resource)
+                .unwrap();
+            assert_eq!(binder.hoisting, HoistingClass::DeclaredHead);
+            assert!(
+                source[binder.activation_start..binder.activation_end]
+                    .ends_with("{ resourceValue.helper(); }")
+            );
+            assert!(!source[binder.activation_start..binder.activation_end].contains("catch"));
+        }
+        let item = identifier(
+            &facts,
+            "item",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Value,
+        )
+        .site;
+        let item_binder = facts
+            .binders
+            .iter()
+            .find(|binder| binder.declaration == item)
+            .unwrap();
+        assert_eq!(item_binder.hoisting, HoistingClass::DeclaredHead);
+        assert_eq!(
+            &source[item_binder.activation_start..item_binder.activation_end],
+            "{ item.toString(); }"
+        );
+        let item_scope = facts.scopes[item_binder.scope.index()];
+        assert_eq!(
+            &source[item_scope.start_byte..item_scope.end_byte],
+            "for (String item : items) { item.toString(); }"
+        );
         let caught = identifier(
             &facts,
             "caught",
@@ -7397,24 +7926,21 @@ mod tests {
             2,
             "the outer and anonymous methods retain their return edges"
         );
-        assert_eq!(facts.gaps.len(), 20, "{:?}", facts.gaps);
         assert_eq!(
             facts
                 .gaps
                 .iter()
                 .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedScopeOrBinder)
                 .count(),
-            2,
+            1,
             "all resolution gaps: {:?}",
             facts.gaps
         );
-        assert_eq!(
+        assert!(
             facts
                 .gaps
                 .iter()
-                .filter(|gap| gap.kind == ResolutionGapKind::ImplicitConstructor)
-                .count(),
-            2,
+                .all(|gap| gap.kind != ResolutionGapKind::ImplicitConstructor),
             "all resolution gaps: {:?}",
             facts.gaps
         );
@@ -7434,7 +7960,7 @@ mod tests {
                 .iter()
                 .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedVisibility)
                 .count(),
-            5,
+            6,
             "all resolution gaps: {:?}",
             facts.gaps
         );
@@ -7449,6 +7975,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2771: modules hid service types and the grammar left the first provider unfielded"
+    )]
     fn structured_annotation_references_are_not_enumeration_gaps() {
         let source = "@Marker @Configured(value = \"x\") sealed class A permits Allowed { void f() throws Failure {} }";
         let parsed = parse_file(source);
@@ -7468,29 +7997,42 @@ mod tests {
                 "structured annotation or declaration reference omitted {spelling:?}: {spellings:?}"
             );
         }
-        let unsupported = facts
+        // A `permits` or `throws` clause binds nothing, so it no longer carries
+        // a scope-wide unsupported-binder gap; the two names it spells are
+        // unmodeled type syntax, each with a gap local to its own reference.
+        assert!(
+            facts
+                .gaps
+                .iter()
+                .all(|gap| gap.kind != ResolutionGapKind::UnsupportedScopeOrBinder),
+            "all resolution gaps: {:?}",
+            facts.gaps
+        );
+        let unmodeled = facts
             .gaps
             .iter()
-            .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedScopeOrBinder)
+            .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedTypeSyntax)
+            .map(|gap| {
+                let site = site(&facts, gap.site);
+                assert_eq!(site.kind, ResolutionSiteKind::TypeReference);
+                &source[site.start_byte..site.end_byte]
+            })
             .collect::<Vec<_>>();
-        assert_eq!(unsupported.len(), 2);
-        assert!(unsupported.iter().all(|gap| {
-            site(&facts, gap.site).kind == ResolutionSiteKind::UnsupportedDeclaration
-        }));
+        assert_eq!(unmodeled, ["Allowed", "Failure"]);
         assert_eq!(
             non_visibility_gaps(&facts)
                 .iter()
                 .map(|gap| gap.kind)
                 .collect::<Vec<_>>(),
             vec![
-                ResolutionGapKind::UnsupportedScopeOrBinder,
-                ResolutionGapKind::UnsupportedScopeOrBinder,
+                ResolutionGapKind::UnsupportedTypeSyntax,
+                ResolutionGapKind::UnsupportedTypeSyntax,
                 ResolutionGapKind::UnsupportedHierarchyTraversal,
-                ResolutionGapKind::ImplicitConstructor,
                 ResolutionGapKind::UnsupportedPlacementBoundary,
             ]
         );
-        assert_eq!(visibility_gap_sites(&facts).len(), 2);
+        // The package-private class, its default constructor and `f`.
+        assert_eq!(visibility_gap_sites(&facts).len(), 3);
         for spelling in ["Marker", "Configured"] {
             let identifier = facts
                 .identifiers
@@ -7514,8 +8056,9 @@ mod tests {
             );
         }
 
-        let module =
-            parse_file("module sample.app { uses Service; provides Service with Implementation; }");
+        let module = parse_file(
+            "module sample.app { requires other.mod; exports sample.pkg to friend.mod; opens sample.internal; uses Service; provides Service with Implementation, other.Implementation; }",
+        );
         for spelling in ["Service", "Implementation"] {
             assert!(
                 module.type_identifiers.contains(spelling),
@@ -7523,23 +8066,46 @@ mod tests {
                 module.type_identifiers
             );
         }
-        assert!(module.resolution_facts.identifiers.is_empty());
+        assert!(module.resolution_facts.binders.is_empty());
         assert_eq!(
-            module.resolution_facts.gaps,
+            identifier_spellings(&module.resolution_facts),
             vec![
-                ResolutionGapFact {
-                    site: ResolutionSiteId::new(0),
-                    kind: ResolutionGapKind::UnsupportedScopeOrBinder,
-                },
-                ResolutionGapFact {
-                    site: ResolutionSiteId::new(1),
-                    kind: ResolutionGapKind::UnsupportedPlacementBoundary,
-                },
+                "Service",
+                "Service",
+                "Implementation",
+                "other",
+                "Implementation"
             ]
         );
-        assert_eq!(
-            site(&module.resolution_facts, ResolutionSiteId::new(0)).kind,
-            ResolutionSiteKind::UnsupportedDeclaration
+        assert!(
+            module
+                .resolution_facts
+                .gaps
+                .iter()
+                .all(|gap| gap.kind != ResolutionGapKind::UnsupportedScopeOrBinder),
+            "{:?}",
+            module.resolution_facts.gaps
+        );
+        assert!(
+            module
+                .resolution_facts
+                .reference_enumeration_gaps
+                .is_empty()
+        );
+        let malformed = parse("module sample.app { uses ; }");
+        assert!(
+            malformed
+                .gaps
+                .iter()
+                .any(|gap| gap.kind == ResolutionGapKind::MalformedSyntax),
+            "{:?}",
+            malformed.gaps
+        );
+        assert!(
+            malformed
+                .gaps
+                .iter()
+                .all(|gap| gap.kind != ResolutionGapKind::UnsupportedScopeOrBinder)
         );
     }
 

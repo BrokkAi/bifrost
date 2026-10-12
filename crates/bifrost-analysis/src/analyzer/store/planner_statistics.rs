@@ -381,6 +381,10 @@ pub mod pinned_plans {
     /// The plan SQLite chooses for one pinned query, as its detail column.
     pub fn explain_pin(conn: &Connection, query: &PinnedQuery) -> Vec<String> {
         crate::analyzer::store::rust_crates::prepare_pin_context(conn).expect("crate SQL context");
+        conn.execute_batch(
+            super::super::rust_unit_summaries::RUST_IMPORT_GRAPH_MEMBER_SELECTION_SQL,
+        )
+        .expect("Rust import graph member selection view");
         plan_rows(conn, query)
             .unwrap_or_else(|error| panic!("planning pinned query {}: {error}", query.name))
     }
@@ -456,6 +460,10 @@ pub mod pinned_plans {
             &["Target".to_string()].into_iter().collect(),
         )
         .expect("reverse lookup temp tables");
+        conn.execute_batch(
+            super::super::rust_unit_summaries::RUST_IMPORT_GRAPH_MEMBER_SELECTION_SQL,
+        )
+        .expect("Rust import graph member selection view");
     }
 
     /// The typed-fact statements that take one blob and one key array, with the
@@ -658,6 +666,11 @@ pub mod pinned_plans {
             "selected_macro_occurrence_lines",
             super::super::resolution_operation::SELECTED_MACRO_OCCURRENCE_LINES_SQL,
             vec![integer(1)],
+        ));
+        queries.push(pin(
+            "invocation_roles_for_references",
+            super::super::resolution_typed::INVOCATION_ROLES_FOR_REFERENCES_SQL,
+            vec![integer(1), text("[1,2,3]")],
         ));
         queries.push(pin(
             "go_definition_package_anchor",
@@ -1124,6 +1137,11 @@ pub mod pinned_plans {
                 macro_walk::MACRO_INCLUDE_STARTS,
                 vec![text("app/src/lib.rs")],
             ),
+            pin(
+                "rust_macro_host_files",
+                macro_walk::MACRO_HOST_FILES,
+                vec![text("app/src/generated.rs")],
+            ),
         ]);
         use crate::analyzer::store::resolution_operation::rust_reverse_rows as reverse;
         queries.extend([
@@ -1222,7 +1240,7 @@ pub mod pinned_plans {
             pin(
                 "rust_reverse_module_sources",
                 reverse::MODULE_SOURCES_SQL,
-                vec![integer(1), text("crate")],
+                vec![digest(0), text("crate")],
             ),
             pin(
                 "rust_reverse_locators",
@@ -1581,6 +1599,11 @@ pub mod pinned_plans {
         queries.push(pin(
             "java_inheritance_declarations",
             super::super::resolution_typed::java_inheritance::DECLARATIONS,
+            vec![],
+        ));
+        queries.push(pin(
+            "java_synthetic_type_bodies",
+            super::super::resolution_typed::java_inheritance::SYNTHETIC_TYPE_BODIES,
             vec![],
         ));
         queries.push(pin(
@@ -2316,6 +2339,21 @@ pub mod pinned_plans {
             "rust_unit_summary_dependents",
             super::super::unit_summaries::UNIT_DEPENDENTS_SQL,
             vec![digest(1), text(&"7".repeat(64)), text("rust"), integer(1)],
+        ));
+        queries.push(pin(
+            "rust_unit_summary_import_graph_binding_surfaces",
+            super::super::rust_unit_summaries::RUST_SUMMARY_BINDING_SURFACES_SQL,
+            vec![text("[\"src/lib.rs\"]")],
+        ));
+        queries.push(pin(
+            "rust_unit_summary_import_graph_binding_completeness",
+            super::super::rust_unit_summaries::RUST_SUMMARY_BINDING_COMPLETENESS_SQL,
+            vec![text("[\"src/lib.rs\"]")],
+        ));
+        queries.push(pin(
+            "rust_unit_summary_import_graph_module_candidates",
+            super::super::rust_unit_summaries::RUST_SUMMARY_MODULE_CANDIDATES_SQL,
+            vec![text("[[0,1,\"crate\"]]")],
         ));
         queries.push(pin(
             "unit_summary_graph_join",
@@ -3586,6 +3624,166 @@ pub(crate) mod tests {
             }
             for query in pinned_queries() {
                 let plan = explain_pin(&conn, &query);
+                if query.name == "rust_unit_summary_package_members" {
+                    assert!(
+                        plan.iter()
+                            .any(|detail| detail.contains("SEARCH versions USING PRIMARY KEY")),
+                        "{state} package-member lookup must seek live summary versions: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter()
+                            .any(|detail| detail.contains("SEARCH members USING PRIMARY KEY")),
+                        "{state} package-member lookup must seek summary members: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().all(|detail| {
+                            !detail.contains("AUTOMATIC")
+                                && !detail.contains("TEMP B-TREE")
+                                && !detail.starts_with("SCAN versions")
+                                && !detail.starts_with("SCAN members")
+                                && !detail.starts_with("SCAN contexts")
+                                && !detail.starts_with("SCAN naming")
+                        }),
+                        "{state} package-member lookup must not scan unbounded rows or build planner state: {plan:?}"
+                    );
+                }
+                if query.name == "rust_unit_summary_cargo_routes" {
+                    assert!(
+                        plan.iter().any(|detail| {
+                            detail.contains("resolution_unit_summary_versions_open")
+                                || detail
+                                    .contains("sqlite_autoindex_resolution_unit_summary_versions_1")
+                                || detail.contains("SEARCH versions USING PRIMARY KEY")
+                        }),
+                        "{state} Cargo-route lookup must seek selected summary versions: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().any(|detail| {
+                            detail.contains("SEARCH parent_member USING")
+                                && detail.contains("PRIMARY KEY")
+                        }),
+                        "{state} Cargo-route lookup must seek the parent root member by summary: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().any(|detail| {
+                            detail.contains("SEARCH child_versions USING PRIMARY KEY")
+                        }),
+                        "{state} Cargo-route lookup must seek the live dependency summary by unit key: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().any(|detail| {
+                            detail.contains("SEARCH child_member USING")
+                                && detail.contains("PRIMARY KEY")
+                        }),
+                        "{state} Cargo-route lookup must seek the child root member by summary: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().any(|detail| {
+                            detail.contains("SEARCH parent_file USING INDEX idx_workspace_file_versions_snapshot_kind")
+                                || detail.contains("SEARCH parent_file USING INDEX sqlite_autoindex_workspace_file_versions_1")
+                        }),
+                        "{state} Cargo-route lookup must seek the parent's live root file version: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().any(|detail| {
+                            detail.contains("SEARCH child_file USING INDEX idx_workspace_file_versions_snapshot_kind")
+                                || detail.contains("SEARCH child_file USING INDEX sqlite_autoindex_workspace_file_versions_1")
+                        }),
+                        "{state} Cargo-route lookup must seek the dependency's live root file version: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().any(|detail| {
+                            detail.contains("SEARCH dependencies USING")
+                                && detail.contains("PRIMARY KEY")
+                        }),
+                        "{state} Cargo-route lookup must seek dependency rows by summary: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().any(|detail| {
+                            detail.contains("rust_resolution_unit_summary_dependency_names_ordinal")
+                        }),
+                        "{state} Cargo-route lookup must seek dependency names by ordinal: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().all(|detail| {
+                            !detail.contains("AUTOMATIC")
+                                && !detail.contains("TEMP B-TREE")
+                                && !detail.starts_with("SCAN versions")
+                                && !detail.starts_with("SCAN members")
+                                && !detail.starts_with("SCAN dependencies")
+                                && !detail.starts_with("SCAN dependency_names")
+                                && !detail.starts_with("SCAN parent_member")
+                                && !detail.starts_with("SCAN child_member")
+                                && !detail.starts_with("SCAN child_versions")
+                                && !detail.starts_with("SCAN parent_file")
+                                && !detail.starts_with("SCAN child_file")
+                        }),
+                        "{state} Cargo-route lookup must not scan unbounded base rows or create indexes: {plan:?}"
+                    );
+                }
+                if query.name == "rust_unit_summary_development_capability" {
+                    assert!(
+                        plan.iter().any(|detail| {
+                            detail.contains("SEARCH topologies USING INTEGER PRIMARY KEY")
+                        }),
+                        "{state} Rust target capability lookup must seek its topology: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter()
+                            .any(|detail| { detail.contains("rust_crate_versions_topology") }),
+                        "{state} Rust target capability lookup must seek the topology version: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().all(|detail| {
+                            !detail.contains("SCAN topologies")
+                                && !detail.contains("SCAN versions")
+                                && !detail.contains("AUTOMATIC")
+                                && !detail.contains("TEMP B-TREE")
+                        }),
+                        "{state} Rust target capability lookup must stay indexed: {plan:?}"
+                    );
+                }
+                if query.name.starts_with("rust_macro_") {
+                    // A query reads its source path through the selected mount, or
+                    // through the selected file version of the persisted path when
+                    // it never reads a mount (the child-module walk).
+                    assert!(
+                        plan.iter().any(|detail| detail
+                            .contains("sqlite_autoindex_selected_resolution_mounts_2")
+                            || detail.contains("idx_workspace_file_versions_snapshot_kind")),
+                        "{state} {} must seek its selected source path: {plan:?}",
+                        query.name
+                    );
+                    // Membership is a keyed seek: by selected blob, or by the summary
+                    // when the query reaches members through the selected file version.
+                    assert!(
+                        plan.iter().any(|detail| {
+                            detail.contains("resolution_unit_summary_members_blob")
+                                || detail
+                                    .contains("SEARCH members USING PRIMARY KEY (summary_id=?)")
+                        }),
+                        "{state} {} must seek summary membership by a key: {plan:?}",
+                        query.name
+                    );
+                    assert!(
+                        plan.iter().all(|detail| !detail.contains("AUTOMATIC")),
+                        "{state} {} must not create an automatic index: {plan:?}",
+                        query.name
+                    );
+                    assert!(
+                        plan.iter().all(|detail| {
+                            !detail.starts_with("SCAN child ")
+                                && !detail.starts_with("SCAN parent ")
+                                && !detail.starts_with("SCAN included ")
+                                && !detail.starts_with("SCAN host ")
+                                && !detail.starts_with("SCAN child_member ")
+                                && !detail.starts_with("SCAN host_member ")
+                                && !detail.starts_with("SCAN included_member ")
+                        }),
+                        "{state} {} must not scan Rust summary rows: {plan:?}",
+                        query.name
+                    );
+                }
                 if plan.is_empty() {
                     // SQLite emits no QUERY PLAN rows for a VALUES insert
                     // without a lookup. Still require executable VM bytecode
@@ -4486,7 +4684,6 @@ mod rust_crate_row_plans {
         for state in PlannerStatisticsState::BOTH {
             state.install(&conn);
             for (name, index) in [
-                ("rust_reverse_exports", "rust_crate_exports_declaration"),
                 ("rust_crate_imports_target", "rust_crate_imports_target"),
                 (
                     "rust_crate_glob_reexport_routes_target",

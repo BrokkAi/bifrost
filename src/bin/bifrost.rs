@@ -30,23 +30,28 @@ use brokk_bifrost::mcp_registry::{
     single_shot_only_tool_descriptors,
 };
 use brokk_bifrost::policy::{
-    BuiltInPolicyCatalogManifest, BuiltInPolicySelection, BuiltInPolicySelectionRecord,
-    ExplanationCandidate, ExplanationGeneration, ExplanationLimits, ExplanationTarget,
-    FlowExplanationCandidate, HumanRenderColor, HumanRenderDetail, HumanRenderOptions,
-    MAX_RQLP_SOURCE_BYTES, NearMissCandidates, POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE,
-    PolicyBaselineDocument, PolicyBaselineOptions, PolicyBaselineSource, PolicyBatchOutcome,
-    PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExecutionStage,
-    PolicyFailOn, PolicyFindingId, PolicyRangeRequest, PolicyRenderError, PolicyScopeOptions,
-    PolicyScopeSource, PolicySourceIdentity, PolicySourceIdentityResolution,
-    PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog,
-    configure_identical_relational_selectors, escape_terminal_text, evaluate_policy_inputs,
-    explain_policy_inputs, policy_source_identity, rank_policy_near_misses,
-    relation_schema_catalog, write_policy_human, write_policy_json, write_policy_sarif_for_outcome,
+    BuiltInPolicyCatalogManifest, BuiltInPolicySelection, BuiltInPolicySelectionRecord, CatalogRef,
+    CategoryPredicate, DirectQueryApiRequirement, ExplanationCandidate, ExplanationGeneration,
+    ExplanationLimits, ExplanationTarget, FlowExplanationCandidate, HumanRenderColor,
+    HumanRenderDetail, HumanRenderOptions, MAX_RQLP_SOURCE_BYTES, MatchEndpointSetRef,
+    NearMissCandidates, POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument,
+    PolicyBaselineOptions, PolicyBaselineSource, PolicyBatchOutcome, PolicyEvaluationDate,
+    PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExecutionStage, PolicyFailOn,
+    PolicyFindingId, PolicyRangeRequest, PolicyRenderError, PolicyScopeOptions, PolicyScopeSource,
+    PolicySourceIdentity, PolicySourceIdentityResolution, PolicySuppressionOptions,
+    PolicySuppressionSource, RawDependencyRef, ReceiverTypeConstraintKind,
+    ResolvedPolicyLocatorKind, ResolvedPolicyLocatorRole, SarifToolIdentity,
+    StaticDependencyDocument, StaticLocatorReference, StaticSelectorSource,
+    built_in_policy_catalog, configure_identical_relational_selectors, escape_terminal_text,
+    evaluate_policy_inputs, explain_policy_inputs, parse_rqlp_source, policy_source_identity,
+    rank_policy_near_misses, relation_schema_catalog, write_policy_human, write_policy_json,
+    write_policy_sarif_for_outcome,
 };
 use brokk_bifrost::rmcp_host::{
     NamedWorkspace, run_named_workspace_stdio_server_with_build_identity,
     run_stdio_server_with_build_identity,
 };
+use brokk_bifrost::rql::query::QuerySourceOperation;
 use brokk_bifrost::scoped_project::{create_cli_tool_service, create_scoped_service};
 use brokk_bifrost::searchtools_render::RenderOptions;
 use brokk_bifrost::tool_arguments::normalize_tool_arguments_for_cli;
@@ -294,7 +299,19 @@ fn run_portable_runtime_command(args: &[String]) -> Option<Result<CliRunResult, 
                 install_semantic_packs(Path::new(&args[1]), Path::new(&args[2]))
             }
         }
+        Some("pack-engine-contracts") => {
+            if args.len() != 1 {
+                Err("pack-engine-contracts takes no arguments".to_owned())
+            } else {
+                println!(
+                    "{}",
+                    brokk_bifrost::engine_contracts::engine_contract_catalog()
+                );
+                Ok(CliRunResult::Complete)
+            }
+        }
         Some("policy-source-identity") => run_policy_source_identity_command(&args[1..]),
+        Some("policy-source-dependencies") => run_policy_source_dependencies_command(&args[1..]),
         Some("configure-policy") => run_policy_configuration_command(&args[1..]),
         Some("prepare-open-packs") => match run_prepare_open_packs(&args[1..]) {
             Ok(result) => Ok(result),
@@ -355,6 +372,349 @@ fn policy_source_identity_json(args: &[String]) -> Result<Value, String> {
         "engine_version": brokk_bifrost::BIFROST_VERSION,
         "build_identity": brokk_bifrost::BIFROST_BUILD_IDENTITY,
     }))
+}
+
+fn run_policy_source_dependencies_command(args: &[String]) -> Result<CliRunResult, String> {
+    println!("{}", policy_source_dependencies_json(args)?);
+    Ok(CliRunResult::Complete)
+}
+
+fn policy_source_dependencies_json(args: &[String]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("usage: bifrost policy-source-dependencies SOURCE_ID POLICY_FILE".to_owned());
+    }
+    let source = read_bounded_policy_source(Path::new(&args[1]))?;
+    let raw_source = std::str::from_utf8(&source)
+        .map_err(|error| format!("policy source is not UTF-8: {error}"))?;
+    let parsed = parse_rqlp_source(raw_source, PolicySourceIdentity::new(&args[0]))
+        .map_err(|error| format!("cannot parse policy source '{}': {error}", args[1]))?;
+    let report = parsed.static_dependency_export();
+    Ok(json!({
+        "format": "bifrost_policy_source_dependencies/v1",
+        "source_id": report.source.as_str(),
+        "policy_file": args[1],
+        "source_sha256": format!("{:x}", Sha256::digest(&source)),
+        "engine_version": brokk_bifrost::BIFROST_VERSION,
+        "build_identity": brokk_bifrost::BIFROST_BUILD_IDENTITY,
+        "document": static_dependency_document_json(report.document),
+        "direct_query_api_requirements": report
+            .direct_query_api_requirements
+            .iter()
+            .map(direct_query_api_requirement_json)
+            .collect::<Vec<_>>(),
+        "selectors": report
+            .selectors
+            .iter()
+            .map(static_selector_dependency_json)
+            .collect::<Vec<_>>(),
+        "external_dependencies": report
+            .unresolved_external_closure
+            .iter()
+            .map(raw_dependency_json)
+            .collect::<Vec<_>>(),
+        "external_closure_status": if report.unresolved_external_closure.is_empty() {
+            "complete"
+        } else {
+            "unresolved"
+        },
+    }))
+}
+
+fn static_dependency_document_json(document: StaticDependencyDocument) -> Value {
+    match document {
+        StaticDependencyDocument::Policy { analysis } => json!({
+            "kind": "policy",
+            "analysis": analysis.label(),
+        }),
+        StaticDependencyDocument::Endpoint => json!({
+            "kind": "endpoint",
+        }),
+        StaticDependencyDocument::EndpointSet { kind } => json!({
+            "kind": "endpoint_set",
+            "endpoint_set_kind": kind.label(),
+        }),
+    }
+}
+
+fn direct_query_api_requirement_json(requirement: &DirectQueryApiRequirement) -> Value {
+    match requirement {
+        DirectQueryApiRequirement::Analysis(analysis) => json!({
+            "kind": "analysis",
+            "name": analysis.label(),
+        }),
+        DirectQueryApiRequirement::SourceOperation(operation) => json!({
+            "kind": "source",
+            "name": query_source_operation_label(*operation),
+        }),
+        DirectQueryApiRequirement::CompositionOperation(operation) => json!({
+            "kind": "composition",
+            "name": operation.label(),
+        }),
+        DirectQueryApiRequirement::StepOperation(operation) => json!({
+            "kind": "step",
+            "name": operation.label(),
+        }),
+    }
+}
+
+fn query_source_operation_label(operation: QuerySourceOperation) -> &'static str {
+    match operation {
+        QuerySourceOperation::Match => "match",
+        QuerySourceOperation::Occurrences => "occurrences",
+        QuerySourceOperation::Scopes => "scopes",
+        QuerySourceOperation::Bindings => "bindings",
+        QuerySourceOperation::Paths => "paths",
+        QuerySourceOperation::GenerationSites => "generation_sites",
+        QuerySourceOperation::Exports => "exports",
+        QuerySourceOperation::ConfigurationFacts => "configuration_facts",
+        QuerySourceOperation::DependencyEvidence => "dependency_evidence",
+    }
+}
+
+fn static_selector_dependency_json(
+    selector: &brokk_bifrost::policy::StaticSelectorDependency,
+) -> Value {
+    json!({
+        "path": selector.path,
+        "source": static_selector_source_json(&selector.source),
+        "query": selector.query.as_ref().map(static_query_dependencies_json),
+        "locators": selector
+            .locators
+            .iter()
+            .map(static_locator_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn static_selector_source_json(source: &StaticSelectorSource) -> Value {
+    match source {
+        StaticSelectorSource::Inline { schema_version } => json!({
+            "kind": "inline",
+            "schema_version": schema_version,
+        }),
+        StaticSelectorSource::File {
+            authored_schema_version,
+            analysis_schema_version,
+            path,
+        } => json!({
+            "kind": "file",
+            "path": path.as_str(),
+            "authored_schema_version": authored_schema_version,
+            "analysis_schema_version": analysis_schema_version,
+        }),
+    }
+}
+
+fn static_query_dependencies_json(
+    dependencies: &brokk_bifrost::rql::query::QueryStaticDependencies,
+) -> Value {
+    let language_scopes = dependencies.language_scopes.as_ref().map(|scopes| {
+        scopes
+            .iter()
+            .map(|scope| {
+                scope
+                    .iter()
+                    .map(|language| language.config_label())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    });
+    json!({
+        "schema_version": dependencies.schema_version,
+        "source_operations": dependencies
+            .source_operations
+            .iter()
+            .map(|operation| query_source_operation_label(*operation))
+            .collect::<Vec<_>>(),
+        "source_scopes": dependencies
+            .source_scopes
+            .iter()
+            .map(static_query_source_scope_json)
+            .collect::<Vec<_>>(),
+        "composition_scopes": dependencies.composition_scopes.iter().map(|scope| json!({
+            "operation": scope.operation.label(),
+            "plan_path": scope.plan_path,
+        })).collect::<Vec<_>>(),
+        "step_scopes": dependencies.step_scopes.iter().map(|scope| json!({
+            "plan_path": scope.plan_path,
+            "operations": scope.operations.iter().map(|operation| operation.label()).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "step_operations": dependencies
+            .step_operations
+            .iter()
+            .map(|operation| operation.label())
+            .collect::<Vec<_>>(),
+        "language_scopes": language_scopes,
+        "may_use_semantic_packs": dependencies.may_use_semantic_packs,
+    })
+}
+
+fn static_query_source_scope_json(scope: &brokk_bifrost::rql::query::QuerySourceScope) -> Value {
+    let languages = scope.languages.as_ref().map(|languages| {
+        languages
+            .iter()
+            .map(|language| language.config_label())
+            .collect::<Vec<_>>()
+    });
+    let where_globs = scope
+        .where_globs
+        .groups()
+        .iter()
+        .map(|group| group.iter().map(|glob| glob.as_str()).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    json!({
+        "operation": query_source_operation_label(scope.operation),
+        "plan_path": scope.plan_path,
+        "languages": languages,
+        "where_globs": where_globs,
+    })
+}
+
+fn static_locator_json(locator: &StaticLocatorReference) -> Value {
+    json!({
+        "role": resolved_locator_role_label(locator.role),
+        "value": locator.value,
+        "source_range": locator.source_range.as_ref().map(range_json),
+        "resolution": locator.resolution.as_ref().map(static_locator_resolution_json),
+    })
+}
+
+fn static_locator_resolution_json(
+    resolution: &brokk_bifrost::policy::StaticLocatorResolution,
+) -> Value {
+    json!({
+        "kind": resolved_locator_kind_label(resolution.kind),
+        "identity": resolution.identity,
+        "constraint": resolution
+            .constraint
+            .map(receiver_type_constraint_label),
+        "provenance": &resolution.provenance,
+    })
+}
+
+fn range_json(range: &std::ops::Range<usize>) -> Value {
+    json!({
+        "start": range.start,
+        "end": range.end,
+    })
+}
+
+fn resolved_locator_role_label(role: ResolvedPolicyLocatorRole) -> &'static str {
+    match role {
+        ResolvedPolicyLocatorRole::Callable => "callable",
+        ResolvedPolicyLocatorRole::ReceiverType => "receiver_type",
+        ResolvedPolicyLocatorRole::Value => "value",
+    }
+}
+
+fn resolved_locator_kind_label(kind: ResolvedPolicyLocatorKind) -> &'static str {
+    match kind {
+        ResolvedPolicyLocatorKind::WorkspaceDeclaration => "workspace_declaration",
+        ResolvedPolicyLocatorKind::ActiveSemanticModel => "active_semantic_model",
+    }
+}
+
+fn receiver_type_constraint_label(constraint: ReceiverTypeConstraintKind) -> &'static str {
+    match constraint {
+        ReceiverTypeConstraintKind::Exact => "exact",
+        ReceiverTypeConstraintKind::AssignableTo => "assignable_to",
+    }
+}
+
+fn raw_dependency_json(dependency: &RawDependencyRef) -> Value {
+    match dependency {
+        RawDependencyRef::SelectorFile {
+            path,
+            authored_schema_version,
+            analysis_schema_version,
+        } => json!({
+            "kind": "selector_file",
+            "path": path.as_str(),
+            "authored_schema_version": authored_schema_version,
+            "analysis_schema_version": analysis_schema_version,
+        }),
+        RawDependencyRef::EndpointFile { reference } => json!({
+            "kind": "endpoint_file",
+            "reference": {
+                "path": reference.path.as_str(),
+                "sha256": reference.sha256.map(|hash| hash.to_string()),
+                "range": range_json(&reference.range),
+            },
+        }),
+        RawDependencyRef::CatalogSet { reference } => json!({
+            "kind": "catalog_set",
+            "reference": catalog_ref_json(reference),
+        }),
+        RawDependencyRef::MatchSet { reference } => json!({
+            "kind": "match_set",
+            "reference": match_set_ref_json(reference),
+        }),
+        RawDependencyRef::CatalogEndpoint { catalog, entry_id } => json!({
+            "kind": "catalog_endpoint",
+            "catalog": catalog_ref_json(catalog),
+            "entry_id": entry_id.as_str(),
+        }),
+        RawDependencyRef::MatchEndpoint { endpoint_id } => json!({
+            "kind": "match_endpoint",
+            "endpoint_id": endpoint_id.as_str(),
+        }),
+        RawDependencyRef::Locator { reference } => json!({
+            "kind": "locator",
+            "reference": static_locator_json(reference),
+        }),
+    }
+}
+
+fn catalog_ref_json(reference: &CatalogRef) -> Value {
+    json!({
+        "name": reference.name.as_str(),
+        "version": reference.version,
+        "sha256": reference.sha256.map(|hash| hash.to_string()),
+    })
+}
+
+// This source-only v1 descriptor preserves authored order and explicit null pins.
+// It is not canonical policy JSON and must not be used to derive a semantic hash.
+fn match_set_ref_json(reference: &MatchEndpointSetRef) -> Value {
+    match reference {
+        MatchEndpointSetRef::Exact { endpoint_ids } => json!({
+            "kind": "exact",
+            "endpoint_ids": endpoint_ids
+                .iter()
+                .map(|endpoint_id| endpoint_id.as_str())
+                .collect::<Vec<_>>(),
+        }),
+        MatchEndpointSetRef::Directory { reference } => {
+            let categories = match &reference.categories {
+                CategoryPredicate::Any { categories } => json!({
+                    "kind": "any",
+                    "categories": categories
+                        .iter()
+                        .map(|category| category.as_str())
+                        .collect::<Vec<_>>(),
+                }),
+                CategoryPredicate::All { categories } => json!({
+                    "kind": "all",
+                    "categories": categories
+                        .iter()
+                        .map(|category| category.as_str())
+                        .collect::<Vec<_>>(),
+                }),
+            };
+            json!({
+                "kind": "directory",
+                "path": reference.path.as_str(),
+                "scope": match reference.scope {
+                    brokk_bifrost::policy::DirectoryScope::Direct => "direct",
+                    brokk_bifrost::policy::DirectoryScope::Recursive => "recursive",
+                },
+                "categories": categories,
+                "manifest_sha256": reference
+                    .manifest_sha256
+                    .map(|hash| hash.to_string()),
+            })
+        }
+    }
 }
 
 /// Repository-owned configuration for identical empty relational selectors.
@@ -2718,8 +3078,12 @@ USAGE:
     bifrost --query-file PATH  Run a .rql or .json code query once, print JSON result, and exit
     bifrost --install          Register brokk with installed coding hosts and exit
     bifrost pack-engine-profile Print the portable pack-consumer profile as JSON
+    bifrost pack-engine-contracts Print engine-owned API bounds and per-run uncertainty as JSON
     bifrost policy-source-identity SOURCE_ID POLICY_FILE
                                Print production policy authoring identities without a workspace
+                               or built-in/open pack catalog
+    bifrost policy-source-dependencies SOURCE_ID POLICY_FILE
+                               Print typed source-only policy dependencies without a workspace
                                or built-in/open pack catalog
     bifrost configure-policy SOURCE_ID POLICY_FILE CONFIG_FILE
                                Print configured policy bytes and identities from a repository-owned

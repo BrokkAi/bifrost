@@ -190,7 +190,7 @@ pub(super) static SELECTED_DECLARATION_UNITS_SQL: std::sync::LazyLock<String> =
 /// definition it stages for an item sits at the byte range where declaration
 /// replay recorded that item's name, and replay's declaration carries the
 /// item's `CodeUnit`. Only an item the crate declared
-/// (`rust_crate_macro_items`, a cross-file passthrough whose rules expand to
+/// (`rust_resolution_unit_summary_generated_names`, a cross-file passthrough whose rules expand to
 /// their arguments) is linked: a capsule lowers an invocation's arguments, not
 /// its transcriber's output, so for any other macro the staged item and the
 /// item the expansion really declares are not known to be the same one.
@@ -204,11 +204,18 @@ pub(super) static SELECTED_MACRO_ITEM_UNIT_SQL: std::sync::LazyLock<String> =
              FROM temp.selected_resolution_stage_semantics AS staged
              CROSS JOIN temp.selected_resolution_mounts AS mount
                ON mount.mount_ordinal = staged.host_ordinal
-             CROSS JOIN main.rust_crate_macro_items AS item
-                 INDEXED BY rust_crate_macro_items_declaration
-               ON item.blob_id = mount.blob_id
+             CROSS JOIN main.resolution_unit_summary_members AS member
+                 INDEXED BY resolution_unit_summary_members_blob
+               ON member.blob_id = mount.blob_id
+              AND member.rel_path = mount.persisted_relative_path
+             CROSS JOIN temp.selected_rust_unit_summaries AS selected
+               ON selected.summary_id = member.summary_id
+             CROSS JOIN main.rust_resolution_unit_summary_generated_names AS item
+                 INDEXED BY rust_resolution_unit_summary_generated_names_declaration
+               ON item.summary_id = member.summary_id
+              AND item.member_ordinal = member.member_ordinal
              CROSS JOIN main.source_declarations AS declaration
-               ON declaration.blob_id = item.blob_id
+               ON declaration.blob_id = member.blob_id
               AND declaration.declaration_id = item.declaration_id
               AND declaration.name_start_byte = staged.start_byte
               AND declaration.name_end_byte = staged.end_byte
@@ -226,8 +233,6 @@ pub(super) static SELECTED_MACRO_ITEM_UNIT_SQL: std::sync::LazyLock<String> =
                AND staged.semantic_key IS ?2 AND staged.semantic_shared IS ?3
                AND staged.role = ?4
                AND units.in_declarations = 1
-               AND EXISTS(SELECT 1 FROM selected_rust_crates AS selected
-                          WHERE selected.topology_id = item.topology_id)
                AND {}",
             super::PARSED_BLOB_COMPLETE_CONDITION
         )

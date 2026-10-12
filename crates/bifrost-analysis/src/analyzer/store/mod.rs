@@ -32,6 +32,12 @@ mod rust_module_source_tests;
 #[cfg(test)]
 mod rust_type_form_tests;
 mod selected_definition;
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn selected_macro_item_unit_sql_for_plan() -> &'static str {
+    selected_definition::SELECTED_MACRO_ITEM_UNIT_SQL.as_str()
+}
+
 pub(in crate::analyzer) mod source_facts;
 pub use source_facts::SourceFactStorage;
 // Milestone 5 publishes the normalized writer seam before the producer and
@@ -39,6 +45,7 @@ pub use source_facts::SourceFactStorage;
 pub(crate) mod go_package_context;
 pub(crate) mod go_unit_summaries;
 pub(crate) mod import_graph;
+pub(crate) mod jvm_external_inventory;
 pub(crate) mod rust_unit_summaries;
 pub(crate) mod unit_summaries;
 pub(crate) use go_package_context::{GoContextHeadStatus, GoContextIdentity};
@@ -2371,6 +2378,34 @@ fn workspace_content_package_facts_sql(oid_count: usize) -> String {
                   packages.package_fqn_tail, segments.seg_ordinal"
     )
 }
+
+const RUST_UNRESOLVED_TRAIT_IMPL_FILES_SQL: &str = "SELECT DISTINCT blobs.blob_oid,
+       members.rel_path, endpoints.impl_declaration_id
+FROM rust_resolution_unit_summary_trait_endpoints AS endpoints
+     INDEXED BY rust_resolution_unit_summary_trait_endpoints_unresolved
+CROSS JOIN resolution_unit_summaries AS summaries
+  ON summaries.summary_id = endpoints.summary_id
+CROSS JOIN resolution_unit_summary_versions AS versions
+     INDEXED BY resolution_unit_summary_versions_summary
+  ON versions.summary_id = summaries.summary_id
+CROSS JOIN workspace_heads AS heads
+  ON heads.workspace_id = versions.workspace_id AND heads.lang = versions.lang
+ AND heads.generation = versions.generation
+ AND versions.valid_from <= heads.revision
+ AND (versions.valid_until IS NULL OR heads.revision < versions.valid_until)
+CROSS JOIN resolution_producer_epochs AS epochs
+  ON epochs.lang = versions.lang AND epochs.producer_epoch = summaries.producer_epoch
+CROSS JOIN rust_resolution_unit_summary_versions AS rust_versions
+  ON rust_versions.workspace_id = versions.workspace_id AND rust_versions.lang = versions.lang
+ AND rust_versions.generation = versions.generation AND rust_versions.unit_key = versions.unit_key
+ AND rust_versions.valid_from = versions.valid_from AND rust_versions.summary_id = versions.summary_id
+CROSS JOIN resolution_unit_summary_members AS members
+  ON members.summary_id = endpoints.summary_id AND members.member_ordinal = endpoints.member_ordinal
+CROSS JOIN blobs ON blobs.id = members.blob_id
+WHERE endpoints.endpoint_role = 'trait' AND endpoints.endpoint_state = 'unresolved'
+  AND endpoints.unresolved_spelling = ?1
+  AND summaries.lang = 'rust' AND summaries.unit_kind = 'rust_crate'
+  AND summaries.publication_state = 'complete' AND summaries.derivation_version = 7";
 
 impl AnalyzerStore {
     pub(crate) fn resolution_shared_name_cache(&self) -> &resolution::SharedNameCache {
@@ -6451,12 +6486,12 @@ impl AnalyzerStore {
                 "DELETE FROM rust_crate_reconciliations WHERE workspace_id = ?1",
                 params![workspace_id],
             )?;
-            tx.execute(rust_crates::DELETE_UNBOUND_TOPOLOGIES_SQL, [])?;
             tx.execute(
                 unit_summaries::DELETE_WORKSPACE_VERSIONS_SQL,
                 params![workspace_id],
             )?;
             tx.execute(unit_summaries::DELETE_UNBOUND_SUMMARIES_SQL, [])?;
+            tx.execute(rust_crates::DELETE_UNBOUND_TOPOLOGIES_SQL, [])?;
             let revisions = tx.execute(
                 "DELETE FROM workspace_revisions WHERE workspace_id = ?1",
                 params![workspace_id],
@@ -6570,10 +6605,10 @@ impl AnalyzerStore {
     /// The traits one placed type declaration implements, as the placed
     /// declarations that declare them: `(blob, declaration id, rel_path)`.
     ///
-    /// Crate derivation already bound both ends of every `impl Trait for Type`
-    /// it could reach, so this is an index seek on
-    /// `rust_crate_trait_impls_subject` and the declaration bridge, not a walk
-    /// of the workspace's impls. The asked end is keyed by its file as well as
+    /// Unit derivation already bound both ends of every `impl Trait for Type`
+    /// it could reach, so this is an index seek on the Rust summary endpoint
+    /// target index and the declaration bridge, not a walk of the workspace's
+    /// impls. The asked end is keyed by its file as well as
     /// its `(blob, declaration)`: two byte-identical files are one blob, and
     /// only the file says which of them the question is about. The answer is
     /// one query's result: nothing here outlives the call.
@@ -6592,8 +6627,8 @@ impl AnalyzerStore {
     }
 
     /// The placed types that implement one placed trait declaration. The
-    /// reverse of [`Self::rust_traits_implemented_by`], seeked on
-    /// `rust_crate_trait_impls_trait`.
+    /// reverse of [`Self::rust_traits_implemented_by`], seeked on the Rust
+    /// summary endpoint target index.
     pub(crate) fn rust_types_implementing(
         &self,
         blob: Oid,
@@ -6633,7 +6668,7 @@ impl AnalyzerStore {
         Ok(out)
     }
 
-    /// Every impl of one placed trait declaration as the crate rows state it:
+    /// Every impl of one placed trait declaration as the published rows state it:
     /// the impl's blob, file and source declaration, and its subject's placed
     /// declaration.
     ///
@@ -6687,8 +6722,8 @@ impl AnalyzerStore {
         Ok(out)
     }
 
-    /// The traits the crate rows say one placed impl item states, as placed
-    /// declarations. Seeked on `rust_crate_trait_impls_impl`.
+    /// The traits one placed impl item states, as placed declarations. Seeked
+    /// on the Rust summary endpoint impl index.
     pub(crate) fn rust_traits_of_impl(
         &self,
         impl_blob: Oid,
@@ -6713,12 +6748,13 @@ impl AnalyzerStore {
     /// every such crate, as the crate's own cfg atoms evaluate it.
     pub(crate) fn rust_item_macro_decisions(
         &self,
+        snapshots: &WorkspaceSnapshots,
         blob: Oid,
         rel_path: &str,
     ) -> Result<Vec<StoredItemMacroDecision>> {
         use brokk_bifrost_rust::graph_support::RustItemMacroDecided;
         use brokk_bifrost_rust::selected_context::RustSelectedActivation;
-        let conn = self.read_conn()?;
+        let conn = self.read_conn_for_workspace(snapshots)?;
         let mut stmt = conn.prepare_cached(RUST_ITEM_MACRO_DECISIONS_SQL)?;
         let rows = stmt.query_map(params![blob.to_string(), rel_path], |row| {
             Ok((
@@ -6729,8 +6765,8 @@ impl AnalyzerStore {
                 row.get::<_, Option<String>>(4)?,
             ))
         })?;
-        /// One invocation's rows: per placing crate, the decoration and that
-        /// crate's cfg atoms when the crate decided it, `None` when it did not.
+        /// One invocation's rows: per selected unit summary, the decoration
+        /// and that crate's cfg atoms when it decided it, `None` when it did not.
         struct Placed {
             invocation: u32,
             name: Option<String>,
@@ -6738,7 +6774,7 @@ impl AnalyzerStore {
         }
         let mut invocations: Vec<Placed> = Vec::new();
         for row in rows {
-            let (invocation, name, topology, decoration, atoms) = row?;
+            let (invocation, name, owner_summary, decoration, atoms) = row?;
             if invocations
                 .last()
                 .is_none_or(|last| last.invocation != invocation)
@@ -6750,9 +6786,12 @@ impl AnalyzerStore {
                 });
             }
             let placements = &mut invocations.last_mut().expect("pushed above").placements;
-            if let Some(topology) = topology {
+            if let Some(owner_summary) = owner_summary {
                 let atoms = atoms.expect("a placing crate has cfg atoms");
-                placements.insert(topology, decoration.map(|decoration| (decoration, atoms)));
+                placements.insert(
+                    owner_summary,
+                    decoration.map(|decoration| (decoration, atoms)),
+                );
             }
         }
         let mut out = Vec::with_capacity(invocations.len());
@@ -6891,21 +6930,15 @@ impl AnalyzerStore {
     /// These are the impls the relation cannot point at: their trait side never
     /// bound, so there is no declaration to seek them by. They still decide
     /// whether a trait's implementations are exhaustively known, so a reader
-    /// that wants to answer that has to be told where they are. Recording them
-    /// by spelling is the only way to find them, which is what
-    /// `rust_crate_unresolved_trait_impls` exists for.
+    /// that wants to answer that has to be told where they are. The indexed
+    /// Rust summary endpoint rows preserve each spelling under the unit's live
+    /// summary version.
     pub(crate) fn rust_unresolved_trait_impl_files(
         &self,
         spelling: &str,
     ) -> Result<Vec<(Oid, String, Option<u32>)>> {
         let conn = self.read_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT DISTINCT keys.blob_oid, unresolved.impl_rel_path, unresolved.impl_declaration_id
-                 FROM rust_crate_unresolved_trait_impls AS unresolved
-                      INDEXED BY rust_crate_unresolved_trait_impls_spelling
-                 JOIN blobs AS keys ON keys.id = unresolved.impl_blob_id
-                 WHERE unresolved.side = 'trait' AND unresolved.spelling = ?1",
-        )?;
+        let mut stmt = conn.prepare_cached(RUST_UNRESOLVED_TRAIT_IMPL_FILES_SQL)?;
         let rows = stmt.query_map(params![spelling], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -7324,23 +7357,141 @@ const RUST_MODULE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT keys.blob_
 /// the way in, source site to declaration on the way out. `?3` is the asked
 /// declaration's file, which the seek includes so that one of two
 /// byte-identical files does not answer for the other.
-fn trait_impl_counterpart_sql(asked: &str, counterpart: &str, index: &str) -> String {
+fn live_rust_summary_joins(prefix: &str, version_index: &str, version_predicate: &str) -> String {
     format!(
-        "SELECT DISTINCT counterpart_keys.blob_oid, counterpart.declaration_id,
-                impls.{counterpart}_rel_path
-         FROM blobs AS asked_keys
-         CROSS JOIN source_native_declaration_bridges AS asked
-              INDEXED BY source_native_declaration_bridges_declaration
-           ON asked.blob_id = asked_keys.id AND asked.declaration_id = ?2
-         CROSS JOIN rust_crate_trait_impls AS impls INDEXED BY {index}
-           ON impls.{asked}_declaration_blob_id = asked_keys.id
-          AND impls.{asked}_declaration_site = asked.source_site
-          AND impls.{asked}_rel_path = ?3
-         CROSS JOIN source_native_declaration_bridges AS counterpart
-           ON counterpart.blob_id = impls.{counterpart}_declaration_blob_id
-          AND counterpart.source_site = impls.{counterpart}_declaration_site
-         CROSS JOIN blobs AS counterpart_keys ON counterpart_keys.id = counterpart.blob_id
-         WHERE asked_keys.blob_oid = ?1"
+        "CROSS JOIN main.resolution_unit_summary_versions AS {prefix}_versions \
+           INDEXED BY {version_index} ON {version_predicate} \
+         CROSS JOIN main.workspace_heads AS {prefix}_heads \
+           ON {prefix}_heads.workspace_id={prefix}_versions.workspace_id \
+          AND {prefix}_heads.lang={prefix}_versions.lang \
+          AND {prefix}_heads.generation={prefix}_versions.generation \
+          AND {prefix}_versions.valid_from<={prefix}_heads.revision \
+          AND ({prefix}_versions.valid_until IS NULL OR \
+               {prefix}_heads.revision<{prefix}_versions.valid_until) \
+         CROSS JOIN main.resolution_unit_summaries AS {prefix}_summaries \
+           ON {prefix}_summaries.summary_id={prefix}_versions.summary_id \
+          AND {prefix}_summaries.lang='rust' \
+          AND {prefix}_summaries.unit_kind='rust_crate' \
+          AND {prefix}_summaries.publication_state='complete' \
+          AND {prefix}_summaries.derivation_version=7 \
+         CROSS JOIN main.resolution_producer_epochs AS {prefix}_epochs \
+           ON {prefix}_epochs.lang={prefix}_versions.lang \
+          AND {prefix}_epochs.producer_epoch={prefix}_summaries.producer_epoch \
+         CROSS JOIN main.rust_resolution_unit_summary_versions AS {prefix}_rust_versions \
+           ON {prefix}_rust_versions.workspace_id={prefix}_versions.workspace_id \
+          AND {prefix}_rust_versions.lang={prefix}_versions.lang \
+          AND {prefix}_rust_versions.generation={prefix}_versions.generation \
+          AND {prefix}_rust_versions.unit_key={prefix}_versions.unit_key \
+          AND {prefix}_rust_versions.valid_from={prefix}_versions.valid_from \
+          AND {prefix}_rust_versions.summary_id={prefix}_versions.summary_id"
+    )
+}
+
+fn live_rust_summary_by_id(prefix: &str, summary_id: &str) -> String {
+    live_rust_summary_joins(
+        prefix,
+        "resolution_unit_summary_versions_summary",
+        &format!("{prefix}_versions.summary_id={summary_id}"),
+    )
+}
+
+fn live_rust_summary_by_key(prefix: &str, owner_prefix: &str, unit_key: &str) -> String {
+    live_rust_summary_joins(
+        prefix,
+        "resolution_unit_summary_versions_open",
+        &format!(
+            "{prefix}_versions.workspace_id={owner_prefix}_versions.workspace_id \
+             AND {prefix}_versions.lang='rust' \
+             AND {prefix}_versions.generation={owner_prefix}_versions.generation \
+             AND {prefix}_versions.unit_key={unit_key} \
+             AND {prefix}_versions.valid_until IS NULL"
+        ),
+    )
+}
+
+fn live_rust_member_file_joins(prefix: &str, member: &str, version: &str) -> String {
+    format!(
+        "CROSS JOIN main.workspace_file_versions AS {prefix}_files \
+           INDEXED BY idx_workspace_file_versions_snapshot_path \
+           ON {prefix}_files.workspace_id={version}.workspace_id \
+          AND {prefix}_files.lang={version}.lang \
+          AND {prefix}_files.generation={version}.generation \
+          AND {prefix}_files.input_kind='source' \
+          AND {prefix}_files.rel_path={member}.rel_path \
+          AND {prefix}_files.valid_from<={prefix}_heads.revision \
+          AND ({prefix}_files.valid_until IS NULL OR \
+               {prefix}_heads.revision<{prefix}_files.valid_until) \
+         CROSS JOIN main.blobs AS {prefix}_blobs \
+           ON {prefix}_blobs.id={member}.blob_id \
+          AND {prefix}_blobs.lang={version}.lang \
+          AND {prefix}_blobs.generation={version}.generation \
+          AND {prefix}_blobs.blob_oid={prefix}_files.blob_oid"
+    )
+}
+
+fn trait_impl_counterpart_sql(asked: &str, counterpart: &str) -> String {
+    let asked_live = live_rust_summary_by_id("asked", "asked_member.summary_id");
+    let asked_file = live_rust_member_file_joins("asked", "asked_member", "asked_versions");
+    let owner_live = live_rust_summary_by_id("owner", "asked_endpoint.summary_id");
+    let owner_file = live_rust_member_file_joins("owner", "owner_member", "owner_versions");
+    let target_live = live_rust_summary_by_key(
+        "counterpart",
+        "owner",
+        "counterpart_endpoint.target_unit_key",
+    );
+    let target_file =
+        live_rust_member_file_joins("counterpart", "counterpart_member", "counterpart_versions");
+    format!(
+        "SELECT DISTINCT counterpart_blobs.blob_oid, counterpart_bridge.declaration_id, \
+                counterpart_member.rel_path \
+         FROM main.blobs AS asked_keys \
+         CROSS JOIN main.source_native_declaration_bridges AS asked \
+           INDEXED BY source_native_declaration_bridges_declaration \
+           ON asked.blob_id=asked_keys.id AND asked.declaration_id=?2 \
+         CROSS JOIN main.resolution_unit_summary_members AS asked_member \
+           INDEXED BY resolution_unit_summary_members_blob \
+           ON asked_member.blob_id=asked_keys.id AND asked_member.rel_path=?3 \
+         {asked_live} {asked_file} \
+         CROSS JOIN main.rust_resolution_unit_summary_exports AS asked_export \
+           INDEXED BY rust_resolution_unit_summary_exports_declaration \
+           ON asked_export.summary_id=asked_member.summary_id \
+          AND asked_export.declaration_member_ordinal=asked_member.member_ordinal \
+          AND asked_export.declaration_site=asked.source_site \
+          AND asked_export.namespace='type' AND asked_export.origin='declaration' \
+         CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS asked_endpoint \
+           INDEXED BY rust_resolution_unit_summary_trait_endpoints_target \
+           ON asked_endpoint.target_unit_key=asked_versions.unit_key \
+          AND asked_endpoint.target_module_path=asked_export.module_path \
+          AND asked_endpoint.target_identity_id=asked_export.identity_id \
+          AND asked_endpoint.endpoint_role='{asked}' \
+          AND asked_endpoint.endpoint_state='resolved' \
+         CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS counterpart_endpoint \
+           ON counterpart_endpoint.summary_id=asked_endpoint.summary_id \
+          AND counterpart_endpoint.member_ordinal=asked_endpoint.member_ordinal \
+          AND counterpart_endpoint.owner_module_path=asked_endpoint.owner_module_path \
+          AND counterpart_endpoint.source_relation_key=asked_endpoint.source_relation_key \
+          AND counterpart_endpoint.endpoint_role='{counterpart}' \
+          AND counterpart_endpoint.endpoint_state='resolved' \
+         {owner_live} \
+         CROSS JOIN main.resolution_unit_summary_members AS owner_member \
+           ON owner_member.summary_id=owner_versions.summary_id \
+          AND owner_member.member_ordinal=asked_endpoint.member_ordinal \
+         {owner_file} \
+         {target_live} \
+         CROSS JOIN main.rust_resolution_unit_summary_exports AS counterpart_export \
+           INDEXED BY rust_resolution_unit_summary_exports_identity \
+           ON counterpart_export.summary_id=counterpart_versions.summary_id \
+          AND counterpart_export.identity_id=counterpart_endpoint.target_identity_id \
+          AND counterpart_export.module_path=counterpart_endpoint.target_module_path \
+          AND counterpart_export.namespace='type' AND counterpart_export.origin='declaration' \
+         CROSS JOIN main.resolution_unit_summary_members AS counterpart_member \
+           ON counterpart_member.summary_id=counterpart_export.summary_id \
+          AND counterpart_member.member_ordinal=counterpart_export.declaration_member_ordinal \
+         {target_file} \
+         CROSS JOIN main.source_native_declaration_bridges AS counterpart_bridge \
+           ON counterpart_bridge.blob_id=counterpart_member.blob_id \
+          AND counterpart_bridge.source_site=counterpart_export.declaration_site \
+         WHERE asked_keys.blob_oid=?1"
     )
 }
 
@@ -7366,22 +7517,25 @@ pub(crate) struct StoredMacroExpansionBlob {
 /// The name row exists only for an unqualified invocation, which is the only
 /// kind textual `macro_rules!` scoping decides.
 const RUST_ITEM_MACRO_DECISIONS_SQL: &str =
-    "SELECT invocation.invocation_occurrence_id, head.macro_name, placed.topology_id,
-            decided.decoration_cfg, json(topologies.cfg_atoms)
+    "SELECT invocation.invocation_occurrence_id, head.macro_name, member.summary_id,
+            decided.decoration_cfg, json(context.cfg_atoms)
      FROM blobs AS keys
      CROSS JOIN source_rust_item_macro_expansions AS invocation
        ON invocation.blob_id = keys.id
      LEFT JOIN source_rust_macro_invocations AS head
        ON head.blob_id = invocation.blob_id
       AND head.occurrence_id = invocation.invocation_occurrence_id
-     LEFT JOIN rust_crate_container_sources AS placed
-       ON placed.blob_id = invocation.blob_id AND placed.rel_path = ?2
-     LEFT JOIN rust_crate_topologies AS topologies
-       ON topologies.topology_id = placed.topology_id
-     LEFT JOIN rust_crate_decided_item_macros AS decided
-       ON decided.topology_id = placed.topology_id
-      AND decided.blob_id = invocation.blob_id
+     LEFT JOIN main.resolution_unit_summary_members AS member
+       INDEXED BY resolution_unit_summary_members_blob
+       ON member.blob_id = invocation.blob_id AND member.rel_path = ?2
+      AND EXISTS(SELECT 1 FROM temp.selected_rust_unit_summary_route_owners AS live
+                 WHERE live.summary_id = member.summary_id)
+     LEFT JOIN main.rust_resolution_unit_summary_macro_decisions AS decided
+       ON decided.summary_id = member.summary_id
+      AND decided.member_ordinal = member.member_ordinal
       AND decided.invocation_occurrence_id = invocation.invocation_occurrence_id
+     LEFT JOIN main.rust_resolution_unit_summary_contexts AS context
+       ON context.summary_id = member.summary_id
      WHERE keys.blob_oid = ?1 AND keys.lang = 'rust' AND invocation.source_position IN (0, 1)
      ORDER BY invocation.invocation_occurrence_id";
 
@@ -7437,43 +7591,114 @@ pub(crate) struct StoredTraitImplRow {
 /// unbridged subject still returns its impl, to be resolved by the reader.
 pub(crate) static RUST_TRAIT_IMPL_ROWS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
-        String::from(
-            "SELECT DISTINCT impl_keys.blob_oid, impls.impl_rel_path, impls.impl_declaration_id,
-                    subject_keys.blob_oid, subject.declaration_id, impls.subject_rel_path
-             FROM blobs AS asked_keys
-             CROSS JOIN source_native_declaration_bridges AS asked
-                  INDEXED BY source_native_declaration_bridges_declaration
-               ON asked.blob_id = asked_keys.id AND asked.declaration_id = ?2
-             CROSS JOIN rust_crate_trait_impls AS impls
-                  INDEXED BY rust_crate_trait_impls_trait
-               ON impls.trait_declaration_blob_id = asked_keys.id
-              AND impls.trait_declaration_site = asked.source_site
-              AND impls.trait_rel_path = ?3
-             CROSS JOIN blobs AS impl_keys ON impl_keys.id = impls.impl_blob_id
-             LEFT JOIN source_native_declaration_bridges AS subject
-               ON subject.blob_id = impls.subject_declaration_blob_id
-              AND subject.source_site = impls.subject_declaration_site
-             LEFT JOIN blobs AS subject_keys ON subject_keys.id = subject.blob_id
-             WHERE asked_keys.blob_oid = ?1",
+        let target_live = live_rust_summary_by_id("asked", "asked_member.summary_id");
+        let target_file = live_rust_member_file_joins("asked", "asked_member", "asked_versions");
+        let impl_live = live_rust_summary_by_id("impl", "trait_endpoint.summary_id");
+        let impl_file = live_rust_member_file_joins("impl", "impl_member", "impl_versions");
+        let subject_live =
+            live_rust_summary_by_key("subject", "impl", "subject_endpoint.target_unit_key");
+        let subject_file =
+            live_rust_member_file_joins("subject", "subject_member", "subject_versions");
+        format!(
+            "SELECT DISTINCT impl_blobs.blob_oid, impl_member.rel_path, \
+                    trait_endpoint.impl_declaration_id, subject_blobs.blob_oid, \
+                    subject_bridge.declaration_id, subject_member.rel_path \
+             FROM main.blobs AS asked_keys \
+             CROSS JOIN main.source_native_declaration_bridges AS asked \
+               INDEXED BY source_native_declaration_bridges_declaration \
+               ON asked.blob_id=asked_keys.id AND asked.declaration_id=?2 \
+             CROSS JOIN main.resolution_unit_summary_members AS asked_member \
+               INDEXED BY resolution_unit_summary_members_blob \
+               ON asked_member.blob_id=asked_keys.id AND asked_member.rel_path=?3 \
+             {target_live} {target_file} \
+             CROSS JOIN main.rust_resolution_unit_summary_exports AS asked_export \
+               INDEXED BY rust_resolution_unit_summary_exports_declaration \
+               ON asked_export.summary_id=asked_member.summary_id \
+              AND asked_export.declaration_member_ordinal=asked_member.member_ordinal \
+              AND asked_export.declaration_site=asked.source_site \
+              AND asked_export.namespace='type' AND asked_export.origin='declaration' \
+             CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS trait_endpoint \
+               INDEXED BY rust_resolution_unit_summary_trait_endpoints_target \
+               ON trait_endpoint.target_unit_key=asked_versions.unit_key \
+              AND trait_endpoint.target_module_path=asked_export.module_path \
+              AND trait_endpoint.target_identity_id=asked_export.identity_id \
+              AND trait_endpoint.endpoint_role='trait' \
+              AND trait_endpoint.endpoint_state='resolved' \
+             CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS subject_endpoint \
+               ON subject_endpoint.summary_id=trait_endpoint.summary_id \
+              AND subject_endpoint.member_ordinal=trait_endpoint.member_ordinal \
+              AND subject_endpoint.owner_module_path=trait_endpoint.owner_module_path \
+              AND subject_endpoint.source_relation_key=trait_endpoint.source_relation_key \
+              AND subject_endpoint.endpoint_role='subject' \
+              AND subject_endpoint.endpoint_state='resolved' \
+             {impl_live} \
+             CROSS JOIN main.resolution_unit_summary_members AS impl_member \
+               ON impl_member.summary_id=impl_versions.summary_id \
+              AND impl_member.member_ordinal=trait_endpoint.member_ordinal \
+             {impl_file} \
+             {subject_live} \
+             CROSS JOIN main.rust_resolution_unit_summary_exports AS subject_export \
+               INDEXED BY rust_resolution_unit_summary_exports_identity \
+               ON subject_export.summary_id=subject_versions.summary_id \
+              AND subject_export.identity_id=subject_endpoint.target_identity_id \
+              AND subject_export.module_path=subject_endpoint.target_module_path \
+              AND subject_export.namespace='type' AND subject_export.origin='declaration' \
+             CROSS JOIN main.resolution_unit_summary_members AS subject_member \
+               ON subject_member.summary_id=subject_export.summary_id \
+              AND subject_member.member_ordinal=subject_export.declaration_member_ordinal \
+             {subject_file} \
+             LEFT JOIN main.source_native_declaration_bridges AS subject_bridge \
+               ON subject_bridge.blob_id=subject_member.blob_id \
+              AND subject_bridge.source_site=subject_export.declaration_site \
+             WHERE asked_keys.blob_oid=?1"
         )
     });
 
 /// The placed traits one placed impl item states.
 pub(crate) static RUST_TRAITS_OF_IMPL_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
-        String::from(
-            "SELECT DISTINCT trait_keys.blob_oid, bridge.declaration_id, impls.trait_rel_path
-             FROM blobs AS impl_keys
-             CROSS JOIN rust_crate_trait_impls AS impls
-                  INDEXED BY rust_crate_trait_impls_impl
-               ON impls.impl_blob_id = impl_keys.id
-              AND impls.impl_declaration_id = ?2
-              AND impls.impl_rel_path = ?3
-             CROSS JOIN source_native_declaration_bridges AS bridge
-               ON bridge.blob_id = impls.trait_declaration_blob_id
-              AND bridge.source_site = impls.trait_declaration_site
-             CROSS JOIN blobs AS trait_keys ON trait_keys.id = bridge.blob_id
-             WHERE impl_keys.blob_oid = ?1",
+        let owner_live = live_rust_summary_by_id("owner", "owner_member.summary_id");
+        let owner_file = live_rust_member_file_joins("owner", "owner_member", "owner_versions");
+        let target_live =
+            live_rust_summary_by_key("trait", "owner", "trait_endpoint.target_unit_key");
+        let target_file = live_rust_member_file_joins("trait", "trait_member", "trait_versions");
+        format!(
+            "SELECT DISTINCT trait_blobs.blob_oid, trait_bridge.declaration_id, \
+                    trait_member.rel_path \
+             FROM main.blobs AS impl_keys \
+             CROSS JOIN main.resolution_unit_summary_members AS owner_member \
+               INDEXED BY resolution_unit_summary_members_blob \
+               ON owner_member.blob_id=impl_keys.id AND owner_member.rel_path=?3 \
+             {owner_live} {owner_file} \
+             CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS trait_endpoint \
+               INDEXED BY rust_resolution_unit_summary_trait_endpoints_impl \
+               ON trait_endpoint.summary_id=owner_versions.summary_id \
+              AND trait_endpoint.member_ordinal=owner_member.member_ordinal \
+              AND trait_endpoint.impl_declaration_id=?2 \
+              AND trait_endpoint.endpoint_role='trait' \
+              AND trait_endpoint.endpoint_state='resolved' \
+             CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS subject_endpoint \
+               ON subject_endpoint.summary_id=trait_endpoint.summary_id \
+              AND subject_endpoint.member_ordinal=trait_endpoint.member_ordinal \
+              AND subject_endpoint.owner_module_path=trait_endpoint.owner_module_path \
+              AND subject_endpoint.source_relation_key=trait_endpoint.source_relation_key \
+              AND subject_endpoint.endpoint_role='subject' \
+              AND subject_endpoint.endpoint_state='resolved' \
+             {target_live} \
+             CROSS JOIN main.rust_resolution_unit_summary_exports AS trait_export \
+               INDEXED BY rust_resolution_unit_summary_exports_identity \
+               ON trait_export.summary_id=trait_versions.summary_id \
+              AND trait_export.identity_id=trait_endpoint.target_identity_id \
+              AND trait_export.module_path=trait_endpoint.target_module_path \
+              AND trait_export.namespace='type' AND trait_export.origin='declaration' \
+             CROSS JOIN main.resolution_unit_summary_members AS trait_member \
+               ON trait_member.summary_id=trait_export.summary_id \
+              AND trait_member.member_ordinal=trait_export.declaration_member_ordinal \
+             {target_file} \
+             CROSS JOIN main.source_native_declaration_bridges AS trait_bridge \
+               ON trait_bridge.blob_id=trait_member.blob_id \
+              AND trait_bridge.source_site=trait_export.declaration_site \
+             WHERE impl_keys.blob_oid=?1"
         )
     });
 
@@ -7482,33 +7707,57 @@ pub(crate) static RUST_TRAITS_OF_IMPL_SQL: std::sync::LazyLock<String> =
 /// impl blob and the impl site the relation row already carries.
 pub(crate) static RUST_TRAIT_IMPL_SPELLINGS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
-        String::from(
-            "SELECT DISTINCT spelled.terminal_spelling
-             FROM blobs AS asked_keys
-             CROSS JOIN source_native_declaration_bridges AS asked
-                  INDEXED BY source_native_declaration_bridges_declaration
-               ON asked.blob_id = asked_keys.id AND asked.declaration_id = ?2
-             CROSS JOIN rust_crate_trait_impls AS impls
-                  INDEXED BY rust_crate_trait_impls_trait
-               ON impls.trait_declaration_blob_id = asked_keys.id
-              AND impls.trait_declaration_site = asked.source_site
-              AND impls.trait_rel_path = ?3
-             CROSS JOIN resolution_trait_implementations AS spelled
-               ON spelled.blob_id = impls.impl_blob_id
-              AND spelled.side = 'trait'
-              AND spelled.impl_site = impls.impl_site
-             WHERE asked_keys.blob_oid = ?1 AND spelled.terminal_spelling IS NOT NULL",
+        let target_live = live_rust_summary_by_id("asked", "asked_member.summary_id");
+        let target_file = live_rust_member_file_joins("asked", "asked_member", "asked_versions");
+        let impl_live = live_rust_summary_by_id("impl", "trait_endpoint.summary_id");
+        let impl_file = live_rust_member_file_joins("impl", "impl_member", "impl_versions");
+        format!(
+            "SELECT DISTINCT spelled.terminal_spelling \
+             FROM main.blobs AS asked_keys \
+             CROSS JOIN main.source_native_declaration_bridges AS asked \
+               INDEXED BY source_native_declaration_bridges_declaration \
+               ON asked.blob_id=asked_keys.id AND asked.declaration_id=?2 \
+             CROSS JOIN main.resolution_unit_summary_members AS asked_member \
+               INDEXED BY resolution_unit_summary_members_blob \
+               ON asked_member.blob_id=asked_keys.id AND asked_member.rel_path=?3 \
+             {target_live} {target_file} \
+             CROSS JOIN main.rust_resolution_unit_summary_exports AS asked_export \
+               INDEXED BY rust_resolution_unit_summary_exports_declaration \
+               ON asked_export.summary_id=asked_member.summary_id \
+              AND asked_export.declaration_member_ordinal=asked_member.member_ordinal \
+              AND asked_export.declaration_site=asked.source_site \
+              AND asked_export.namespace='type' AND asked_export.origin='declaration' \
+             CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS trait_endpoint \
+               INDEXED BY rust_resolution_unit_summary_trait_endpoints_target \
+               ON trait_endpoint.target_unit_key=asked_versions.unit_key \
+              AND trait_endpoint.target_module_path=asked_export.module_path \
+              AND trait_endpoint.target_identity_id=asked_export.identity_id \
+              AND trait_endpoint.endpoint_role='trait' \
+              AND trait_endpoint.endpoint_state='resolved' \
+             CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS subject_endpoint \
+               ON subject_endpoint.summary_id=trait_endpoint.summary_id \
+              AND subject_endpoint.member_ordinal=trait_endpoint.member_ordinal \
+              AND subject_endpoint.owner_module_path=trait_endpoint.owner_module_path \
+              AND subject_endpoint.source_relation_key=trait_endpoint.source_relation_key \
+              AND subject_endpoint.endpoint_role='subject' \
+              AND subject_endpoint.endpoint_state='resolved' \
+             {impl_live} \
+             CROSS JOIN main.resolution_unit_summary_members AS impl_member \
+               ON impl_member.summary_id=impl_versions.summary_id \
+              AND impl_member.member_ordinal=trait_endpoint.member_ordinal \
+             {impl_file} \
+             CROSS JOIN main.resolution_trait_implementations AS spelled \
+               ON spelled.blob_id=impl_member.blob_id \
+              AND spelled.relation_key=trait_endpoint.source_relation_key \
+              AND spelled.side='trait' AND spelled.terminal_spelling IS NOT NULL \
+             WHERE asked_keys.blob_oid=?1"
         )
     });
 
 pub(crate) static RUST_TRAITS_IMPLEMENTED_BY_SQL: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| {
-        trait_impl_counterpart_sql("subject", "trait", "rust_crate_trait_impls_subject")
-    });
+    std::sync::LazyLock::new(|| trait_impl_counterpart_sql("subject", "trait"));
 pub(crate) static RUST_TYPES_IMPLEMENTING_SQL: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| {
-        trait_impl_counterpart_sql("trait", "subject", "rust_crate_trait_impls_trait")
-    });
+    std::sync::LazyLock::new(|| trait_impl_counterpart_sql("trait", "subject"));
 
 fn declaration_candidate_sql(predicate: &str) -> String {
     declaration_candidate_sql_with_order(predicate, "keys.blob_oid, units.unit_key")
@@ -16559,12 +16808,15 @@ fn ensure_language_epochs_tx(
         if lang == "rust" {
             tx.execute("DELETE FROM rust_crate_versions WHERE lang = ?1", [lang])?;
             tx.execute("DELETE FROM rust_crate_reconciliations", [])?;
-            tx.execute(rust_crates::DELETE_UNBOUND_TOPOLOGIES_SQL, [])?;
         }
         // Summaries are keyed by generation, so a rotation strands every version
         // row of the language. Withdraw them and delete the headers nothing binds.
         if tx.execute(unit_summaries::DELETE_LANGUAGE_VERSIONS_SQL, [lang])? > 0 {
             tx.execute(unit_summaries::DELETE_UNBOUND_SUMMARIES_SQL, [])?;
+        }
+        if lang == "rust" {
+            // After the summary withdrawal: Rust summary versions bind topologies too.
+            tx.execute(rust_crates::DELETE_UNBOUND_TOPOLOGIES_SQL, [])?;
         }
         let generation: i64 = tx.query_row(
             "UPDATE analysis_generation_sequence

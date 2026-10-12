@@ -852,6 +852,7 @@ fn header_module_id(dependency_name: &str, header: &str) -> String {
 fn header_module_fact(dependency_name: &str, header: &str) -> Option<TypeFact> {
     let name = crate::analyzer::semantic::module_identity_owner(Path::new(header))?;
     Some(TypeFact {
+        jvm_inventory: None,
         ambient_use: None,
         id: header_module_id(dependency_name, header),
         name: name.clone(),
@@ -1300,6 +1301,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
         let mut types = extracted_types
             .into_iter()
             .map(|record| TypeFact {
+                jvm_inventory: None,
                 ambient_use: None,
                 id: type_ids[&record.name].clone(),
                 name: record.name.clone(),

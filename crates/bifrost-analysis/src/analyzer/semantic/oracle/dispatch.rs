@@ -1857,8 +1857,10 @@ impl DispatchResult {
     /// candidate identifies receiver shape even when the receiver declaration
     /// itself is unnamed and therefore has no formal binding row. A modeled
     /// external target qualifies only when its boundary carries the equivalent
-    /// resolver-owned shape. Mixed, partial, non-Go, or open target sets prove
-    /// no shape.
+    /// resolver-owned shape. Java method staticness is likewise declaration-
+    /// owned: a written operand on a static invocation is evaluated but never
+    /// transported as an instance receiver. Mixed, partial, unsupported-language
+    /// or open target sets prove no shape.
     pub fn proven_receiver_shape(&self) -> Option<bool> {
         if self.coverage != CandidateCoverage::Exhaustive {
             return None;
@@ -1876,23 +1878,35 @@ impl DispatchResult {
         let shape = |candidate: &DispatchCandidate| {
             if !matches!(candidate.proof(), ProofStatus::Proven)
                 || !matches!(candidate.completeness(), EvidenceCompleteness::Complete)
-                || candidate.target().artifact().key().language()
-                    != SemanticLanguage::Standard(Language::Go)
             {
                 return None;
             }
-            match candidate.target().semantics().kind() {
-                ProcedureKind::Method => Some(true),
-                ProcedureKind::Function | ProcedureKind::LocalFunction | ProcedureKind::Lambda => {
-                    Some(false)
-                }
+            let procedure = candidate.target().semantics();
+            match candidate.target().artifact().key().language() {
+                SemanticLanguage::Standard(Language::Go) => match procedure.kind() {
+                    ProcedureKind::Method => Some(true),
+                    ProcedureKind::Function
+                    | ProcedureKind::LocalFunction
+                    | ProcedureKind::Lambda => Some(false),
+                    _ => None,
+                },
+                SemanticLanguage::Standard(Language::Java) => match procedure.kind() {
+                    ProcedureKind::Method => Some(!procedure.properties().is_static),
+                    ProcedureKind::Constructor => Some(false),
+                    _ => None,
+                },
                 _ => None,
             }
         };
-        let first = shape(self.candidates.first()?)?;
+        let first_candidate = self.candidates.first()?;
+        let language = first_candidate.target().artifact().key().language();
+        let first = shape(first_candidate)?;
         self.candidates
             .iter()
-            .all(|candidate| shape(candidate) == Some(first))
+            .all(|candidate| {
+                candidate.target().artifact().key().language() == language
+                    && shape(candidate) == Some(first)
+            })
             .then_some(first)
     }
 
@@ -2300,5 +2314,79 @@ mod split_canonical_qualified_callee_tests {
             split_canonical_qualified_callee("std::str::from_utf8", Language::Java),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod receiver_shape_tests {
+    use super::*;
+    use crate::analyzer::ProjectFile;
+    use crate::analyzer::semantic::{SemanticBudget, SemanticRequest};
+    use crate::cancellation::CancellationToken;
+    use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn equal_receiver_shapes_in_different_languages_are_not_one_declaration_contract() {
+        let mut candidates = Vec::new();
+        for (language, path, source, kind) in [
+            (
+                Language::Java,
+                "App.java",
+                "class App { static void target() {} }",
+                ProcedureKind::Method,
+            ),
+            (
+                Language::Go,
+                "target.go",
+                "package fixture\nfunc target() {}\n",
+                ProcedureKind::Function,
+            ),
+        ] {
+            let fixture = AnalyzerFixture::new_for_language(language, &[(path, source)]);
+            let file = ProjectFile::new(fixture.project_root(), path);
+            let cancellation = CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            let artifact = fixture
+                .analyzer
+                .materialize_program_semantics(
+                    &file,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("source-backed target materializes")
+                .available_value()
+                .cloned()
+                .expect("target artifact is available");
+            let target = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| procedure.kind() == kind)
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .expect("one declared target");
+            candidates.push(
+                DispatchCandidate::new(
+                    target,
+                    ProofStatus::Proven,
+                    EvidenceCompleteness::Complete,
+                    std::iter::empty(),
+                    OracleLimits::default(),
+                )
+                .expect("bounded candidate"),
+            );
+        }
+        let mut result = DispatchResult {
+            candidates: candidates[..1].to_vec().into_boxed_slice(),
+            boundaries: Box::new([]),
+            coverage: CandidateCoverage::Exhaustive,
+            complete_receiver_hint_refinable: false,
+            resolver_proved_no_callee: false,
+            returned_callable: None,
+            argument_callable: None,
+            stable_package_values: Box::new([]),
+        };
+        assert_eq!(result.proven_receiver_shape(), Some(false));
+        result.candidates = candidates[1..].to_vec().into_boxed_slice();
+        assert_eq!(result.proven_receiver_shape(), Some(false));
+        result.candidates = candidates.into_boxed_slice();
+        assert_eq!(result.proven_receiver_shape(), None);
     }
 }

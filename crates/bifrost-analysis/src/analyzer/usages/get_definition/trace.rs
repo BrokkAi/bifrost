@@ -886,14 +886,11 @@ fn trace_completeness_for(file: &ProjectFile) -> TraceCompleteness {
     if language_for_file(file) == crate::analyzer::Language::Rust {
         return TraceCompleteness::SelectionOnly;
     }
-    if language_for_file(file) == crate::analyzer::Language::Java
-        && std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some()
-    {
-        return TraceCompleteness::SelectionOnly;
-    }
     #[cfg(any(test, feature = "test-support"))]
-    if (language_for_file(file) == crate::analyzer::Language::Scala
-        && std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some())
+    if (language_for_file(file) == crate::analyzer::Language::Java
+        && std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some())
+        || (language_for_file(file) == crate::analyzer::Language::Scala
+            && std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some())
         || (language_for_file(file) == crate::analyzer::Language::Kotlin
             && std::env::var_os("BIFROST_TRIAL_NATIVE_KOTLIN").is_some())
     {
@@ -1013,6 +1010,56 @@ pub fn boundary_evidence(
     file: &ProjectFile,
     name: &str,
 ) -> (BoundaryStatus, Option<String>) {
+    boundary_evidence_for(analyzer, file, name, BoundaryEvidenceUse::Reference)
+}
+
+/// Resolve the boundary for a call target. Java's implicit `java.lang` root
+/// supplies types, not unqualified methods, so it cannot make a bare unknown
+/// callee a declared-but-unindexed target.
+pub(crate) fn call_target_boundary_evidence(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    name: &str,
+) -> (BoundaryStatus, Option<String>) {
+    let evidence = boundary_evidence_for(analyzer, file, name, BoundaryEvidenceUse::CallTarget);
+    if crate::analyzer::common::language_for_file(file) == crate::analyzer::Language::Java
+        && evidence.0 == BoundaryStatus::ExternalDeclaredUnindexed
+        && !analyzer
+            .dependency_discovery_evidence(crate::analyzer::Language::Java)
+            .as_deref()
+            .is_some_and(|discovery| {
+                declared_by_retained_discovery(analyzer, crate::analyzer::Language::Java, name)
+                    || declared_jvm_import_or_implicit_root(
+                        analyzer,
+                        file,
+                        crate::analyzer::Language::Java,
+                        name,
+                        discovery,
+                        false,
+                    )
+            })
+    {
+        // The Java external index can report an unavailable inventory without
+        // any build or import evidence that this call reaches it. Keep that
+        // unmodeled receiver open; index diagnostics alone do not declare an
+        // arbitrary method name.
+        return (BoundaryStatus::ExternalUnknown, None);
+    }
+    evidence
+}
+
+#[derive(Clone, Copy)]
+enum BoundaryEvidenceUse {
+    Reference,
+    CallTarget,
+}
+
+fn boundary_evidence_for(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    name: &str,
+    usage: BoundaryEvidenceUse,
+) -> (BoundaryStatus, Option<String>) {
     let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     use crate::analyzer::common::language_for_file;
@@ -1070,7 +1117,13 @@ pub fn boundary_evidence(
                     if declared_by_retained_discovery(analyzer, language, name)
                         || discovery.as_deref().is_some_and(|evidence| {
                             declared_jvm_import_or_implicit_root(
-                                analyzer, file, language, name, evidence,
+                                analyzer,
+                                file,
+                                language,
+                                name,
+                                evidence,
+                                !matches!(usage, BoundaryEvidenceUse::CallTarget)
+                                    || language != Language::Java,
                             )
                         })
                     {
@@ -1415,6 +1468,7 @@ fn declared_jvm_import_or_implicit_root(
     language: crate::analyzer::Language,
     name: &str,
     evidence: &crate::analyzer::semantic_model::DependencyDiscoveryEvidence,
+    include_implicit_root: bool,
 ) -> bool {
     use crate::analyzer::resolution::{JvmImplicitRootProvider, language_implicit_root_providers};
 
@@ -1435,7 +1489,8 @@ fn declared_jvm_import_or_implicit_root(
             })
         });
     imported
-        || (!name.contains('.')
+        || (include_implicit_root
+            && !name.contains('.')
             && language_implicit_root_providers(language)
                 .iter()
                 .any(|provider| {

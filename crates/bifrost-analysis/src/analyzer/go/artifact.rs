@@ -877,6 +877,7 @@ fn module_type_drafts(
                     .collect();
                 TypeDraft {
                     fact: TypeFact {
+                        jvm_inventory: None,
                         ambient_use: None,
                         id: type_declaration_id(TypeIdentity {
                             ecosystem: "go",
@@ -1124,6 +1125,7 @@ fn collect_type_draft(
     }
     types.push(TypeDraft {
         fact: TypeFact {
+            jvm_inventory: None,
             ambient_use: None,
             id: type_id.clone(),
             name: canonical_name.clone(),

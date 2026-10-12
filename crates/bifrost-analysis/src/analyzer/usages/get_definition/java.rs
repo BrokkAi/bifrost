@@ -6153,22 +6153,6 @@ fn java_hierarchy_crosses_unindexed_supertype(
     false
 }
 
-/// Methods every Java class inherits from `java.lang.Object` and every
-/// interface declares implicitly (JLS 4.3.2, 9.2). The workspace does not
-/// index `Object`, so no workspace walk can show that one of these names has
-/// no further overload.
-const JAVA_OBJECT_METHOD_NAMES: [&str; 9] = [
-    "clone",
-    "equals",
-    "finalize",
-    "getClass",
-    "hashCode",
-    "notify",
-    "notifyAll",
-    "toString",
-    "wait",
-];
-
 /// Whether the methods named `member` found so far are every method of that
 /// name Java overload resolution considers for `owner` (JLS 15.12.2.1).
 ///
@@ -6187,7 +6171,13 @@ fn java_overload_set_is_complete(
     seen: &HashSet<CodeUnit>,
     member: &str,
 ) -> bool {
-    if JAVA_OBJECT_METHOD_NAMES.contains(&member) {
+    // Every Java class inherits the `java.lang.Object` methods and every
+    // interface declares them implicitly (JLS 4.3.2, 9.2). The workspace does
+    // not index `Object`, so no workspace walk can show that one of these
+    // names has no further overload.
+    if crate::analyzer::resolution::language_implicit_root_member_names(Language::Java)
+        .contains(&member)
+    {
         return false;
     }
     let Some(provider) = analyzer.type_hierarchy_provider() else {
@@ -7102,34 +7092,12 @@ mod tests {
                     DefinitionResolutionAuthority::NativeJavaSelected,
                     "the trial result comes from the selected native operation: {lookup:?}"
                 );
-                assert_eq!(
-                    outcome.status,
-                    DefinitionLookupStatus::Incomplete,
-                    "{outcome:?}"
-                );
-                assert!(
-                    outcome.diagnostics.iter().any(|diagnostic| {
-                        diagnostic.kind == "incomplete_binding"
-                            && diagnostic
-                                .message
-                                .starts_with("selected native binding is incomplete:")
-                    }),
-                    "the native frontier reason remains visible: {outcome:?}"
-                );
-                assert!(
-                    outcome
-                        .diagnostics
-                        .iter()
-                        .any(|diagnostic| diagnostic.kind == "java-source-access-open"),
-                    "the source-access gap remains visible: {outcome:?}"
-                );
-            } else {
-                assert_eq!(
-                    outcome.status,
-                    DefinitionLookupStatus::Resolved,
-                    "{outcome:?}"
-                );
             }
+            assert_eq!(
+                outcome.status,
+                DefinitionLookupStatus::Resolved,
+                "{outcome:?}"
+            );
             assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
             assert_eq!(outcome.definitions[0].fq_name(), "api.Store.put");
         }

@@ -293,8 +293,8 @@ struct ReachKey {
 
 #[derive(Debug, Clone)]
 enum ReachDerivation {
-    /// The interior `hop` from the source, then the path of item `next`.
-    Direct { hop: Box<Hop>, next: usize },
+    /// `hops` from the source, then the path of item `next`.
+    Direct { hops: Vec<Hop>, next: usize },
     /// The path of reach `inner`, then `hops`, then the path of item `next`.
     Through {
         inner: usize,
@@ -689,7 +689,7 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
             };
             let carrier = carrier(transform.carrier());
             let placed = place_transfer(transform.point(), &carrier, &carrier, hop_for);
-            self.annotate(placed, transform.point(), &carrier);
+            self.annotate_many(placed, transform.point(), &carrier);
         }
     }
 
@@ -710,7 +710,7 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
             &sanitizer.output,
             hop_for,
         );
-        self.annotate(placed, &sanitizer.point, &sanitizer.input);
+        self.annotate_many(placed, &sanitizer.point, &sanitizer.input);
     }
 
     /// Place one matched transform as a flow of its own from the call input
@@ -727,38 +727,39 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
             &transform.output,
             hop_for,
         );
-        match placed {
-            Some((
-                call,
-                Annotation {
-                    input: Some(input),
-                    output: Some(output),
-                    hop,
-                },
-            )) => self
-                .links
-                .entry(call)
-                .or_default()
-                .push(Link { input, output, hop }),
-            _ => self.note(Incompleteness::UnplacedTransfer {
+        let mut links = 0;
+        for (call, Annotation { input, output, hop }) in placed {
+            if let (Some(input), Some(output)) = (input, output) {
+                self.links
+                    .entry(call)
+                    .or_default()
+                    .push(Link { input, output, hop });
+                links += 1;
+            }
+        }
+        if links == 0 {
+            self.note(Incompleteness::UnplacedTransfer {
                 procedure: transform.point.procedure().durable_key(),
                 carrier: transform.input.clone(),
-            }),
+            });
         }
     }
 
-    fn annotate(
+    fn annotate_many(
         &mut self,
-        placed: Option<(DurableCallSiteKey, Annotation)>,
+        placed: Vec<(DurableCallSiteKey, Annotation)>,
         point: &ProgramPointHandle,
         carrier: &ValueFlowCarrier,
     ) {
-        match placed {
-            Some((call, annotation)) => self.annotations.entry(call).or_default().push(annotation),
-            None => self.note(Incompleteness::UnplacedTransfer {
+        if placed.is_empty() {
+            self.note(Incompleteness::UnplacedTransfer {
                 procedure: point.procedure().durable_key(),
                 carrier: carrier.clone(),
-            }),
+            });
+            return;
+        }
+        for (call, annotation) in placed {
+            self.annotations.entry(call).or_default().push(annotation);
         }
     }
 
@@ -789,6 +790,45 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
             })
             .map(|annotation| annotation.hop.clone())
             .collect()
+    }
+
+    /// Annotations on the input port where a matched-value sink is rooted.
+    /// The path ends at this port, so it does not cross the call result and
+    /// cannot pick up the annotation through `annotations_for`.
+    fn sink_annotations(&self, sink: ValueFlowSinkId) -> Vec<Hop> {
+        let spec = self
+            .plan
+            .value_flow()
+            .sink(sink)
+            .expect("a sink item names a sink of its plan");
+        let ValueFlowCarrier::Value(value) = spec.carrier() else {
+            return Vec::new();
+        };
+        let point = spec.point();
+        let procedure = point.procedure().durable_key();
+        let semantics = point.procedure().semantics();
+        let mut placed = Vec::new();
+        for call in semantics
+            .call_sites()
+            .iter()
+            .filter(|call| call.point == point.id())
+        {
+            let Some(input) = call_input_port(call, value.id()) else {
+                continue;
+            };
+            let Some(annotations) = self.annotations.get(&(procedure.clone(), call.id)) else {
+                continue;
+            };
+            placed.extend(
+                annotations
+                    .iter()
+                    .filter(|annotation| {
+                        annotation.input.as_ref() == Some(&input) && annotation.output.is_none()
+                    })
+                    .map(|annotation| annotation.hop.clone()),
+            );
+        }
+        placed
     }
 
     fn exhaust(&mut self, lane: BudgetLane) {
@@ -1228,46 +1268,45 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                 .and_then(|interior| interior.into.get(&key.node).cloned())
                 .unwrap_or_default(),
         };
+        let sink_annotations = match &key.node {
+            Endpoint::Sink(sink) => self.sink_annotations(*sink),
+            _ => Vec::new(),
+        };
         {
             for flow in reaching {
                 let (flow_quality, crossed) =
                     self.flow_quality(&key.procedure, flow.uncertain, &flow.crossed, request)?;
                 let seed = flow.from;
-                let hop = Hop::Interior {
+                let mut hops = vec![Hop::Interior {
                     procedure: key.procedure.clone(),
                     from: seed.clone(),
                     to: key.node.clone(),
                     quality: flow_quality,
                     crossed,
-                };
+                }];
+                hops.extend(sink_annotations.iter().cloned());
+                let path_quality = Hop::path_quality(&hops).conjoin(quality);
+                let function = hops_function(&hops, self.plan.universe()).compose(&key.function);
                 match seed {
                     Endpoint::Source(source) => self.add_reach(
                         key.root.clone(),
                         source,
-                        key.function.clone(),
-                        flow_quality
-                            .conjoin(match self.sources[source.index()].evidence {
-                                EndpointEvidence::Known(quality) => quality,
-                                // Judged at stage 3, for the sources that
-                                // reach a sink.
-                                EndpointEvidence::Unknown => HopQuality::CERTAIN,
-                            })
-                            .conjoin(quality),
-                        ReachDerivation::Direct {
-                            hop: Box::new(hop),
-                            next: id,
-                        },
+                        function,
+                        path_quality.conjoin(match self.sources[source.index()].evidence {
+                            EndpointEvidence::Known(quality) => quality,
+                            // Judged at stage 3, for the sources that
+                            // reach a sink.
+                            EndpointEvidence::Unknown => HopQuality::CERTAIN,
+                        }),
+                        ReachDerivation::Direct { hops, next: id },
                     ),
                     Endpoint::Port(_) => self.add_item(
                         key.procedure.clone(),
                         key.root.clone(),
                         seed,
-                        key.function.clone(),
-                        flow_quality.conjoin(quality),
-                        Derivation::Step {
-                            hops: vec![hop],
-                            next: id,
-                        },
+                        function,
+                        path_quality,
+                        Derivation::Step { hops, next: id },
                     ),
                     Endpoint::Sink(_) | Endpoint::Location(_) => {
                         unreachable!("sinks and locations are never interior seeds")
@@ -1915,9 +1954,9 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
                 Piece::Hop(hop) => hops.push(hop.clone()),
                 Piece::Hops(run) => hops.extend(run.iter().cloned()),
                 Piece::Reach(id) => match self.reaches[id].derivations.get(chain) {
-                    ReachDerivation::Direct { hop, next } => {
+                    ReachDerivation::Direct { hops, next } => {
                         stack.push(Piece::Item(*next));
-                        stack.push(Piece::Hop(hop));
+                        stack.push(Piece::Hops(hops));
                     }
                     ReachDerivation::Through { inner, hops, next } => {
                         stack.push(Piece::Item(*next));
@@ -2058,25 +2097,30 @@ fn caller_side(
         .collect()
 }
 
-/// Place one sanitizer or transform on the call at its point. `input` and
-/// `output` are its carriers; an in-place binding (`input == output`) sits on
-/// whichever one call port its carrier is.
+/// Place an in-place matched-value transfer on every call use of its value;
+/// all other transfers stay on the call at the observation point. `input` and
+/// `output` are its carriers; an in-place binding sits on whichever one call
+/// port its carrier is.
 fn place_transfer(
     point: &ProgramPointHandle,
     input: &ValueFlowCarrier,
     output: &ValueFlowCarrier,
     hop_for: impl Fn(DurableCallSiteKey) -> Hop,
-) -> Option<(DurableCallSiteKey, Annotation)> {
+) -> Vec<(DurableCallSiteKey, Annotation)> {
     let procedure = point.procedure().durable_key();
     let value_of = |carrier: &ValueFlowCarrier| match carrier {
         ValueFlowCarrier::Value(value) => Some(value.id()),
         _ => None,
     };
     let semantics = point.procedure().semantics();
+    // The selected observation point still determines phase; every use of
+    // its matched value follows the definition, even at a different point.
+    let matched_value = input == output && matches!(input, ValueFlowCarrier::Value(_));
+    let mut placements = Vec::new();
     for call in semantics
         .call_sites()
         .iter()
-        .filter(|call| call.point == point.id())
+        .filter(|call| matched_value || call.point == point.id())
     {
         let input_port = value_of(input).and_then(|value| call_input_port(call, value));
         let output_port = value_of(output).and_then(|value| call_output_port(call, value));
@@ -2087,7 +2131,7 @@ fn place_transfer(
             _ => continue,
         };
         let key = (procedure.clone(), call.id);
-        return Some((
+        placements.push((
             key.clone(),
             Annotation {
                 input: placement.0,
@@ -2096,7 +2140,7 @@ fn place_transfer(
             },
         ));
     }
-    None
+    placements
 }
 
 fn call_input_port(call: &SemanticCallSite, value: ValueId) -> Option<PartialFlowPort> {

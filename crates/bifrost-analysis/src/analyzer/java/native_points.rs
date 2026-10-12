@@ -453,7 +453,13 @@ fn java_native_call_evidence(
             DefinitionLookupStatus::NoDefinition
                 | DefinitionLookupStatus::UnresolvableImportBoundary
                 | DefinitionLookupStatus::Incomplete
+                | DefinitionLookupStatus::Ambiguous
         )
+        || (outcome.status == DefinitionLookupStatus::Ambiguous
+            && !outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "native_external_member_inventory"))
         || (outcome.status == DefinitionLookupStatus::Incomplete
             && !outcome
                 .diagnostics
@@ -512,6 +518,42 @@ fn java_native_call_evidence(
                     })
                 }
             };
+            let external_call = external_call.or_else(|| {
+                // This canonical value comes from selected external inventory
+                // rows, not from parsing the call's source text.
+                if receiver.is_some()
+                    || !outcome
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.kind == "native_external_member_inventory")
+                {
+                    return None;
+                }
+                let (owner, selected_member) = outcome.reference.as_ref()?.text.rsplit_once('.')?;
+                if selected_member != member_name {
+                    return None;
+                }
+                java_native_external_method_proof(
+                    java,
+                    query,
+                    token,
+                    owner,
+                    selected_member,
+                    &actual_types,
+                    JavaNativeReceiverForm::BoundValue,
+                )
+                .or_else(|| {
+                    java_native_external_method_proof(
+                        java,
+                        query,
+                        token,
+                        owner,
+                        selected_member,
+                        &actual_types,
+                        JavaNativeReceiverForm::TypeQualifier,
+                    )
+                })
+            });
             if let Some((proof, owner, member, dispatch_closed)) = external_call {
                 if let Some(proof) = proof {
                     publish_java_external_call_boundary(query, outcome, &proof, &owner, &member);
@@ -524,11 +566,76 @@ fn java_native_call_evidence(
                 } else {
                     publish_java_external_member_identity(query, outcome, &owner, &member);
                 }
+            } else if let Some(receiver) = receiver.filter(|receiver| {
+                receiver.kind() == "method_invocation"
+                    && outcome.status == DefinitionLookupStatus::Incomplete
+                    && outcome.definitions.is_empty()
+                    && outcome.lexical_definition.is_none()
+            }) && java_chained_receiver_has_no_declaration(java, query, token, receiver)
+            {
+                publish_java_unmodeled_receiver_boundary(query, outcome, member_name);
             }
         }
         JavaNativeCallSite::Constructor { .. } => {}
     }
     evidence
+}
+
+fn java_chained_receiver_has_no_declaration(
+    java: &JavaAnalyzer,
+    query: BoundedReceiverQuery<'_>,
+    token: crate::analyzer::QueryToken<'_>,
+    receiver: Node<'_>,
+) -> bool {
+    use crate::analyzer::usages::get_definition::java::{
+        JavaResolutionSession, JavaSourceInvocationReturn, java_external_invocation_return_type,
+        java_source_invocation_return_declaration,
+    };
+    use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+
+    let cancellation = query.analyzer.active_query_cancellation();
+    let definitions = AnalyzerDefinitionLookup::new(query.analyzer, Language::Java);
+    let session = JavaResolutionSession::bounded(
+        &definitions,
+        ReceiverAnalysisBudget::default(),
+        cancellation.as_ref(),
+    );
+    if !matches!(
+        java_source_invocation_return_declaration(
+            query.analyzer,
+            token,
+            &session,
+            query.file,
+            query.source,
+            receiver,
+        ),
+        JavaSourceInvocationReturn::NoSourceDeclaration
+    ) {
+        return false;
+    }
+    java_external_invocation_return_type(java, token, &session, query.file, query.source, receiver)
+        .is_none()
+}
+
+fn publish_java_unmodeled_receiver_boundary(
+    query: BoundedReceiverQuery<'_>,
+    outcome: &mut DefinitionLookupOutcome,
+    member: &str,
+) {
+    let reference = outcome.reference.get_or_insert_with(|| query.site.clone());
+    reference.text = member.to_owned();
+    outcome.status = DefinitionLookupStatus::UnresolvableImportBoundary;
+    if outcome
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.kind != "java_native_unmodeled_receiver")
+    {
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "java_native_unmodeled_receiver".into(),
+            message: format!("`{member}` is called on a receiver with no resolved source type"),
+            claim: None,
+        });
+    }
 }
 
 fn java_native_source_call_evidence(
@@ -751,6 +858,21 @@ fn java_native_external_method_proof(
             ExactExternalCallProof::java_static_external_member(owner, member, parameter_count)
         }
     }
+    .with_external_member_identity(
+        query
+            .analyzer
+            .active_semantic_model_snapshot()
+            .and_then(|snapshot| {
+                resolved.inventory_identity_for_argument_types(
+                    snapshot.active_models(),
+                    bound_receiver,
+                    actual_types,
+                )
+            })
+            .or_else(|| {
+                resolved.direct_inventory_identity_for_argument_types(bound_receiver, actual_types)
+            }),
+    )
     .with_source_jdk_artifact(selected.filter(|artifact| {
         artifact.artifact_sha256.as_deref() == resolved.jdk_artifact_sha256()
             && resolved.jdk_artifact_sha256().is_some()
@@ -1122,8 +1244,9 @@ fn publish_java_external_call_boundary(
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
             kind: "java_native_external_call_boundary".into(),
             message: format!(
-                "`{}` names an external Java callable",
-                proof.canonical_callee()
+                "`{}` names an external Java callable; inventory member {:?}",
+                proof.canonical_callee(),
+                proof.external_member_identity()
             ),
             claim: Some(UnindexedClaim::external_boundary(
                 format!("{owner}.{member}"),
@@ -1168,7 +1291,18 @@ fn java_constructor_reference_namespace(
                 .and_then(java_constructor_type_terminal)
                 .is_some_and(|terminal| terminal.id() == reference.id())
         {
-            return Some(ResolutionNamespace::Constructor);
+            // An anonymous creation names its written supertype; its synthetic
+            // constructor has no source declaration to navigate to.
+            return Some(
+                if named_children(node)
+                    .into_iter()
+                    .any(|child| child.kind() == "class_body")
+                {
+                    ResolutionNamespace::Type
+                } else {
+                    ResolutionNamespace::Constructor
+                },
+            );
         }
         ancestor = node.parent();
     }

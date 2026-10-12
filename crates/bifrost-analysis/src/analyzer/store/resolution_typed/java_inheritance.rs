@@ -43,6 +43,36 @@ CROSS JOIN main.unit_signature_metadata_values AS metadata
 CROSS JOIN main.blob_meta AS meta ON meta.blob_id=units.blob_id AND meta.is_complete=1
 "#;
 
+// A synthetic Java class body (an anonymous class or an enum constant body) is
+// a generated type owner, not a source declaration: it has no source-bridge
+// row, no display metadata link and no access modifier. The producer still
+// publishes it as a definition that owns a type-body member scope, with its
+// written supertype as an ordinary hierarchy edge. Over a complete source
+// publication, a Java definition with a member scope and no source bridge is
+// exactly such a body. It is a class, never an interface, in the file's package.
+pub(in crate::analyzer::store) const SYNTHETIC_TYPE_BODIES: &str = r#"
+SELECT request.mount_ordinal, request.key0, meta.content_package
+FROM temp.selected_resolution_typed_requests_1 AS request
+CROSS JOIN temp.selected_resolution_mounts AS mount
+  ON mount.mount_ordinal=request.mount_ordinal
+CROSS JOIN main.resolution_fragment_interiors AS interior
+  ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language
+ AND interior.semantic_language=mount.semantic_language
+ AND interior.producer_epoch=mount.producer_epoch AND interior.interior_digest=mount.interior_digest
+ AND interior.publication_state='complete'
+CROSS JOIN main.resolution_semantic_sites AS semantic
+  ON semantic.blob_id=interior.blob_id AND semantic.semantic_role='definition'
+ AND semantic.semantic_key=request.key0
+CROSS JOIN main.resolution_member_scope_properties AS scope
+  ON scope.blob_id=semantic.blob_id AND scope.definition_semantic_key=semantic.semantic_key
+CROSS JOIN main.source_fact_manifests AS source
+  ON source.blob_id=semantic.blob_id AND source.publication_state='complete'
+CROSS JOIN main.blob_meta AS meta ON meta.blob_id=semantic.blob_id AND meta.is_complete=1
+WHERE NOT EXISTS (
+  SELECT 1 FROM main.source_native_declaration_bridges AS bridge
+  WHERE bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site)
+"#;
+
 pub(super) fn read(
     source: &SelectedResolutionTypedSource<'_, '_>,
     definitions: &[SemanticId],
@@ -54,6 +84,7 @@ pub(super) fn read(
     for chunk in definitions.chunks(crate::analyzer::resolution::MAX_TYPED_FACT_REQUESTS_PER_BATCH)
     {
         let mut coordinates = std::collections::BTreeMap::new();
+        let mut java_coordinates = std::collections::BTreeSet::new();
         for &definition in chunk {
             if cancellation.is_cancelled() {
                 return Ok(None);
@@ -61,11 +92,10 @@ pub(super) fn read(
             let Some(ordinal) = definition.ordinal() else {
                 continue;
             };
-            if !language_has_jvm_semantics(
-                selection
-                    .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?
-                    .semantic_language(),
-            ) {
+            let language = selection
+                .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?
+                .semantic_language();
+            if !language_has_jvm_semantics(language) {
                 continue;
             }
             let Some(provenance) =
@@ -76,10 +106,11 @@ pub(super) fn read(
             let Some(SelectedSemanticProvenance::FragmentLocal(local)) = provenance else {
                 continue;
             };
-            coordinates.insert(
-                (local.mount().ordinal(), local.local_key().get()),
-                definition,
-            );
+            let coordinate = (local.mount().ordinal(), local.local_key().get());
+            if language == Language::Java {
+                java_coordinates.insert(coordinate);
+            }
+            coordinates.insert(coordinate, definition);
         }
         if coordinates.is_empty() {
             continue;
@@ -148,6 +179,54 @@ pub(super) fn read(
                     "one Java source declaration has conflicting inheritance metadata",
                 ));
             }
+        }
+        // A Java definition with no source-declared row can be a synthetic
+        // class body. Only these remaining definitions can be one.
+        let unsourced = coordinates
+            .iter()
+            .filter(|(coordinate, definition)| {
+                java_coordinates.contains(coordinate) && !result.contains_key(definition)
+            })
+            .map(|(&coordinate, _)| coordinate)
+            .collect::<Vec<_>>();
+        if unsourced.is_empty() {
+            continue;
+        }
+        if !selection.replace_resolution_requests_1(unsourced, cancellation)? {
+            return Ok(None);
+        }
+        let synthetic = source.read_statement(cancellation, |connection| {
+            let mut statement = connection.prepare_cached(SYNTHETIC_TYPE_BODIES)?;
+            let mut rows = statement.query([])?;
+            let mut found = Vec::new();
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                let coordinate = (
+                    SelectedResolutionMountOrdinal::new(row.get(0)?),
+                    row.get::<_, i64>(1)?,
+                );
+                found.push(JavaInheritanceDeclaration {
+                    definition: coordinates[&coordinate],
+                    name: String::new(),
+                    package: row.get(2)?,
+                    kind: JavaInheritanceDeclarationKind::Type {
+                        is_interface: false,
+                        is_singleton: false,
+                    },
+                });
+            }
+            Ok(Some(found))
+        })?;
+        let Some(synthetic) = synthetic else {
+            return Ok(None);
+        };
+        for row in synthetic {
+            assert!(
+                result.insert(row.definition, row).is_none(),
+                "a synthetic Java class body has no source-declared inheritance row"
+            );
         }
     }
     Ok((!cancellation.is_cancelled()).then(|| result.into_values().collect()))

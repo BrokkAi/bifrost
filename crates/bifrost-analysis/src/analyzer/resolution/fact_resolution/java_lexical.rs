@@ -18,8 +18,6 @@ struct JavaLexicalReplay {
     rerun_key: Option<JavaLexicalRerunKey>,
     /// Whether the answer being replayed already binds a target.
     resolved: bool,
-    /// Java-only hierarchy rules do not apply to Kotlin or Scala callers.
-    java_semantics: bool,
     branches: Vec<(
         HierarchyLookupShape,
         SemanticId,
@@ -144,10 +142,6 @@ impl JavaLexicalReplay {
         if reasons.is_empty() {
             return Ok(None);
         }
-        let has_java_selection = evaluation
-            .session
-            .typed_source
-            .selection_has_java_semantics();
         let has_jvm_selection = evaluation
             .session
             .typed_source
@@ -187,12 +181,6 @@ impl JavaLexicalReplay {
         let Some(calls) = evaluation.accept_session_read(read) else {
             return Ok(None);
         };
-        let has_java_call = calls.iter().any(|call| {
-            let call = call.get(evaluation.session).row();
-            call.callee_reference() == reference
-                && (call.language() == Language::Java
-                    || (call.language() == Language::None && has_java_selection))
-        });
         let has_jvm_call = calls.iter().any(|call| {
             let call = call.get(evaluation.session).row();
             call.callee_reference() == reference
@@ -289,6 +277,7 @@ impl JavaLexicalReplay {
                 ResolutionNamespace::Type
                     | ResolutionNamespace::Value
                     | ResolutionNamespace::Callable
+                    | ResolutionNamespace::TypeOrValue
             )
         {
             return Ok(None);
@@ -369,40 +358,52 @@ impl JavaLexicalReplay {
         if lookups.len() != 1
             && (!matches!(
                 metadata.namespace(),
-                ResolutionNamespace::Value | ResolutionNamespace::Callable
-            ) || !calls.iter().any(|call| {
-                let call = call.get(evaluation.session).row();
-                call.callee_reference() == reference
-                    && matches!(call.language(), Language::Kotlin | Language::Scala)
-            }))
+                ResolutionNamespace::Value
+                    | ResolutionNamespace::Callable
+                    | ResolutionNamespace::TypeOrValue
+            ) || (!matches!(metadata.namespace(), ResolutionNamespace::TypeOrValue)
+                && !calls.iter().any(|call| {
+                    let call = call.get(evaluation.session).row();
+                    call.callee_reference() == reference
+                        && matches!(call.language(), Language::Kotlin | Language::Scala)
+                })))
         {
             return Ok(None);
         }
         let callable_overload_set = has_jvm_call;
-        let java_semantics = has_java_call || (calls.is_empty() && has_java_selection);
         if metadata.namespace() == ResolutionNamespace::Callable && !callable_overload_set {
             return Ok(None);
         }
-        let shapes = lookups
-            .into_iter()
-            .map(|lookup| {
-                let shape = HierarchyLookupShape::new(
-                    lookup,
-                    metadata.namespace(),
-                    if metadata.namespace() == ResolutionNamespace::Type {
-                        QualifierCategory::Type
-                    } else {
-                        QualifierCategory::Runtime
-                    },
-                    0,
-                );
-                if callable_overload_set {
-                    shape.with_callable_overload_set()
+        let mut shapes = Vec::with_capacity(lookups.len());
+        for lookup in lookups {
+            let namespace = if metadata.namespace() == ResolutionNamespace::TypeOrValue {
+                let Some(namespace) = evaluation
+                    .session
+                    .typed_source
+                    .lookup_namespace(lookup, evaluation.cancellation)?
+                else {
+                    return Ok(None);
+                };
+                namespace
+            } else {
+                metadata.namespace()
+            };
+            let shape = HierarchyLookupShape::new(
+                lookup,
+                namespace,
+                if namespace == ResolutionNamespace::Type {
+                    QualifierCategory::Type
                 } else {
-                    shape
-                }
-            })
-            .collect::<Vec<_>>();
+                    QualifierCategory::Runtime
+                },
+                0,
+            );
+            shapes.push(if callable_overload_set {
+                shape.with_callable_overload_set()
+            } else {
+                shape
+            });
+        }
         let mut branches = Vec::new();
         let mut enclosing_type_branches = Vec::new();
         for chunk in gaps.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
@@ -529,7 +530,6 @@ impl JavaLexicalReplay {
             seed,
             rerun_key: None,
             resolved: !answer.targets().is_empty(),
-            java_semantics,
             branches,
             cursor: 0,
             group: None,
@@ -623,28 +623,38 @@ impl JavaLexicalReplay {
                 return Ok(Ready(None));
             };
             let (shape, owner, identity, branch) = &self.branches[self.cursor];
-            // JLS 4.3.2: java.lang.Object declares methods only. A member-type
-            // lookup whose inherited walk is sealed except for the implicit
-            // unindexed Object superclass has an exhaustive negative answer at
-            // this owner, so the raw hierarchy branch is retired without a
-            // replacement. Only a resolved answer can become complete this way:
+            // A lookup whose inherited walk is sealed except for the implicit
+            // root supertype (Java's unindexed `Object` edge, or no edge at
+            // all for Kotlin's `Any` and Scala's `Any` and `AnyRef`) has an
+            // exhaustive negative answer at this owner when the root declares
+            // no member of that name (`language_implicit_root_member_names`).
+            // The raw hierarchy branch is then retired without a replacement.
+            // A lookup that finds no owner is absent from the indexed
+            // ancestry. Only a resolved answer can become complete this way:
             // a lookup nothing answers still reaches the compilation unit's
             // placement boundary, so it keeps this reason conservatively and
-            // is not re-evaluated.
-            if self.java_semantics
-                && self.resolved
-                && (selected.owners.is_empty() || shape.namespace == ResolutionNamespace::Value)
-            {
-                let Some(object_gaps) =
-                    evaluation.java_hierarchy_implicit_object_gap_references(*owner)?
+            // is not re-evaluated. A selected declaration in any namespace
+            // must keep its hierarchy branch until the member bridges below
+            // are added; otherwise an inherited field can lose to an enclosing
+            // class's declaration (JLS 6.4.1).
+            if self.resolved && selected.owners.is_empty() {
+                let Some(root_gaps) =
+                    evaluation.jvm_hierarchy_implicit_root_gap_references(*owner)?
                 else {
                     return Ok(Ready(None));
                 };
-                if object_gaps.is_some() {
-                    self.removals.push(*identity);
-                    self.group = None;
-                    self.cursor += 1;
-                    return Ok(Continue);
+                if root_gaps.is_some() {
+                    let Some(outside_root) = evaluation
+                        .lookup_is_outside_implicit_root(identity.fragment(), shape.lookup)?
+                    else {
+                        return Ok(Ready(None));
+                    };
+                    if outside_root {
+                        self.removals.push(*identity);
+                        self.group = None;
+                        self.cursor += 1;
+                        return Ok(Continue);
+                    }
                 }
             }
             let (paths, remove_branch) =
@@ -1104,18 +1114,37 @@ impl FactEvaluation<'_, '_> {
         Ok((additions, remove_branch))
     }
 
+    /// Whether the lookup `lookup`, filed in `fragment`, spells no member of
+    /// its language's implicit root supertype. `None` reports cancellation.
+    fn lookup_is_outside_implicit_root(
+        &mut self,
+        fragment: BindingFragmentId,
+        lookup: SemanticId,
+    ) -> StoreResult<Option<bool>> {
+        let Some(outside) = self
+            .session
+            .typed_source
+            .lookups_outside_implicit_root(&[(fragment, lookup)], self.cancellation)?
+        else {
+            self.cancellation_observed = true;
+            return Ok(None);
+        };
+        Ok(Some(outside.contains(&lookup)))
+    }
+
     /// Whether every supertype edge reachable from `owner` is resolved, apart
-    /// from implicit `java.lang.Object` superclass edges whose absolute route
-    /// is unindexed. `None` reports cancellation. An owner without a sealed
+    /// from implicit superclass edges (Java's `java.lang.Object`) whose
+    /// absolute route is unindexed. The references of those implicit edges
+    /// are returned. `None` reports cancellation. An owner without a sealed
     /// edge node, an ambiguous edge, or an unresolved authored supertype makes
-    /// this `false`.
-    pub(super) fn java_hierarchy_implicit_object_gap_references(
+    /// this `Some(None)`.
+    pub(super) fn jvm_hierarchy_implicit_root_gap_references(
         &mut self,
         owner: SemanticId,
     ) -> StoreResult<Option<Option<BTreeSet<SemanticId>>>> {
         let mut pending = vec![owner];
         let mut visited = HashSet::default();
-        let mut implicit_object_references = BTreeSet::new();
+        let mut implicit_root_references = BTreeSet::new();
         while let Some(current) = pending.pop() {
             if self.poll_cancelled() {
                 return Ok(None);
@@ -1160,8 +1189,8 @@ impl FactEvaluation<'_, '_> {
             {
                 return Ok(Some(None));
             }
-            implicit_object_references.extend(unresolved);
+            implicit_root_references.extend(unresolved);
         }
-        Ok(Some(Some(implicit_object_references)))
+        Ok(Some(Some(implicit_root_references)))
     }
 }

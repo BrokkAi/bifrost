@@ -39,7 +39,10 @@ use crate::hash::{HashMap, HashSet};
 
 use super::batch::FactReferenceSiteMetadata;
 use super::engine::PreloadedFragment;
-use super::fact_source::language_explicit_imports_outrank_package_binders;
+use super::fact_source::{
+    language_callables_occupy_value_namespace, language_explicit_imports_outrank_package_binders,
+    language_implicit_root_member_names,
+};
 use super::local_identity::{
     ResolutionIdentityCatalogBuilder, ResolutionLookupSemanticRecipe, ResolutionNodeIdentity,
     ResolutionPathIdentity, ResolutionSemanticIdentity, ResolutionStackVariableIdentity,
@@ -928,6 +931,7 @@ impl LoweredResolutionFragment {
 enum SupportedActivation {
     ScopeWide,
     SourceOrder(usize),
+    DeclaredHead { start: usize, end: usize },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -945,6 +949,10 @@ struct ScopeTimeline {
     fact: ResolutionScopeFact,
     head: BindingNodeId,
     checkpoints: Vec<ActivationCheckpoint>,
+    // An end checkpoint rebuilds the preceding chain without expired routes.
+    // Each insertion is replayed at these snapshot nodes, retaining its own
+    // source-position choice and therefore its original precedence.
+    snapshots: HashMap<usize, Vec<ActivationCheckpoint>>,
 }
 
 impl ScopeTimeline {
@@ -988,6 +996,7 @@ fn lower_scope_timelines_and_paths(
     language: Language,
     index: &FactIndex<'_>,
     activation_positions: &HashMap<ResolutionScopeId, Vec<usize>>,
+    activation_ends: &HashMap<ResolutionScopeId, HashSet<usize>>,
 ) -> LoweredScopeTimelines {
     let mut timelines = HashMap::default();
     let mut nodes = Vec::new();
@@ -1013,6 +1022,7 @@ fn lower_scope_timelines_and_paths(
                         fact: scope,
                         head,
                         checkpoints,
+                        snapshots: HashMap::default(),
                     },
                 )
                 .is_none()
@@ -1020,9 +1030,64 @@ fn lower_scope_timelines_and_paths(
     }
 
     let mut paths = Vec::new();
-    for timeline in timelines.values() {
+    for timeline in timelines.values_mut() {
         let mut previous = timeline.head;
         for checkpoint in &timeline.checkpoints {
+            if activation_ends
+                .get(&timeline.fact.id)
+                .is_some_and(|ends| ends.contains(&checkpoint.position))
+            {
+                previous = timeline.head;
+                for insertion in &timeline.checkpoints {
+                    if insertion.position >= checkpoint.position {
+                        break;
+                    }
+                    let digest = local_digest(
+                        b"bifrost-resolution-activation-snapshot:v1",
+                        &[
+                            ("scope", &u32_bytes(timeline.fact.id.get())),
+                            ("insertion", &usize_bytes(insertion.position)),
+                            ("snapshot", &usize_bytes(checkpoint.position)),
+                        ],
+                    );
+                    let node = identities.node(ResolutionNodeIdentity::new(digest));
+                    nodes.push((node, BindingNodeKind::Scope));
+                    timeline
+                        .snapshots
+                        .entry(insertion.position)
+                        .or_default()
+                        .push(ActivationCheckpoint {
+                            position: checkpoint.position,
+                            node,
+                        });
+                    let id = identities.path(ResolutionPathIdentity::new(digest));
+                    let variable = passthrough_variable(identities, id);
+                    paths.push((
+                        id,
+                        PartialPath::new(
+                            open_endpoint(node, variable),
+                            open_endpoint(previous, variable),
+                            if language == Language::Go {
+                                go_spelling_precedence(
+                                    identities,
+                                    timeline.fact.id,
+                                    Some(insertion.position),
+                                    1,
+                                )
+                            } else {
+                                checkpoint_fallback_precedence(
+                                    identities,
+                                    timeline.fact.id,
+                                    insertion.position,
+                                )
+                            },
+                            [WitnessStep::Node(previous)],
+                            ResolutionCompletion::Complete,
+                        ),
+                    ));
+                    previous = node;
+                }
+            }
             let id = identities.path(timeline_path_identity(
                 timeline.fact.id,
                 checkpoint.position,
@@ -1053,7 +1118,8 @@ fn lower_scope_timelines_and_paths(
             ));
             previous = checkpoint.node;
         }
-
+    }
+    for timeline in timelines.values() {
         // A scope the producer marked as a lookup root keeps its parent link,
         // which placement and containment still read, but contributes no
         // outward lexical path: a name this scope does not declare is not
@@ -1408,7 +1474,7 @@ pub(super) fn lower_file_resolution_facts_with_identities(
     #[cfg(any(test, feature = "test-support"))]
     let mut hierarchy_terminals = Vec::new();
     assert_ne!(language, Language::None, "resolution facts need a language");
-    let index = FactIndex::new(facts);
+    let index = FactIndex::new(language, facts);
     let call_callees = facts
         .calls
         .iter()
@@ -1464,6 +1530,7 @@ pub(super) fn lower_file_resolution_facts_with_identities(
     }
     let mut supported_binders = Vec::new();
     let mut activation_positions: HashMap<ResolutionScopeId, Vec<usize>> = HashMap::default();
+    let mut activation_ends: HashMap<ResolutionScopeId, HashSet<usize>> = HashMap::default();
     let mut declarations_with_binders = HashSet::default();
     for binder in &facts.binders {
         let scope = index.scope(binder.scope);
@@ -1497,6 +1564,26 @@ pub(super) fn lower_file_resolution_facts_with_identities(
                     .or_default()
                     .push(binder.activation_start);
                 Some(SupportedActivation::SourceOrder(binder.activation_start))
+            }
+            HoistingClass::DeclaredHead => {
+                activation_positions
+                    .entry(binder.scope)
+                    .or_default()
+                    .push(binder.activation_start);
+                if binder.activation_end < scope.end_byte {
+                    activation_positions
+                        .entry(binder.scope)
+                        .or_default()
+                        .push(binder.activation_end);
+                    activation_ends
+                        .entry(binder.scope)
+                        .or_default()
+                        .insert(binder.activation_end);
+                }
+                Some(SupportedActivation::DeclaredHead {
+                    start: binder.activation_start,
+                    end: binder.activation_end,
+                })
             }
             _ => None,
         };
@@ -1604,7 +1691,13 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         timelines,
         mut nodes,
         mut paths,
-    } = lower_scope_timelines_and_paths(identities, language, &index, &activation_positions);
+    } = lower_scope_timelines_and_paths(
+        identities,
+        language,
+        &index,
+        &activation_positions,
+        &activation_ends,
+    );
 
     let go_package_qualifiers = if language == Language::Go {
         facts
@@ -1922,7 +2015,10 @@ pub(super) fn lower_file_resolution_facts_with_identities(
             .expect("validated binder scope has a timeline");
         let checkpoint = match binder.activation {
             SupportedActivation::ScopeWide => timeline.head,
-            SupportedActivation::SourceOrder(position) => {
+            SupportedActivation::SourceOrder(position)
+            | SupportedActivation::DeclaredHead {
+                start: position, ..
+            } => {
                 let checkpoint = timeline.checkpoint_at(position);
                 checkpoint.node
             }
@@ -1931,21 +2027,41 @@ pub(super) fn lower_file_resolution_facts_with_identities(
             .get(&(binder.fact.declaration, LoweredSemanticRole::Definition))
             .copied()
             .expect("binder declaration has a definition semantic");
+        let mut gap_endpoints = vec![checkpoint];
+        let activation_start = match binder.activation {
+            SupportedActivation::ScopeWide => None,
+            SupportedActivation::SourceOrder(start)
+            | SupportedActivation::DeclaredHead { start, .. } => Some(start),
+        };
+        if let Some(start) = activation_start {
+            gap_endpoints.extend(timeline.snapshots.get(&start).into_iter().flatten().filter(|snapshot| {
+                !matches!(binder.activation, SupportedActivation::DeclaredHead { end, .. } if snapshot.position >= end)
+            }).map(|snapshot| snapshot.node));
+        }
         assert!(
             forward_gap_endpoints
-                .insert(binder.fact.declaration, checkpoint)
+                .insert(binder.fact.declaration, gap_endpoints)
                 .is_none(),
             "one supported binder route per declaration is required"
         );
         let primary_namespace = effective_declaration_namespace(binder.identifier.namespace);
-        let namespaces = std::iter::once(primary_namespace).chain(
-            index
-                .additional_definition_namespaces(binder.fact.declaration)
-                .iter()
-                .map(|fact| fact.namespace)
-                .filter(|namespace| *namespace != primary_namespace),
-        );
+        let value_alias = index
+            .value_aliased_callables
+            .contains(&binder.fact.declaration);
+        let namespaces = std::iter::once(primary_namespace)
+            .chain(
+                index
+                    .additional_definition_namespaces(binder.fact.declaration)
+                    .iter()
+                    .map(|fact| fact.namespace)
+                    .filter(|namespace| *namespace != primary_namespace),
+            )
+            .chain(value_alias.then_some(ResolutionNamespace::Value));
         for namespace in namespaces {
+            if matches!(binder.activation, SupportedActivation::DeclaredHead { start, end } if start == end)
+            {
+                continue;
+            }
             let lookup =
                 identities.lookup_semantic(language, namespace, index.name(binder.identifier.name));
             let identity = if namespace == primary_namespace {
@@ -1965,12 +2081,24 @@ pub(super) fn lower_file_resolution_facts_with_identities(
                             timeline.fact.id,
                             match binder.activation {
                                 SupportedActivation::ScopeWide => None,
-                                SupportedActivation::SourceOrder(position) => Some(position),
+                                SupportedActivation::SourceOrder(position)
+                                | SupportedActivation::DeclaredHead {
+                                    start: position, ..
+                                } => Some(position),
                             },
                             if binder.superseded { 2 } else { 0 },
                         )
                     } else {
-                        binder_precedence(identities, language, timeline, &binder)
+                        // The Value alias of a callable ranks in the Value
+                        // namespace, so a val of the same scope outranks it.
+                        // Every other path keeps the declaration's own.
+                        let choice_namespace =
+                            if value_alias && namespace == ResolutionNamespace::Value {
+                                ResolutionNamespace::Value
+                            } else {
+                                primary_namespace
+                            };
+                        binder_precedence(identities, language, timeline, &binder, choice_namespace)
                     },
                     [WitnessStep::Node(definition_node)],
                     completion_for_site(
@@ -1980,6 +2108,44 @@ pub(super) fn lower_file_resolution_facts_with_identities(
                     ),
                 ),
             ));
+            let activation_start = match binder.activation {
+                SupportedActivation::ScopeWide => continue,
+                SupportedActivation::SourceOrder(start)
+                | SupportedActivation::DeclaredHead { start, .. } => start,
+            };
+            for snapshot in timeline
+                .snapshots
+                .get(&activation_start)
+                .into_iter()
+                .flatten()
+            {
+                if matches!(binder.activation, SupportedActivation::DeclaredHead { end, .. } if snapshot.position >= end)
+                {
+                    continue;
+                }
+                let precedence = paths
+                    .last()
+                    .expect("binder path just published")
+                    .1
+                    .precedence()
+                    .to_vec();
+                let replay_id =
+                    identities.path(activation_replay_path_identity(identity, snapshot.position));
+                paths.push((
+                    replay_id,
+                    PartialPath::new(
+                        closed_endpoint(snapshot.node, [lookup]),
+                        closed_endpoint(definition_node, []),
+                        precedence,
+                        [WitnessStep::Node(definition_node)],
+                        completion_for_site(
+                            &reasons_by_site,
+                            binder.fact.declaration,
+                            lexical_declaration_gap,
+                        ),
+                    ),
+                ));
+            }
         }
     }
 
@@ -2010,7 +2176,7 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         let id = identities.path(missing_binder_path_identity(semantic.site));
         assert!(
             forward_gap_endpoints
-                .insert(semantic.site, timeline.head)
+                .insert(semantic.site, vec![timeline.head])
                 .is_none(),
             "a withheld binder cannot also have a supported route"
         );
@@ -2137,7 +2303,7 @@ pub(super) fn lower_file_resolution_facts_with_identities(
                 // of its method names can reach this unindexed edge, so the
                 // branch is closed on exactly those lookups; member-type,
                 // field and constructor lookups never meet it.
-                for name in JAVA_OBJECT_METHOD_NAMES {
+                for &name in language_implicit_root_member_names(Language::Java) {
                     let lookup =
                         identities.lookup_semantic(language, ResolutionNamespace::Callable, name);
                     let id = identities.path(implicit_object_hierarchy_path_identity(
@@ -2327,13 +2493,47 @@ fn lower_root_import_paths(
                 id,
                 PartialPath::new(
                     symbol_open_endpoint(start, [lookup], tail),
-                    symbol_open_endpoint(BindingNodeId::universal_root(), root_symbols, tail),
+                    symbol_open_endpoint(
+                        BindingNodeId::universal_root(),
+                        root_symbols.clone(),
+                        tail,
+                    ),
                     root_import_precedence(identities, language, import, choice, demand.namespace),
                     witness.clone(),
                     ResolutionCompletion::Complete,
                 )
                 .with_root_import_activation(activation),
             ));
+            if let Some(position) = import.fact.position {
+                let timeline = &timelines[&import.fact.root_scope];
+                for snapshot in timeline.snapshots.get(&position).into_iter().flatten() {
+                    let replay_id = identities.path(activation_replay_path_identity(
+                        root_import_path_identity(import.fact.site, demand.namespace, route_name),
+                        snapshot.position,
+                    ));
+                    let tail = passthrough_variable(identities, replay_id);
+                    paths.push((
+                        replay_id,
+                        PartialPath::new(
+                            symbol_open_endpoint(snapshot.node, [lookup], tail),
+                            symbol_open_endpoint(
+                                BindingNodeId::universal_root(),
+                                root_symbols.clone(),
+                                tail,
+                            ),
+                            root_import_precedence(
+                                identities,
+                                language,
+                                import,
+                                choice,
+                                demand.namespace,
+                            ),
+                            witness.clone(),
+                            ResolutionCompletion::Complete,
+                        ),
+                    ));
+                }
+            }
         }
     }
 }
@@ -2687,6 +2887,9 @@ struct FactIndex<'facts> {
     identifiers_by_site: HashMap<ResolutionSiteId, Vec<&'facts PositionedIdentifierFact>>,
     additional_definition_namespaces_by_declaration:
         HashMap<ResolutionSiteId, Vec<ResolutionAdditionalDefinitionNamespaceFact>>,
+    /// Callable declarations that a Value lookup also reaches
+    /// (`language_callables_occupy_value_namespace`).
+    value_aliased_callables: HashSet<ResolutionSiteId>,
     reference_owner_by_reference: HashMap<ResolutionSiteId, Option<ResolutionSiteId>>,
     callable_receiver_origin_by_reference:
         HashMap<ResolutionSiteId, ResolutionCallableReceiverOrigin>,
@@ -3171,7 +3374,7 @@ impl<'facts> FactIndex<'facts> {
         root_references
     }
 
-    fn new(facts: &'facts FileResolutionFacts) -> Self {
+    fn new(language: Language, facts: &'facts FileResolutionFacts) -> Self {
         let mut names = HashMap::default();
         for name in &facts.names {
             assert!(
@@ -3261,15 +3464,26 @@ impl<'facts> FactIndex<'facts> {
                     ResolutionNamespace::Type,
                 ),
             };
+            // A type declaration occupies the Type namespace, or the Value
+            // namespace when the producer declares it as a term that owns a
+            // member scope (a Scala `object`).
+            let declared_term_type = |site: ResolutionSiteId, namespace: ResolutionNamespace| {
+                namespace == ResolutionNamespace::Value
+                    && facts.additional_definition_namespaces.iter().any(|fact| {
+                        fact.declaration == site && fact.namespace == ResolutionNamespace::Value
+                    })
+            };
             assert!(
                 declaration.role == ResolutionIdentifierRole::Declaration
                     && sites[&member.member].kind == member_kind
-                    && declaration.namespace == member_namespace,
+                    && (declaration.namespace == member_namespace
+                        || (member.kind == ResolutionMemberKind::NestedType
+                            && declared_term_type(member.member, declaration.namespace))),
                 "member-owner member shape is invalid: {member:?}, declaration={declaration:?}"
             );
             assert!(
                 owner.role == ResolutionIdentifierRole::Declaration
-                    && matches!(
+                    && (matches!(
                         (sites[&member.owner].kind, owner.namespace),
                         (
                             ResolutionSiteKind::TypeDeclaration,
@@ -3278,7 +3492,8 @@ impl<'facts> FactIndex<'facts> {
                             ResolutionSiteKind::ConstructorDeclaration,
                             ResolutionNamespace::Constructor
                         )
-                    ),
+                    ) || (sites[&member.owner].kind == ResolutionSiteKind::TypeDeclaration
+                        && declared_term_type(member.owner, owner.namespace))),
                 "member-owner type shape is invalid: {member:?}, owner={owner:?}"
             );
             if member.kind == ResolutionMemberKind::Field {
@@ -3436,6 +3651,30 @@ impl<'facts> FactIndex<'facts> {
                     .all(|pair| pair[0].namespace != pair[1].namespace),
                 "definition namespace authorities must be unique per namespace: {facts:?}"
             );
+        }
+        // A producer that already files a callable under Value keeps its own
+        // fact; every other callable of a term-namespace language is aliased.
+        let mut value_aliased_callables = HashSet::default();
+        if language_callables_occupy_value_namespace(language) {
+            for binder in &facts.binders {
+                let identifier = identifiers_by_site
+                    .get(&binder.declaration)
+                    .and_then(|identifiers| identifiers.first())
+                    .unwrap_or_else(|| {
+                        panic!("binder names declaration without an identifier: {binder:?}")
+                    });
+                if identifier.namespace == ResolutionNamespace::Callable
+                    && !additional_definition_namespaces_by_declaration
+                        .get(&binder.declaration)
+                        .is_some_and(|namespaces| {
+                            namespaces
+                                .iter()
+                                .any(|fact| fact.namespace == ResolutionNamespace::Value)
+                        })
+                {
+                    value_aliased_callables.insert(binder.declaration);
+                }
+            }
         }
         let mut type_slots_by_site: HashMap<_, Vec<_>> = HashMap::default();
         let mut type_slot_ids = HashSet::default();
@@ -3668,6 +3907,7 @@ impl<'facts> FactIndex<'facts> {
             sites,
             identifiers_by_site,
             additional_definition_namespaces_by_declaration,
+            value_aliased_callables,
             reference_owner_by_reference,
             callable_receiver_origin_by_reference,
             argument_independent_references: Self::index_argument_independent_references(facts),
@@ -4160,15 +4400,20 @@ fn binder_precedence(
     language: Language,
     timeline: &ScopeTimeline,
     binder: &SupportedBinder<'_>,
+    namespace: ResolutionNamespace,
 ) -> Vec<PrecedenceStep> {
-    let namespace = effective_declaration_namespace(binder.identifier.namespace);
     let direct_choice = match binder.activation {
         SupportedActivation::ScopeWide => {
             identities.semantic(scope_choice_identity(timeline.fact.id, namespace))
         }
-        SupportedActivation::SourceOrder(position) => identities.semantic(
-            checkpoint_choice_identity(timeline.fact.id, position, namespace),
-        ),
+        SupportedActivation::SourceOrder(position)
+        | SupportedActivation::DeclaredHead {
+            start: position, ..
+        } => identities.semantic(checkpoint_choice_identity(
+            timeline.fact.id,
+            position,
+            namespace,
+        )),
     };
     if binder.superseded {
         // One rank below the outward continuation, which every scope timeline
@@ -4317,6 +4562,36 @@ fn placement_scope(index: &FactIndex<'_>, source: GapSource) -> ResolutionScopeF
     scope_fact
 }
 
+/// The namespaces in which a package of `language` holds members, for the
+/// languages whose producers publish source-owned package lookups. A reference
+/// in another namespace never consults the package inventory, so the unknown
+/// placement of the file cannot hide a package member from it. An empty list
+/// means the language publishes no package lookups, so they cannot cover its
+/// placement.
+const fn package_member_namespaces(language: Language) -> &'static [ResolutionNamespace] {
+    match language {
+        Language::Kotlin | Language::Scala => &[
+            ResolutionNamespace::Type,
+            ResolutionNamespace::Value,
+            ResolutionNamespace::Callable,
+            ResolutionNamespace::TypeOrValue,
+        ],
+        // A Java package holds only types: fields and methods belong to a
+        // class, and a static import names a class member.
+        Language::Java => &[ResolutionNamespace::Type, ResolutionNamespace::TypeOrValue],
+        Language::Go
+        | Language::Rust
+        | Language::Cpp
+        | Language::JavaScript
+        | Language::TypeScript
+        | Language::Python
+        | Language::Php
+        | Language::CSharp
+        | Language::Ruby
+        | Language::None => &[],
+    }
+}
+
 fn package_lookups_cover_placement(
     language: Language,
     facts: &FileResolutionFacts,
@@ -4324,7 +4599,8 @@ fn package_lookups_cover_placement(
     placement_site: ResolutionSiteId,
     root_scope: ResolutionScopeId,
 ) -> bool {
-    if !matches!(language, Language::Kotlin | Language::Scala)
+    let package_namespaces = package_member_namespaces(language);
+    if package_namespaces.is_empty()
         || !facts.packages.iter().any(|package| {
             package.placement_gap_site == placement_site && package.root_scope == root_scope
         })
@@ -4343,9 +4619,9 @@ fn package_lookups_cover_placement(
         .map(|reference| reference.reference)
         .collect::<HashSet<_>>();
     let imported_names = facts
-        .import_selectors
+        .import_routes
         .iter()
-        .filter_map(|selector| selector.local_name)
+        .filter_map(|route| route.bound_name)
         .collect::<HashSet<_>>();
     for identifier in &facts.identifiers {
         if identifier.role != ResolutionIdentifierRole::Reference {
@@ -4376,7 +4652,9 @@ fn package_lookups_cover_placement(
         ) {
             return false;
         }
-        if rooted_references.contains(&identifier.site) || imported_names.contains(&identifier.name)
+        if !package_namespaces.contains(&identifier.namespace)
+            || rooted_references.contains(&identifier.site)
+            || imported_names.contains(&identifier.name)
         {
             continue;
         }
@@ -4515,7 +4793,7 @@ fn lower_coverage_gaps(
     sources: GapCoverageSources<'_>,
     index: &FactIndex<'_>,
     semantics: &HashMap<(ResolutionSiteId, LoweredSemanticRole), (SemanticId, BindingNodeId)>,
-    forward_gap_endpoints: &HashMap<ResolutionSiteId, BindingNodeId>,
+    forward_gap_endpoints: &HashMap<ResolutionSiteId, Vec<BindingNodeId>>,
 ) -> Vec<LoweredCoverageGap> {
     let mut output = Vec::new();
     let mut definitions_by_scope: HashMap<ResolutionScopeId, Vec<BindingNodeId>> =
@@ -4777,14 +5055,16 @@ fn lower_coverage_gaps(
                     effective_declaration_namespace(identifier.namespace),
                     index.name(identifier.name),
                 );
-                let forward_endpoint = *forward_gap_endpoints
+                let forward_endpoints = forward_gap_endpoints
                     .get(&source.site)
                     .expect("lexical definition gap has a supported or withheld binder frontier");
-                frontiers.push(LoweringCoverageFrontier::Candidate {
-                    direction: LoweredCandidateDirection::Forward,
-                    endpoint: forward_endpoint,
-                    lookup: Some(lookup),
-                });
+                for &endpoint in forward_endpoints {
+                    frontiers.push(LoweringCoverageFrontier::Candidate {
+                        direction: LoweredCandidateDirection::Forward,
+                        endpoint,
+                        lookup: Some(lookup),
+                    });
+                }
             }
             frontiers.push(LoweringCoverageFrontier::Candidate {
                 direction: LoweredCandidateDirection::Reverse,
@@ -5423,6 +5703,19 @@ pub(super) fn binder_path_id(
     identities.path(binder_path_identity(site))
 }
 
+fn activation_replay_path_identity(
+    identity: ResolutionPathIdentity,
+    position: usize,
+) -> ResolutionPathIdentity {
+    ResolutionPathIdentity::new(local_digest(
+        b"bifrost-resolution-activation-replay-path:v1",
+        &[
+            ("path", &identity.digest()),
+            ("snapshot", &usize_bytes(position)),
+        ],
+    ))
+}
+
 fn binder_path_identity(site: ResolutionSiteId) -> ResolutionPathIdentity {
     ResolutionPathIdentity::new(local_digest(
         b"bifrost-resolution-binder-path-local:v2",
@@ -5806,20 +6099,6 @@ fn hierarchy_gap_path_id(
     identities.path(hierarchy_gap_path_identity(site, owner))
 }
 
-/// The methods `java.lang.Object` declares (JLS 4.3.2). `wait` has three
-/// overloads under one name.
-const JAVA_OBJECT_METHOD_NAMES: [&str; 9] = [
-    "getClass",
-    "hashCode",
-    "equals",
-    "clone",
-    "toString",
-    "notify",
-    "notifyAll",
-    "wait",
-    "finalize",
-];
-
 fn implicit_object_hierarchy_path_identity(
     site: ResolutionSiteId,
     owner: ResolutionSiteId,
@@ -6183,7 +6462,7 @@ mod tests {
     #[test]
     fn kotlin_named_and_star_imports_have_their_language_precedence_tiers() {
         let facts = root_route_facts();
-        let star = FactIndex::new(&facts)
+        let star = FactIndex::new(Language::Kotlin, &facts)
             .root_imports
             .into_iter()
             .next()
@@ -9854,7 +10133,93 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_activation_of_one_name_does_not_taint_an_unrelated_lookup() {
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2771: SB census binder expiration must preserve other active declarations"
+    )]
+    fn bounded_declared_head_preserves_surviving_source_order_and_other_binders() {
+        let mut facts = FileResolutionFacts {
+            names: vec![
+                ResolutionNameFact {
+                    id: ResolutionNameId::new(0),
+                    spelling: "x".into(),
+                },
+                ResolutionNameFact {
+                    id: ResolutionNameId::new(1),
+                    spelling: "y".into(),
+                },
+            ],
+            scopes: vec![scope(0, None, 0, 100)],
+            ..FileResolutionFacts::default()
+        };
+        for (id, name, position, hoisting, start, end) in [
+            (0, 0, 1, HoistingClass::ScopeWide, 0, 100),
+            (1, 1, 2, HoistingClass::ScopeWide, 0, 100),
+            (2, 0, 3, HoistingClass::DeclaredHead, 10, 30),
+            (3, 1, 4, HoistingClass::DeclaredHead, 15, 40),
+            (4, 0, 5, HoistingClass::SourceOrder, 20, 100),
+        ] {
+            facts
+                .sites
+                .push(site(id, 0, ResolutionSiteKind::ValueDeclaration, position));
+            facts.identifiers.push(identifier(
+                id,
+                name,
+                ResolutionIdentifierRole::Declaration,
+                ResolutionNamespace::Value,
+            ));
+            facts.binders.push(binder(
+                id,
+                0,
+                ResolutionBinderKind::Local,
+                hoisting,
+                start,
+                end,
+            ));
+        }
+        let cases = [
+            (5, 0, 11, 2),
+            (6, 0, 25, 4),
+            (7, 0, 35, 4),
+            (8, 1, 35, 3),
+            (9, 1, 45, 1),
+        ];
+        for (id, name, position, _) in cases {
+            facts
+                .sites
+                .push(site(id, 0, ResolutionSiteKind::ValueReference, position));
+            facts.identifiers.push(identifier(
+                id,
+                name,
+                ResolutionIdentifierRole::Reference,
+                ResolutionNamespace::Value,
+            ));
+        }
+        let lowered =
+            crate::analyzer::resolution::lower_lexical_for_test(fragment(), Language::Java, &facts)
+                .0;
+        assert!(lowered.gaps().is_empty());
+        let source =
+            super::super::engine::PreloadedFragmentSource::from_lowered_fragments(
+                [lowered.clone()],
+            );
+        let engine = BatchResolutionEngine::new(&source);
+        for (id, _, position, target) in cases {
+            let reference = semantic(&lowered, id, LoweredSemanticRole::Reference);
+            let definition = semantic(&lowered, target, LoweredSemanticRole::Definition);
+            let answer = engine
+                .resolve_reference(ResolutionQuery::new(reference), &CancellationToken::new())
+                .unwrap();
+            assert_eq!(answer.targets(), &[definition], "position {position}");
+            assert_eq!(
+                answer.completion(),
+                &ResolutionCompletion::Complete,
+                "position {position}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_source_order_end_does_not_taint_an_unrelated_lookup() {
         let facts = FileResolutionFacts {
             names: vec![
                 ResolutionNameFact {
@@ -9897,9 +10262,9 @@ mod tests {
                     0,
                     0,
                     ResolutionBinderKind::Pattern,
-                    HoistingClass::DeclaredHead,
+                    HoistingClass::SourceOrder,
                     0,
-                    100,
+                    50,
                 ),
                 binder(
                     1,
@@ -9928,7 +10293,7 @@ mod tests {
                     endpoint,
                     lookup: Some(lookup),
                 } if gap.origin()
-                    == LoweringGapOrigin::UnsupportedActivation(HoistingClass::DeclaredHead) =>
+                    == LoweringGapOrigin::UnsupportedActivation(HoistingClass::SourceOrder) =>
                 {
                     Some((endpoint, lookup))
                 }

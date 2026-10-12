@@ -29,8 +29,9 @@ use tree_sitter::Node;
 use super::{JavascriptSupport, TypescriptSupport, is_typescript_declaration_path};
 use crate::analyzer::js_ts::providers::resolve_js_ts_source;
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner_with_nodes;
-use crate::analyzer::semantic::type_flow::file_for_locator;
-use crate::analyzer::semantic::type_flow::node_at_span;
+use crate::analyzer::semantic::type_flow::{
+    ExternalClassCache, external_class_identity, file_for_locator, node_at_span,
+};
 use crate::analyzer::semantic::{
     AdapterSemanticsVersion, AllocationKind, AllocationSite, ClassHierarchy, ClassIdentity,
     ClassSeed, ExternalMemberDeclaration, MemberAccessKind, MemberAccessQuery, MemberDeclaration,
@@ -124,13 +125,38 @@ fn js_ts_external_symbol(symbol: &SemanticModelSymbol) -> bool {
 }
 
 fn external_type_from_symbols<'a>(
+    overlay: Option<&SemanticModelOverlay>,
     symbols: impl Iterator<Item = &'a SemanticModelSymbol>,
 ) -> Option<ExternalType> {
-    let mut symbols = symbols.filter(|symbol| js_ts_external_symbol(symbol));
-    let symbol = symbols.next()?;
-    if symbols.next().is_some() {
-        return None;
+    let symbols = symbols
+        .filter(|symbol| js_ts_external_symbol(symbol))
+        .collect::<Vec<_>>();
+    let symbol = *symbols.first()?;
+    if symbol.kind == SemanticModelSymbolKind::Class {
+        if symbols.iter().any(|candidate| {
+            candidate.kind != SemanticModelSymbolKind::Class
+                || candidate.qualified_name != symbol.qualified_name
+        }) {
+            return None;
+        }
+        let language = if symbol.language == Language::JavaScript.config_label() {
+            Language::JavaScript
+        } else {
+            Language::TypeScript
+        };
+        let identity = external_class_identity(
+            overlay,
+            language,
+            &symbol.qualified_name,
+            None,
+            &mut ExternalClassCache::default(),
+        )?;
+        return Some(ExternalType::Class(identity));
     }
+    let [symbol] = symbols.as_slice() else {
+        return None;
+    };
+    let symbol = *symbol;
     let identity = ClassIdentity::External {
         qualified_name: symbol.qualified_name.clone().into_boxed_str(),
         symbol_id: symbol.id.clone().into_boxed_str(),
@@ -147,7 +173,7 @@ fn external_type_from_symbols<'a>(
 /// the pack's canonical qualified name.
 fn external_type(overlay: Option<&SemanticModelOverlay>, name: &str) -> Option<ExternalType> {
     let matched = overlay?.symbols_named(name);
-    external_type_from_symbols(matched.records.into_iter())
+    external_type_from_symbols(overlay, matched.records.into_iter())
 }
 
 /// Resolve an intrinsic runtime type such as String or Object. Exact literal
@@ -158,6 +184,7 @@ fn external_intrinsic_type(
 ) -> Option<ExternalType> {
     let matched = overlay?.symbols_named(name);
     external_type_from_symbols(
+        overlay,
         matched
             .records
             .into_iter()
@@ -2465,13 +2492,13 @@ impl_js_ts_type_flow_adapter!(
     JavascriptSupport,
     Language::JavaScript,
     "javascript-type-flow",
-    b"javascript-type-flow-closed-surface-v6"
+    b"javascript-type-flow-closed-surface-same-name-class-records-v7"
 );
 impl_js_ts_type_flow_adapter!(
     TypescriptSupport,
     Language::TypeScript,
     "typescript-type-flow",
-    b"typescript-type-flow-closed-surface-v6"
+    b"typescript-type-flow-closed-surface-same-name-class-records-v7"
 );
 
 #[cfg(test)]

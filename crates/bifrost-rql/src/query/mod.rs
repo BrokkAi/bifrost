@@ -37,6 +37,10 @@ pub use brokk_bifrost_core::analyzer::configuration::{
     ConfigurationMemberRole, ConfigurationScalarKind, ConfigurationValueProvenance,
 };
 pub use domain::*;
+pub use features::{
+    QueryCompositionOperation, QueryCompositionScope, QuerySourceOperation, QuerySourceScope,
+    QueryStaticDependencies, QueryStepScope,
+};
 pub use ir::{
     AbsentMemberProofFilter, ArityConstraint, AssignmentRelationFilter, AssignmentRelationKind,
     BindingFilter, BindingOfOptions, BindingSeed, BranchRelationFilter, BranchRelationKind,

@@ -312,6 +312,13 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// The `Language` variant this support serves. Must equal the registry match key.
     fn language(&self) -> Language;
 
+    /// Provider identities for external declaration inventories owned by this
+    /// language's analyzer. Shared resolution gathers these through the
+    /// registered language hooks instead of reaching into a language module.
+    fn external_inventory_providers(&self, _analyzer: &dyn IAnalyzer) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The language-owned argument mapping, applicability, and specificity rules
     /// used by selected call resolution. `None` uses positional mapping only.
     fn call_applicability_adapter(
@@ -1826,6 +1833,32 @@ pub(crate) fn language_support(language: Language) -> Option<&'static dyn Langua
         support.map(LanguageSupport::language)
     );
     support
+}
+
+const ANALYZABLE_LANGUAGES: &[Language] = &[
+    Language::Java,
+    Language::Go,
+    Language::Cpp,
+    Language::JavaScript,
+    Language::TypeScript,
+    Language::Python,
+    Language::Rust,
+    Language::Php,
+    Language::Scala,
+    Language::CSharp,
+    Language::Ruby,
+    Language::Kotlin,
+];
+
+pub(crate) fn selected_external_inventory_providers(analyzer: &dyn IAnalyzer) -> Vec<String> {
+    let mut providers = ANALYZABLE_LANGUAGES
+        .iter()
+        .filter_map(|&language| language_support(language))
+        .flat_map(|support| support.external_inventory_providers(analyzer))
+        .collect::<Vec<_>>();
+    providers.sort_unstable();
+    providers.dedup();
+    providers
 }
 
 /// Every build ecosystem that can derive project topology (#2448), in a stable

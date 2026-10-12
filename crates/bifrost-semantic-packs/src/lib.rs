@@ -418,7 +418,7 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         GO_STDLIB_OS_DECLARATION_SHARDS,
     ),
     EmbeddedSemanticPack::new(
-        "bifrost.go.stdlib.errors@1.0.0",
+        "bifrost.go.stdlib.errors@1.1.0",
         include_bytes!("../embedded/go-stdlib-errors/manifest.json"),
         GO_STDLIB_ERRORS_SHARDS,
     ),
@@ -1257,6 +1257,19 @@ func TestValue(t *testing.T) {
             }
         ));
         assert_eq!(catalog.accounting().unwrap().logical_shard_count, 0);
+    }
+
+    #[test]
+    #[hardwon("#3847: embedded source ids drifted from manifest versions")]
+    fn embedded_source_ids_match_manifest_coordinates() {
+        for pack in BIFROST_EMBEDDED_PACKS.packs() {
+            let manifest = decode_manifest(pack.manifest_bytes(), &DecodeLimits::default())
+                .expect("embedded manifest decodes");
+            assert_eq!(
+                pack.source_id(),
+                format!("{}@{}", manifest.pack_id, manifest.version)
+            );
+        }
     }
 
     #[test]

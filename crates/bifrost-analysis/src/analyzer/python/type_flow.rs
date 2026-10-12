@@ -51,8 +51,8 @@ use crate::analyzer::semantic::{
 };
 use crate::analyzer::semantic_model::{
     ProcedureSummaryMemberKey, SemanticModelCompleteness, SemanticModelMatchDisposition,
-    SemanticModelOverlay, SemanticModelOverlayDisposition, SemanticModelSurfaceGap,
-    SemanticModelSymbol, SemanticModelSymbolKind, TypeRef,
+    SemanticModelOverlay, SemanticModelOverlayDisposition, SemanticModelSymbol,
+    SemanticModelSymbolKind, TypeRef,
 };
 use crate::analyzer::usages::ImportKind;
 use crate::analyzer::usages::get_definition::{
@@ -2115,13 +2115,10 @@ fn external_instance_method_present_on_owner(
     owner_id: &str,
     member: &str,
 ) -> bool {
-    let matched = overlay.member_target_on_owner(owner_id, member);
-    let [record] = matched.records.as_slice() else {
+    let Some(record) = python_external_member_declaration(overlay, owner_id, member) else {
         return false;
     };
-    matched.disposition
-        == crate::analyzer::semantic_model::SemanticModelMemberTargetDisposition::Unique
-        && record.language == Language::Python.config_label()
+    record.language == Language::Python.config_label()
         && record.kind == SemanticModelSymbolKind::Method
         && !record.is_static()
         && record.has_receiver()
@@ -2732,23 +2729,31 @@ fn external_hierarchy_has_protocol_or_abstract_members(
             continue;
         };
         let matched = overlay.symbols_with_id(symbol_id);
-        let [symbol] = matched.records.as_slice() else {
+        let [_symbol] = matched.records.as_slice() else {
             return true;
         };
-        let surface = overlay.owner_surface(symbol);
-        if !surface.gaps.is_empty()
-            || surface.closure.iter().any(|owner| {
-                matches!(
-                    owner.qualified_name.as_str(),
-                    "typing.Protocol" | "typing_extensions.Protocol"
-                ) || owner.declaration_is_abstract()
-                    || overlay
+        let Some(mro) = python_external_class_mro(&overlay, symbol_id) else {
+            return true;
+        };
+        if mro.iter().any(|id| {
+            let records = python_external_class_records(&overlay, id);
+            records.is_empty()
+                || records.iter().any(|owner| {
+                    !overlay.owner_surface(owner).gaps.is_empty()
+                        || owner.declaration_is_abstract()
+                        || matches!(
+                            owner.qualified_name.as_str(),
+                            "typing.Protocol" | "typing_extensions.Protocol"
+                        )
+                })
+                || records.iter().any(|owner| {
+                    overlay
                         .members_of(&owner.id)
                         .records
                         .iter()
                         .any(|member| member.declaration_is_abstract())
-            })
-        {
+                })
+        }) {
             return true;
         }
     }
@@ -2997,21 +3002,13 @@ fn external_class_may_override_getattribute(
     if owner.qualified_name == "builtins.object" {
         return false;
     }
-    let surface = overlay.owner_surface(owner);
-    if surface
-        .gaps
-        .iter()
-        .any(|gap| !matches!(gap, SemanticModelSurfaceGap::PartialType { .. }))
-    {
+    let Some(mro) = python_external_class_mro(overlay, symbol_id) else {
         return true;
-    }
-    surface.closure.iter().any(|ancestor| {
-        ancestor.qualified_name != "builtins.object"
-            && overlay
-                .members_of(&ancestor.id)
-                .records
-                .iter()
-                .any(|member| member.name == "__getattribute__")
+    };
+    mro.iter().skip(1).any(|class_id| {
+        exact_python_model_class(overlay, class_id)
+            .is_some_and(|class| class.qualified_name != "builtins.object")
+            && python_external_declares_member(overlay, class_id, "__getattribute__")
     })
 }
 
@@ -3258,14 +3255,22 @@ fn external_class_hierarchy(
     let [symbol] = matched.records.as_slice() else {
         return ClassHierarchy::unknown();
     };
-    let surface = overlay.owner_surface(symbol);
-    let mut ancestors = surface
-        .closure
+    let mro = python_external_class_mro(overlay, symbol_id);
+    let mut cache = ExternalClassCache::default();
+    let mut ancestors = mro
+        .as_deref()
+        .unwrap_or_default()
         .iter()
-        .filter(|record| record.id != symbol.id)
-        .map(|record| ClassIdentity::External {
-            qualified_name: record.qualified_name.clone().into_boxed_str(),
-            symbol_id: record.id.clone().into_boxed_str(),
+        .filter(|record_id| record_id.as_str() != symbol.id)
+        .filter_map(|record_id| {
+            let record = exact_python_model_class(overlay, record_id)?;
+            external_class_identity(
+                Some(overlay),
+                Language::Python,
+                &record.qualified_name,
+                Some(&record.id),
+                &mut cache,
+            )
         })
         .collect::<Vec<_>>();
     ancestors.sort_by(|left, right| left.qualified_name().cmp(right.qualified_name()));
@@ -3273,7 +3278,12 @@ fn external_class_hierarchy(
     ClassHierarchy {
         ancestors,
         descendants: None,
-        unresolved_base: !surface.proves_absence(),
+        unresolved_base: mro.as_ref().is_none_or(|classes| {
+            classes.iter().any(|class_id| {
+                exact_python_model_class(overlay, class_id)
+                    .is_none_or(|class| overlay.gapped(&class.qualified_name).is_some())
+            })
+        }),
         dynamic_attributes: true,
     }
 }
@@ -5009,11 +5019,16 @@ pub(crate) fn python_external_member_declaration<'a>(
         {
             return None;
         }
-        let has_declared_bases = overlay
-            .relations_from(owner_id)
-            .records
-            .iter()
-            .any(|relation| relation.kind == "extends");
+        let has_declared_bases =
+            python_external_class_records(overlay, owner_id)
+                .iter()
+                .any(|owner| {
+                    overlay
+                        .relations_from(&owner.id)
+                        .records
+                        .iter()
+                        .any(|relation| relation.kind == "extends")
+                });
         if has_declared_bases {
             let mro = python_external_class_mro(overlay, owner_id)?;
             for class_id in mro.iter().skip(1) {
@@ -5207,15 +5222,40 @@ fn python_external_declares_member(
     owner_id: &str,
     member: &str,
 ) -> bool {
+    python_external_class_records(overlay, owner_id)
+        .iter()
+        .any(|owner| {
+            overlay
+                .members_of(&owner.id)
+                .records
+                .into_iter()
+                .any(|symbol| {
+                    symbol.owner_id.as_deref() == Some(owner.id.as_str())
+                        && symbol.name == member
+                        && symbol.language == Language::Python.config_label()
+                })
+        })
+}
+
+fn python_external_class_records<'a>(
+    overlay: &'a SemanticModelOverlay,
+    id: &str,
+) -> Vec<&'a SemanticModelSymbol> {
+    let Some(class) = exact_python_model_class(overlay, id) else {
+        return Vec::new();
+    };
     overlay
-        .members_of(owner_id)
+        .symbols_named(&class.qualified_name)
         .records
         .into_iter()
-        .any(|symbol| {
-            symbol.owner_id.as_deref() == Some(owner_id)
-                && symbol.name == member
+        .filter(|symbol| {
+            symbol.qualified_name == class.qualified_name
                 && symbol.language == Language::Python.config_label()
+                && symbol.owner_id.is_none()
+                && symbol.kind == SemanticModelSymbolKind::Class
+                && !symbol.provenance.ambiguous
         })
+        .collect()
 }
 
 fn exact_python_model_class<'a>(
@@ -5238,27 +5278,48 @@ fn exact_python_method_declaration<'a>(
     owner_id: &str,
     member: &str,
 ) -> Option<&'a SemanticModelSymbol> {
-    let mut records = overlay
-        .members_of(owner_id)
-        .records
+    let mut records = python_external_class_records(overlay, owner_id)
         .into_iter()
-        .filter(|symbol| {
-            symbol.owner_id.as_deref() == Some(owner_id)
-                && symbol.name == member
-                && symbol.language == Language::Python.config_label()
+        .flat_map(|owner| {
+            overlay
+                .members_of(&owner.id)
+                .records
+                .into_iter()
+                .filter(|symbol| {
+                    symbol.owner_id.as_deref() == Some(owner.id.as_str())
+                        && symbol.name == member
+                        && symbol.language == Language::Python.config_label()
+                        && symbol.kind == SemanticModelSymbolKind::Method
+                        && symbol.has_receiver()
+                        && !symbol.provenance.ambiguous
+                        && symbol.has_complete_callable_shape_evidence()
+                        && symbol.structured_signature().is_some()
+                })
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    records.sort_by(|left, right| left.id.cmp(&right.id));
+    records.sort_by(|left, right| {
+        let left_owner = left
+            .owner_id
+            .as_deref()
+            .and_then(|id| exact_python_model_class(overlay, id));
+        let right_owner = right
+            .owner_id
+            .as_deref()
+            .and_then(|id| exact_python_model_class(overlay, id));
+        (right_owner.is_some_and(|owner| {
+            owner.provenance.completeness == SemanticModelCompleteness::Complete
+        }))
+        .cmp(
+            &(left_owner.is_some_and(|owner| {
+                owner.provenance.completeness == SemanticModelCompleteness::Complete
+            })),
+        )
+        .then_with(|| left.id.cmp(&right.id))
+    });
     records.dedup_by(|left, right| left.id == right.id);
-    let [symbol] = records.as_slice() else {
-        return None;
-    };
-    (symbol.kind == SemanticModelSymbolKind::Method
-        && symbol.has_receiver()
-        && !symbol.provenance.ambiguous
-        && symbol.has_complete_callable_shape_evidence()
-        && symbol.structured_signature().is_some())
-    .then_some(*symbol)
+    let symbol = records.first().copied()?;
+    Some(symbol)
 }
 
 #[derive(Debug)]
@@ -5268,10 +5329,9 @@ struct PythonModelMroFrame {
     next_base: usize,
 }
 
-/// C3 linearization over a fully declared active Python model hierarchy.
-/// Missing, ambiguous, partial, or unordered base evidence makes inheritance
-/// unavailable; callers may still use a complete member declared on the class
-/// itself.
+/// C3 linearization over the declared active Python model hierarchy. A partial
+/// member surface can still provide useful base identities; callers retain the
+/// surface gap separately when deciding whether absence is provable.
 fn python_external_class_mro(overlay: &SemanticModelOverlay, root_id: &str) -> Option<Vec<String>> {
     let mut linearizations = HashMap::<String, Vec<String>>::default();
     let mut visiting = HashSet::<String>::default();
@@ -5287,9 +5347,6 @@ fn python_external_class_mro(overlay: &SemanticModelOverlay, root_id: &str) -> O
         if stack[top].bases.is_none() {
             let class_id = stack[top].class_id.clone();
             let class = exact_python_model_class(overlay, &class_id)?;
-            if class.provenance.completeness != SemanticModelCompleteness::Complete {
-                return None;
-            }
             stack[top].bases = Some(python_external_direct_bases(overlay, class)?);
         }
         let bases = stack[top].bases.as_ref().expect("bases were initialized");
@@ -5350,9 +5407,34 @@ fn python_external_direct_bases(
     overlay: &SemanticModelOverlay,
     class: &SemanticModelSymbol,
 ) -> Option<Vec<String>> {
-    if class.provenance.completeness != SemanticModelCompleteness::Complete {
-        return None;
+    if class.qualified_name == "builtins.object" {
+        return Some(Vec::new());
     }
+    let mut declared = Vec::new();
+    for record in python_external_class_records(overlay, &class.id) {
+        if overlay
+            .relations_from(&record.id)
+            .records
+            .iter()
+            .any(|relation| relation.kind == "extends")
+        {
+            declared.push(python_external_direct_bases_for_record(overlay, record)?);
+        }
+    }
+    if declared.is_empty() {
+        return Some(Vec::new());
+    }
+    let bases = declared.remove(0);
+    declared
+        .iter()
+        .all(|candidate| *candidate == bases)
+        .then_some(bases)
+}
+
+fn python_external_direct_bases_for_record(
+    overlay: &SemanticModelOverlay,
+    class: &SemanticModelSymbol,
+) -> Option<Vec<String>> {
     if class.qualified_name == "builtins.object" {
         return Some(Vec::new());
     }
@@ -5377,10 +5459,7 @@ fn python_external_direct_bases(
     if ordered
         .windows(2)
         .any(|pair| pair[0].declaration_ordinal == pair[1].declaration_ordinal)
-        || ordered.iter().any(|relation| {
-            relation.provenance.ambiguous
-                || relation.provenance.completeness != SemanticModelCompleteness::Complete
-        })
+        || ordered.iter().any(|relation| relation.provenance.ambiguous)
     {
         return None;
     }
@@ -5438,7 +5517,17 @@ fn python_external_direct_bases(
         {
             return None;
         }
-        bases.push(base.id.clone());
+        let identity = external_class_identity(
+            Some(overlay),
+            Language::Python,
+            &base.qualified_name,
+            Some(&base.id),
+            &mut ExternalClassCache::default(),
+        )?;
+        let ClassIdentity::External { symbol_id, .. } = identity else {
+            unreachable!("external class lookup returns an external identity")
+        };
+        bases.push(symbol_id.into_string());
     }
     Some(bases)
 }
@@ -7497,14 +7586,19 @@ fn python_external_declared_property_return_classes(
         {
             return None;
         }
-        let mut records = overlay
-            .members_of(&class_id)
-            .records
+        let mut records = python_external_class_records(overlay, &class_id)
             .into_iter()
-            .filter(|symbol| {
-                symbol.owner_id.as_deref() == Some(class_id.as_str())
-                    && symbol.name == member
-                    && symbol.language == Language::Python.config_label()
+            .flat_map(|owner| {
+                overlay
+                    .members_of(&owner.id)
+                    .records
+                    .into_iter()
+                    .filter(|symbol| {
+                        symbol.owner_id.as_deref() == Some(owner.id.as_str())
+                            && symbol.name == member
+                            && symbol.language == Language::Python.config_label()
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         if records.is_empty() {
@@ -7547,16 +7641,7 @@ fn python_external_member_is_declared_in_mro(
         {
             return None;
         }
-        if overlay
-            .members_of(&class_id)
-            .records
-            .into_iter()
-            .any(|symbol| {
-                symbol.owner_id.as_deref() == Some(class_id.as_str())
-                    && symbol.name == member
-                    && symbol.language == Language::Python.config_label()
-            })
-        {
+        if python_external_declares_member(overlay, &class_id, member) {
             return Some(true);
         }
     }
@@ -7642,7 +7727,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // Protocol ancestry, or abstract members.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-dict-read-methods-bounded-receiver-scopes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-importing-source-root-established-source-root-modules-declared-project-root-authority-package-path-extension-executed-typed-numeric-literals-partial-modeled-surface-hook-safety-variadic-container-classes-dynamic-write-name-sets-structured-dynamic-receiver-type-parameter-bounds-dynamic-type-write-bounds-nonescaping-nested-write-bounds-runtime-created-class-exclusion-loop-name-list-bounds-postponed-and-type-checking-annotation-bounds-field-slot-class-value-bounds-quoted-receiver-annotation-name-resolution-field-content-deletion-receivers-declared-parameter-conditional-closed-world-property-descriptor-field-slots-v77-external-module-value-types-exact-constructor-instance-dispatch-python-c3-class-member-replacement-scan-rql-inherited-external-member-exact-factory-and-access-return-class-sets-stable-local-multi-target-flow-dynamic-any-is-not-a-runtime-class-uncertain-constructor-call-shapes-once-bound-module-global-initializer-class-seeds",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-dict-read-methods-bounded-receiver-scopes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-importing-source-root-established-source-root-modules-declared-project-root-authority-package-path-extension-executed-typed-numeric-literals-partial-modeled-surface-hook-safety-variadic-container-classes-dynamic-write-name-sets-structured-dynamic-receiver-type-parameter-bounds-dynamic-type-write-bounds-nonescaping-nested-write-bounds-runtime-created-class-exclusion-loop-name-list-bounds-postponed-and-type-checking-annotation-bounds-field-slot-class-value-bounds-quoted-receiver-annotation-name-resolution-field-content-deletion-receivers-declared-parameter-conditional-closed-world-property-descriptor-field-slots-v78-same-name-external-class-records-external-module-value-types-exact-constructor-instance-dispatch-python-c3-class-member-replacement-scan-rql-inherited-external-member-exact-factory-and-access-return-class-sets-stable-local-multi-target-flow-dynamic-any-is-not-a-runtime-class-uncertain-constructor-call-shapes-once-bound-module-global-initializer-class-seeds",
         )
         .expect("adapter name is non-empty")
     }
@@ -9640,8 +9725,9 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 else {
                     return true;
                 };
-                let expected = overlay.member_target_on_owner(modeled_owner.id.as_str(), required);
-                let [expected] = expected.records.as_slice() else {
+                let Some(expected) =
+                    python_external_member_declaration(overlay, &modeled_owner.id, required)
+                else {
                     return true;
                 };
                 let [actual_id] = required_declaration.symbol_ids() else {

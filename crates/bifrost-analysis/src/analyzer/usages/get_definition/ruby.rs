@@ -505,10 +505,13 @@ pub(crate) fn ruby_modeled_result_class_bounded(
         let constants = RubyOverlayConstants::new(Some(&overlay));
         let result =
             ruby_unshadowed_external_type(ruby, &session, constants, &receiver.owner_fq_name)?;
-        Some(crate::analyzer::semantic::ClassIdentity::External {
-            qualified_name: result.qualified_name.clone().into_boxed_str(),
-            symbol_id: result.id.clone().into_boxed_str(),
-        })
+        crate::analyzer::semantic::type_flow::external_class_identity(
+            Some(&overlay),
+            Language::Ruby,
+            &result.qualified_name,
+            Some(&result.id),
+            &mut crate::analyzer::semantic::type_flow::ExternalClassCache::default(),
+        )
     })();
     session.finish(result)
 }

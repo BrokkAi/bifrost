@@ -303,8 +303,8 @@ impl<'a, 'store> EndpointRows<'a, 'store, '_> {
 /// selected declaration supplies its current name and module authority; its
 /// selected mount supplies placement. The recursion then follows
 /// re-export routes, glob re-exports and imports over the crate rows.
-pub(super) const REVERSE_EXPORTED_NAMES: &str = "WITH RECURSIVE names(topology_id, module_path, namespace, name) AS (
- SELECT placement.topology_id,
+pub(super) const REVERSE_EXPORTED_NAMES: &str = "WITH RECURSIVE names(topology_id, summary_id, unit_key, module_path, namespace, name) AS (
+ SELECT placement.topology_id, owner.summary_id, owner.unit_key,
         CASE WHEN properties.macro_exported=1 THEN 'crate'
              WHEN properties.declaration_kind=9 THEN placement.container_path || '::' || enum_unit.identifier
              ELSE placement.container_path END,
@@ -322,7 +322,9 @@ pub(super) const REVERSE_EXPORTED_NAMES: &str = "WITH RECURSIVE names(topology_i
  CROSS JOIN selected_rust_module_placements AS placement
   ON placement.mount_ordinal=mount.mount_ordinal
   AND placement.module_declaration IS authority.module_declaration
- CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=placement.topology_id
+ CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=placement.topology_id
+ CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
+  ON context.summary_id=owner.summary_id
  LEFT JOIN resolution_member_owner_properties AS member
   ON member.blob_id=authority.blob_id AND member.definition_semantic_key=authority.semantic_key
  LEFT JOIN resolution_rust_declaration_authorities AS enum_authority
@@ -334,28 +336,38 @@ pub(super) const REVERSE_EXPORTED_NAMES: &str = "WITH RECURSIVE names(topology_i
  WHERE mount.mount_ordinal=?4 AND mount.blob_id=?1
   AND ((properties.nearest_declaration_boundary=0 AND properties.declaration_kind NOT IN (8,9,14))
        OR (properties.declaration_kind=9 AND enum_unit.identifier IS NOT NULL))
-  AND cr_cfg(properties.cfg_condition,json(owner.cfg_atoms))=1
+  AND cr_cfg(properties.cfg_condition,json(context.cfg_atoms))=1
  UNION
- SELECT route.topology_id, route.module_path, names.namespace, route.bound_name
+ SELECT owner.topology_id, route.summary_id, owner.unit_key,
+        route.module_path, names.namespace, route.bound_name
  FROM names
- CROSS JOIN selected_rust_crates AS target ON target.topology_id=names.topology_id
- CROSS JOIN rust_crate_reexport_routes AS route ON route.target_crate_key=target.crate_key
+ CROSS JOIN selected_rust_unit_summaries AS target ON target.summary_id=names.summary_id
+ CROSS JOIN rust_resolution_unit_summary_reexport_routes AS route
+  INDEXED BY rust_resolution_unit_summary_reexport_routes_target_identity
+  ON route.target_unit_key=target.unit_key
  AND route.target_module_path=names.module_path AND route.target_name=names.name
- CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=route.topology_id
+ CROSS JOIN selected_rust_unit_summaries AS owner ON owner.summary_id=route.summary_id
  UNION
- SELECT route.topology_id, route.module_path, names.namespace, names.name
+ SELECT owner.topology_id, route.summary_id, owner.unit_key,
+        route.module_path, names.namespace, names.name
  FROM names
- CROSS JOIN selected_rust_crates AS target ON target.topology_id=names.topology_id
- CROSS JOIN rust_crate_glob_reexport_routes AS route ON route.target_crate_key=target.crate_key
+ CROSS JOIN selected_rust_unit_summaries AS target ON target.summary_id=names.summary_id
+ CROSS JOIN rust_resolution_unit_summary_glob_reexport_routes AS route
+  INDEXED BY rust_resolution_unit_summary_glob_reexport_routes_target_identity
+  ON route.target_unit_key=target.unit_key
  AND route.target_module_path=names.module_path
- CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=route.topology_id
+ CROSS JOIN selected_rust_unit_summaries AS owner ON owner.summary_id=route.summary_id
  UNION
- SELECT imports.topology_id, imports.module_path, names.namespace, imports.bound_name
+ SELECT owner.topology_id, imports.summary_id, owner.unit_key,
+        imports.module_path, names.namespace, imports.bound_name
  FROM names
- CROSS JOIN selected_rust_crates AS target ON target.topology_id=names.topology_id
- CROSS JOIN rust_crate_imports AS imports ON imports.target_crate_key=target.crate_key
- AND imports.target_module_path=names.module_path AND imports.target_name=names.name AND imports.namespace=names.namespace
- CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=imports.topology_id
+ CROSS JOIN selected_rust_unit_summaries AS target ON target.summary_id=names.summary_id
+ CROSS JOIN rust_resolution_unit_summary_import_routes AS imports
+  INDEXED BY rust_resolution_unit_summary_import_routes_target_identity
+  ON imports.target_unit_key=target.unit_key
+ AND imports.target_module_path=names.module_path
+ AND imports.target_name=names.name AND imports.namespace=names.namespace
+ CROSS JOIN selected_rust_unit_summaries AS owner ON owner.summary_id=imports.summary_id
 ) SELECT DISTINCT namespace, name FROM names";
 
 impl EndpointRows<'_, '_, '_> {
@@ -720,7 +732,7 @@ impl EndpointRows<'_, '_, '_> {
                             )?;
                             if let Some(name) = names.get(&prefix) {
                                 root_names_a_workspace_crate |= conn
-                                    .prepare_cached(sql::DEPENDENCY)?
+                                    .prepare_cached(sql::DEPENDENCY.as_str())?
                                     .exists(params![module.topology, name])?;
                                 let mut prefix_import_scopes = rows
                                     .module_import_scopes(module.blob, module.scope.get())?
@@ -867,10 +879,16 @@ impl EndpointRows<'_, '_, '_> {
                             },
                         )? {
                             let (key, path, name) = row?;
-                            let id = conn
-                                .prepare_cached(sql::CRATE)?
-                                .query_row([key], |row| row.get(0))?;
-                            targets.push((id, path, name));
+                            match sql::selected_crate_topology(conn, &key)? {
+                                Some(id) => targets.push((id, path, name)),
+                                None => {
+                                    completion =
+                                        completion.combine(&sql::unselected_target_boundary(
+                                            &self.ready.context_identities,
+                                            &key,
+                                        ));
+                                }
+                            }
                         }
                         for row in conn.prepare_cached(sql::GLOBS)?.query_map(
                             params![module.topology, module.path, module.blob, raw],
@@ -892,10 +910,18 @@ impl EndpointRows<'_, '_, '_> {
                             {
                                 continue;
                             }
-                            let id = conn
-                                .prepare_cached(sql::CRATE)?
-                                .query_row([key], |row| row.get(0))?;
-                            targets.push((id, path, demand.spelling().to_owned()));
+                            match sql::selected_crate_topology(conn, &key)? {
+                                Some(id) => {
+                                    targets.push((id, path, demand.spelling().to_owned()));
+                                }
+                                None => {
+                                    completion =
+                                        completion.combine(&sql::unselected_target_boundary(
+                                            &self.ready.context_identities,
+                                            &key,
+                                        ));
+                                }
+                            }
                         }
                     }
                     if !matched_scope && completion == ResolutionCompletion::Complete {
@@ -992,7 +1018,7 @@ impl EndpointRows<'_, '_, '_> {
                     && let Some(name) = import_root_name.as_deref()
                 {
                     root_names_a_workspace_crate |= conn
-                        .prepare_cached(sql::DEPENDENCY)?
+                        .prepare_cached(sql::DEPENDENCY.as_str())?
                         .exists(params![module.topology, name])?;
                 }
                 // A qualified reference can stop at a module import whose
@@ -1365,11 +1391,16 @@ impl EndpointRows<'_, '_, '_> {
     }
 }
 
-pub(super) const PREFIX_MODULES: &str = "WITH RECURSIVE graph(topology_id) AS (
- SELECT ?3 UNION SELECT target.topology_id FROM graph
- CROSS JOIN rust_crate_dependencies AS dependency USING(topology_id)
- CROSS JOIN selected_rust_crates AS target ON target.crate_key=dependency.dependency_crate_key
-) SELECT placement.topology_id, modules.container_path, authority.blob_id, authority.source_site,
+pub(super) const PREFIX_MODULES: &str =
+    "WITH RECURSIVE graph(topology_id, summary_id, unit_key) AS (
+ SELECT topology_id, summary_id, unit_key
+ FROM selected_rust_unit_summaries WHERE topology_id=?3
+ UNION SELECT target.topology_id, target.summary_id, target.unit_key FROM graph
+ CROSS JOIN main.resolution_unit_summary_dependencies AS dependency
+  ON dependency.summary_id=graph.summary_id
+ CROSS JOIN selected_rust_unit_summaries AS target
+  ON target.unit_key=dependency.dependency_unit_key
+) SELECT placement.topology_id, modules.module_path, authority.blob_id, authority.source_site,
  mount.persisted_relative_path
  FROM selected_resolution_mounts AS mount
  CROSS JOIN resolution_rust_declaration_authorities AS authority
@@ -1380,9 +1411,10 @@ pub(super) const PREFIX_MODULES: &str = "WITH RECURSIVE graph(topology_id) AS (
  CROSS JOIN selected_rust_module_placements AS placement
   ON placement.mount_ordinal=mount.mount_ordinal
   AND placement.module_declaration IS authority.module_declaration
- LEFT JOIN rust_crate_containers AS modules
-  ON modules.topology_id=placement.topology_id
-  AND modules.container_path=placement.container_path || '::' || unit.identifier
+ CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=placement.topology_id
+ LEFT JOIN main.rust_resolution_unit_summary_containers AS modules
+  ON modules.summary_id=owner.summary_id
+  AND modules.module_path=placement.container_path || '::' || unit.identifier
  WHERE mount.mount_ordinal=?1 AND placement.topology_id IN (SELECT topology_id FROM graph)";
 
 #[cfg(any(test, feature = "test-support"))]

@@ -516,6 +516,14 @@ fn refusal_messages(refused: &[RefusedCallSite]) -> Vec<String> {
                      single call",
                     ranges.len(),
                 ),
+                RefusalReason::NoSemanticCallSite => format!(
+                    "taint semantic binding refused one site: the selector row at {site} \
+                     does not identify a semantic call site"
+                ),
+                RefusalReason::NoValueObservation => format!(
+                    "taint semantic binding refused one site: the matched source row at {site} \
+                     produced no point-sensitive value observation"
+                ),
                 RefusalReason::UnidentifiedFormal { name, detail } => format!(
                     "taint semantic binding refused one site: the port `(argument :name \
                      \"{name}\")` at {site} does not identify one actual there: {detail}"
@@ -605,6 +613,7 @@ impl ExhaustedTaintLane {
 /// and must not share a classification: the first degrades the run to
 /// inconclusive and keeps every finding the earlier batches already produced,
 /// the second fails the run.
+#[derive(Debug)]
 enum TaintBatchError {
     BudgetExhausted(ExhaustedTaintLane),
     Internal(String),
@@ -1035,6 +1044,17 @@ impl ProductionTaintPolicyEvaluator {
             }
         }
 
+        for payload in payloads.values_mut() {
+            if !matches!(
+                payload.completion,
+                PolicyRunCompletion::Complete | PolicyRunCompletion::ProvenBySummary
+            ) {
+                payload.diagnostics.retain(|diagnostic| {
+                    diagnostic.impact() != PolicyDiagnosticImpact::FindingPartial
+                });
+            }
+        }
+
         Self {
             prepared: Mutex::new(payloads),
             public_findings: Mutex::new(public_findings),
@@ -1094,9 +1114,9 @@ pub(crate) struct TaintPolicyCompiler<'a> {
     /// the value-flow plan.
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     active_semantic_models: Option<Arc<ResolvedActiveSemanticModels>>,
-    /// Selector rows this compile refused to bind because they named more than
-    /// one distinct semantic call site, or because a `(argument :name ...)`
-    /// port identified no single actual there. Kept per row rather than raised
+    /// Selector rows this compile refused to bind because they named no
+    /// semantic call or value observation, named ambiguous calls, or lacked
+    /// an operand identified by the requested port. Kept per row rather than raised
     /// as a compile failure so one unresolvable row costs its own sites and not
     /// the whole run (#2308).
     refused_sites: Vec<RefusedCallSite>,
@@ -1246,6 +1266,10 @@ enum RefusalReason {
     /// The row's best-matching candidates name more than one distinct source
     /// call site, so it names no single call (#2308). Carries the tied ranges.
     AmbiguousCallSite(Vec<ByteRange<usize>>),
+    /// The selected row has no semantic call to bind (#4919).
+    NoSemanticCallSite,
+    /// The selected value has no observation at a program point (#4919).
+    NoValueObservation,
     /// A `(argument :name ...)` port did not identify exactly one actual at the
     /// selected call, because the callee is unresolved, because the retained
     /// argument binding is open, or because two dispatch candidates map the
@@ -1613,6 +1637,114 @@ fn procedure_cause_text(cause: &ValueFlowIncompleteCause, status: &str) -> (Stri
     (family, message)
 }
 
+/// Render a plan cause identically for incomplete runs and partial findings.
+fn value_flow_cause_text(
+    cause: &ValueFlowIncompleteCause,
+    plan: &PreparedTaintPlan,
+    metadata: &HashMap<String, PreparedTaintPlan>,
+    workspace: &WorkspaceAnalyzer,
+) -> Result<(String, String, Option<PolicySourceLocation>), String> {
+    let name = cause_procedure_name(cause);
+    let status = cause_status_label(cause);
+    let (generic_family, generic_detail) = procedure_cause_text(cause, &status);
+    let call_resolution_evidence = match cause {
+        ValueFlowIncompleteCause::CallResolution { call, .. } => {
+            if is_rust_taint_call(call) {
+                let key = call.durable_key();
+                plan.call_resolution_evidence
+                    .as_ref()
+                    .filter(|evidence| evidence.call == key)
+                    .or_else(|| {
+                        metadata.values().find_map(|candidate| {
+                            candidate
+                                .call_resolution_evidence
+                                .as_ref()
+                                .filter(|evidence| evidence.call == key)
+                        })
+                    })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let rust_call_site = match cause {
+        ValueFlowIncompleteCause::CallResolution { call, .. }
+        | ValueFlowIncompleteCause::CallBinding { call, .. }
+        | ValueFlowIncompleteCause::CallBindingCoverage { call, .. } => is_rust_taint_call(call),
+        _ => false,
+    };
+    let family =
+        if rust_call_site && matches!(cause, ValueFlowIncompleteCause::CallResolution { .. }) {
+            CALL_SITE_EVIDENCE_FAMILY.to_owned()
+        } else {
+            generic_family
+        };
+    let (primary, detail) = match cause {
+        ValueFlowIncompleteCause::CallResolution { call, .. } => {
+            if let Some(evidence) = call_resolution_evidence {
+                (
+                    Some(evidence.location.clone()),
+                    call_resolution_detail(evidence),
+                )
+            } else if is_rust_taint_call(call) {
+                let locator = super::semantic_identity::call_site_locator(call);
+                (
+                    Some(super::semantic_identity::policy_location(
+                        workspace, locator,
+                    )?),
+                    format!(
+                        "taint discovery is incomplete at call site {} bytes {}..{}; snapshot input status is {status}; resolver boundary status is unavailable",
+                        locator.path().as_str(),
+                        locator.anchor().span().start_byte(),
+                        locator.anchor().span().end_byte(),
+                    ),
+                )
+            } else {
+                let locator = super::semantic_identity::call_site_locator(call);
+                (
+                    Some(super::semantic_identity::policy_location(
+                        workspace, locator,
+                    )?),
+                    format!(
+                        "taint discovery is incomplete: {} for {}:{name} is {status}; this exact call has neither a completely resolved executable target nor an applicable complete external model",
+                        cause.label(),
+                        locator.path().as_str(),
+                    ),
+                )
+            }
+        }
+        ValueFlowIncompleteCause::CallBinding { call, .. }
+        | ValueFlowIncompleteCause::CallBindingCoverage { call, .. } => {
+            let locator = super::semantic_identity::call_site_locator(call);
+            if rust_call_site {
+                (
+                    Some(super::semantic_identity::policy_location(
+                        workspace, locator,
+                    )?),
+                    format!(
+                        "taint discovery is incomplete: call binding for {} is {status}; it is not completely covered by executable code or an applicable complete external model",
+                        locator.path().as_str(),
+                    ),
+                )
+            } else {
+                (
+                    Some(super::semantic_identity::policy_location(
+                        workspace, locator,
+                    )?),
+                    format!(
+                        "taint discovery is incomplete: {} for {}:{name} is {status}; this exact call binding is not completely covered by executable code or an applicable complete external model",
+                        cause.label(),
+                        locator.path().as_str(),
+                    ),
+                )
+            }
+        }
+        _ => (None, generic_detail),
+    };
+    Ok((family, detail, primary))
+}
+
 /// The diagnostic a composed batch gives each of its policy roots: its first
 /// incompleteness, reported as the ICFG engine reports its first cause (spec
 /// M3.4). A reason keyed by a call that the composition dispatched gets the
@@ -1680,6 +1812,50 @@ fn composition_first_cause(
         }
         _ => None,
     };
+    let (family, message, primary) = composition_cause_text(workspace, provider, first)?;
+    let diagnostic = PolicyDiagnostic::try_new_in_family(
+        PolicyDiagnosticCode::EvaluationFailure,
+        PolicyDiagnosticSeverity::Warning,
+        PolicyDiagnosticImpact::RunIncomplete,
+        family,
+        message,
+        primary,
+        Vec::new(),
+    )
+    .ok();
+    let mut diagnostics: Vec<PolicyDiagnostic> = diagnostic.into_iter().collect();
+    // The ICFG engine gives each analysis root its own first cause, so a run
+    // whose roots fail for different reasons names both families. The
+    // composition has one root; a source whose evidence is incomplete is
+    // named beside a higher-ranked cause of another family.
+    if !matches!(first, Incompleteness::SourceEvidence { .. })
+        && let Some(Incompleteness::SourceEvidence { point }) = reasons
+            .iter()
+            .find(|reason| matches!(reason, Incompleteness::SourceEvidence { .. }))
+    {
+        let (family, message) = source_evidence_text(point);
+        diagnostics.extend(
+            PolicyDiagnostic::try_new_in_family(
+                PolicyDiagnosticCode::EvaluationFailure,
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::RunIncomplete,
+                family,
+                message,
+                None,
+                Vec::new(),
+            )
+            .ok(),
+        );
+    }
+    Ok((diagnostics, first_status))
+}
+
+/// Render one composed cause, shared by run and finding diagnostics.
+fn composition_cause_text(
+    workspace: &WorkspaceAnalyzer,
+    provider: &PolicyCompositionProvider<'_>,
+    first: &Incompleteness,
+) -> Result<(String, String, Option<PolicySourceLocation>), TaintBatchError> {
     // A blocked gap outranks residual calls, as the ICFG engine's plan does.
     // A residual call prints its procedure's snapshot status, as the ICFG
     // engine's `CallResolution` cause does; a dispatch outside an open
@@ -1779,41 +1955,7 @@ fn composition_first_cause(
             None,
         ),
     };
-    let diagnostic = PolicyDiagnostic::try_new_in_family(
-        PolicyDiagnosticCode::EvaluationFailure,
-        PolicyDiagnosticSeverity::Warning,
-        PolicyDiagnosticImpact::RunIncomplete,
-        family,
-        message,
-        primary,
-        Vec::new(),
-    )
-    .ok();
-    let mut diagnostics: Vec<PolicyDiagnostic> = diagnostic.into_iter().collect();
-    // The ICFG engine gives each analysis root its own first cause, so a run
-    // whose roots fail for different reasons names both families. The
-    // composition has one root; a source whose evidence is incomplete is
-    // named beside a higher-ranked cause of another family.
-    if !matches!(first, Incompleteness::SourceEvidence { .. })
-        && let Some(Incompleteness::SourceEvidence { point }) = reasons
-            .iter()
-            .find(|reason| matches!(reason, Incompleteness::SourceEvidence { .. }))
-    {
-        let (family, message) = source_evidence_text(point);
-        diagnostics.extend(
-            PolicyDiagnostic::try_new_in_family(
-                PolicyDiagnosticCode::EvaluationFailure,
-                PolicyDiagnosticSeverity::Warning,
-                PolicyDiagnosticImpact::RunIncomplete,
-                family,
-                message,
-                None,
-                Vec::new(),
-            )
-            .ok(),
-        );
-    }
-    Ok((diagnostics, first_status))
+    Ok((family, message, primary))
 }
 
 /// The family and message the ICFG engine gives a source whose selector
@@ -3969,21 +4111,11 @@ impl<'a> TaintPolicyCompiler<'a> {
             .collect())
     }
 
-    /// Materialize the selected row's file and bind it to the semantic call
-    /// sites it identifies. An ambiguous row is refused into `refused_sites`
-    /// and answered with `None`, so a caller drops the row rather than guess.
+    /// Materialize the selected row's file and classify its semantic call sites.
     fn selected_semantic_calls(
         &mut self,
         selection: &SelectedSite,
-    ) -> Result<
-        Option<
-            Vec<(
-                ProcedureHandle,
-                brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
-            )>,
-        >,
-        TaintPolicyCompileError,
-    > {
+    ) -> Result<SelectedCallSites, TaintPolicyCompileError> {
         if selection
             .call_binding
             .as_ref()
@@ -4037,23 +4169,46 @@ impl<'a> TaintPolicyCompiler<'a> {
                 "taint semantic call binding exhausted the shared traversal budget",
             ));
         }
-        match select_call(&lookup.handles, selection)? {
-            SelectedCallSites::One(sites) => Ok(Some(sites)),
+        Ok(select_call(&lookup.handles, selection))
+    }
+
+    /// Keep valid calls and record unsuitable rows without excluding other
+    /// endpoints. Ambiguous calls retain their existing region exclusion.
+    fn bind_selected_calls(
+        &mut self,
+        selection: &SelectedSite,
+        calls: SelectedCallSites,
+    ) -> Option<
+        Vec<(
+            ProcedureHandle,
+            brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
+        )>,
+    > {
+        let (reason, procedures) = match calls {
+            SelectedCallSites::One(sites) => return Some(sites),
+            SelectedCallSites::Missing => (RefusalReason::NoSemanticCallSite, Vec::new()),
             SelectedCallSites::Ambiguous { ranges, procedures } => {
-                // The row names more than one distinct call. Refuse this row
-                // only, and record which procedures could hold the site so the
-                // regions that could contain it are dropped below (#2308). A
-                // whole-policy failure here cost every case in the run its
-                // verdict for one unresolvable row.
-                self.refused_sites.push(RefusedCallSite {
-                    file: selection.file.clone(),
-                    span: selection.span.clone(),
-                    reason: RefusalReason::AmbiguousCallSite(ranges),
-                    procedures,
-                });
-                Ok(None)
+                (RefusalReason::AmbiguousCallSite(ranges), procedures)
             }
-        }
+        };
+        self.refused_sites.push(RefusedCallSite {
+            file: selection.file.clone(),
+            span: selection.span.clone(),
+            reason,
+            procedures,
+        });
+        None
+    }
+
+    fn refuse_value_observation(&mut self, selection: &SelectedSite) {
+        self.refused_sites.push(RefusedCallSite {
+            file: selection.file.clone(),
+            span: selection.span.clone(),
+            reason: RefusalReason::NoValueObservation,
+            // There is no value endpoint to solve. Other endpoints in this
+            // procedure keep their findings; the refusal caps run completion.
+            procedures: Vec::new(),
+        });
     }
 
     fn resolve_selected_values(
@@ -4077,36 +4232,26 @@ impl<'a> TaintPolicyCompiler<'a> {
             }
             return (self.matched_values)(self, selection);
         }
-        let sites = match self.selected_semantic_calls(&selection) {
-            Ok(Some(sites)) => sites,
-            Ok(None) => return Ok(Vec::new()),
-            Err(TaintPolicyCompileError::SemanticUnavailable(message))
-                if message == "selected row does not identify a semantic call site"
-                    && matches!(binding, PolicyPort::ReturnValue) =>
+        let calls = self.selected_semantic_calls(&selection)?;
+        if matches!(calls, SelectedCallSites::Missing) && matches!(binding, PolicyPort::ReturnValue)
+        {
+            // Preserve the literal-source spelling: only a semantic literal
+            // observation can promote a non-call return-value row.
+            let refusals_before = self.refused_sites.len();
+            let resolved = (self.matched_values)(self, selection.clone())?;
+            if !resolved.is_empty()
+                && resolved
+                    .iter()
+                    .all(|value| value.kind == TaintEndpointKind::LiteralValue)
             {
-                let call_site_error = TaintPolicyCompileError::SemanticUnavailable(message);
-                // A return-value binding on a non-call row is also the
-                // literal-source spelling. Promote it only when the semantic
-                // observation proves that every selected carrier is a literal;
-                // a non-literal row must retain its typed call-site gap rather
-                // than guessing which value or call it names.
-                let resolved = match (self.matched_values)(self, selection) {
-                    Ok(resolved) => resolved,
-                    Err(TaintPolicyCompileError::SemanticUnavailable(_)) => {
-                        return Err(call_site_error);
-                    }
-                    Err(error) => return Err(error),
-                };
-                if resolved.is_empty()
-                    || resolved
-                        .iter()
-                        .any(|value| value.kind != TaintEndpointKind::LiteralValue)
-                {
-                    return Err(call_site_error);
-                }
                 return Ok(resolved);
             }
-            Err(error) => return Err(error),
+            // Report the requested call port's refusal instead of the
+            // speculative literal observation's refusal.
+            self.refused_sites.truncate(refusals_before);
+        }
+        let Some(sites) = self.bind_selected_calls(&selection, calls) else {
+            return Ok(Vec::new());
         };
         let receiver_sites = if matches!(binding, PolicyPort::Receiver) {
             sites.clone()
@@ -4355,14 +4500,18 @@ impl<'a> TaintPolicyCompiler<'a> {
         let refusals_before = self.refused_sites.len();
         let inputs = self.resolve_selected_values(selection.clone(), selector, input)?;
         let outputs = self.resolve_selected_values(selection, selector, output)?;
-        let operand_refused = self.refused_sites[refusals_before..]
-            .iter()
-            .any(|refusal| matches!(refusal.reason, RefusalReason::MissingOperand { .. }));
+        let row_refused = self.refused_sites[refusals_before..].iter().any(|refusal| {
+            matches!(
+                refusal.reason,
+                RefusalReason::MissingOperand { .. }
+                    | RefusalReason::NoSemanticCallSite
+                    | RefusalReason::NoValueObservation
+            )
+        });
         if inputs.is_empty() || inputs.len() != outputs.len() {
-            // A port whose operand the call lacks was refused, and its
-            // partner port has nothing to pair with. The row is refused
-            // whole; without such a refusal, the mismatch is a binding fault.
-            if operand_refused {
+            // A refused row has no endpoint for its partner port to pair
+            // with. Without a refusal, the mismatch is a binding fault.
+            if row_refused {
                 return Ok(Vec::new());
             }
             return Err(TaintPolicyCompileError::AmbiguousSemanticSite(
@@ -4578,7 +4727,8 @@ impl<'a> TaintPolicyCompiler<'a> {
         definition: &ResolvedTaintExternalModelDefinition,
         identity: &ResolvedEndpointIdentity,
     ) -> Result<Vec<BoundExternalModel>, TaintPolicyCompileError> {
-        let Some(sites) = self.selected_semantic_calls(&selection)? else {
+        let calls = self.selected_semantic_calls(&selection)?;
+        let Some(sites) = self.bind_selected_calls(&selection, calls) else {
             return Ok(Vec::new());
         };
         let mut bound = Vec::with_capacity(sites.len());
@@ -5328,7 +5478,8 @@ impl<'a> TaintPolicyCompiler<'a> {
             .as_ref()
             .is_some_and(|row| row.requires_dispatch())
         {
-            let Some(sites) = self.selected_semantic_calls(&selection)? else {
+            let calls = self.selected_semantic_calls(&selection)?;
+            let Some(sites) = self.bind_selected_calls(&selection, calls) else {
                 return Ok(Vec::new());
             };
             sites.into_iter().map(|(_, call)| call).collect::<Vec<_>>()
@@ -5341,12 +5492,28 @@ impl<'a> TaintPolicyCompiler<'a> {
             self.active_semantic_model_snapshot.clone(),
             DispatchHints::empty(),
         );
-        let outcome = {
+        let (outcome, source_observation_complete) = {
             let mut request = self.selectors.semantic_request();
             if let Some(endpoint) = selection.runtime_keyed_read.as_ref() {
-                oracle
+                let outcome = oracle
                     .pointees_for_keyed_read(endpoint, &mut request)
-                    .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
+                    .map_err(|error| {
+                        TaintPolicyCompileError::SemanticProvider(error.to_string())
+                    })?;
+                let source_observation_complete =
+                    matches!(outcome, SemanticOutcome::Complete { .. })
+                        && outcome.available_value().is_some_and(|result| {
+                            result.coverage() == CandidateCoverage::Exhaustive
+                        });
+                let values = outcome.map(|result| {
+                    result
+                        .observations()
+                        .iter()
+                        .map(|observation| observation.query().clone())
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice()
+                });
+                (values, source_observation_complete)
             } else {
                 if selection.runtime_keyed_read_row {
                     if selection.runtime_keyed_read_conclusive_exclusion {
@@ -5357,13 +5524,18 @@ impl<'a> TaintPolicyCompiler<'a> {
                             .to_owned(),
                     ));
                 }
-                oracle
-                    .pointees_at_source(
+                let outcome = oracle
+                    .value_observations_at_source(
                         &selection.file,
                         super::selector_compiler::source_range(&selection.span),
                         &mut request,
                     )
-                    .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
+                    .map_err(|error| {
+                        TaintPolicyCompileError::SemanticProvider(error.to_string())
+                    })?;
+                let source_observation_complete =
+                    matches!(outcome, SemanticOutcome::Complete { .. });
+                (outcome, source_observation_complete)
             }
         };
         require_uninterrupted_outcome(&outcome, "taint matched source binding")?;
@@ -5377,14 +5549,13 @@ impl<'a> TaintPolicyCompiler<'a> {
             {
                 return Ok(Vec::new());
             }
-            return Err(TaintPolicyCompileError::SemanticUnavailable(
-                "matched source row produced no point-sensitive value observation".to_owned(),
-            ));
+            self.refuse_value_observation(&selection);
+            return Ok(Vec::new());
         };
-        if let Some(observation) = result.observations().first() {
+        if let Some(observation) = result.first() {
             self.selectors.remember_artifact(
                 selection.file.clone(),
-                Arc::clone(observation.query().point().procedure().artifact()),
+                Arc::clone(observation.point().procedure().artifact()),
             );
         }
         let endpoint_quality = selection.runtime_keyed_read.as_ref().map(|endpoint| {
@@ -5400,20 +5571,12 @@ impl<'a> TaintPolicyCompiler<'a> {
             }
             (endpoint.proof.clone(), endpoint.completeness.clone())
         });
-        // Python can expose complete source rows while keeping its whole
-        // points-to capability surface open. Rust has a narrower exception:
-        // exact dispatch can prove that a selected expression inside a built-in
-        // value macro is a runtime value despite an unrelated open snapshot.
-        let source_observation_complete = (matches!(outcome, SemanticOutcome::Complete { .. })
-            && result.coverage() == CandidateCoverage::Exhaustive)
-            || (brokk_bifrost_analysis::analyzer::common::language_for_file(&selection.file)
-                == brokk_bifrost_analysis::Language::Python
-                && matches!(outcome, SemanticOutcome::Unknown { .. })
-                && result.source_observations_complete())
-            || (brokk_bifrost_analysis::analyzer::common::language_for_file(&selection.file)
-                == brokk_bifrost_analysis::Language::Rust
-                && matches!(outcome, SemanticOutcome::Unknown { .. })
-                && result.runtime_value_macro_observation_complete());
+        // A matched source is the value read at this selected point. Which
+        // object a formal base aliases does not change what flows from the
+        // read; aliasing for kills and sanitizers is the flow solver's question.
+        // The points-to objects were never consumed here, and establishing a
+        // formal's identity needs every caller, which dynamic dispatch cannot
+        // provide. The file-local projection is therefore the source evidence.
         let proof = if source_observation_complete {
             endpoint_quality.as_ref().map_or_else(
                 || selection.proof.clone(),
@@ -5451,11 +5614,10 @@ impl<'a> TaintPolicyCompiler<'a> {
                 })
         };
         Ok(result
-            .observations()
             .iter()
             .map(|observation| {
                 matched_value_endpoint(
-                    observation.query(),
+                    observation,
                     &dispatch_calls,
                     proof.clone(),
                     completeness.clone(),
@@ -5502,7 +5664,8 @@ impl<'a> TaintPolicyCompiler<'a> {
             .as_ref()
             .is_some_and(|row| row.requires_dispatch())
         {
-            let Some(sites) = self.selected_semantic_calls(&selection)? else {
+            let calls = self.selected_semantic_calls(&selection)?;
+            let Some(sites) = self.bind_selected_calls(&selection, calls) else {
                 return Ok(Vec::new());
             };
             sites.into_iter().map(|(_, call)| call).collect::<Vec<_>>()
@@ -5536,9 +5699,8 @@ impl<'a> TaintPolicyCompiler<'a> {
             {
                 return Ok(Vec::new());
             }
-            return Err(TaintPolicyCompileError::SemanticUnavailable(
-                "matched source row produced no point-sensitive value observation".to_owned(),
-            ));
+            self.refuse_value_observation(&selection);
+            return Ok(Vec::new());
         };
         if let Some(observation) = observations.first() {
             self.selectors.remember_artifact(
@@ -7028,6 +7190,7 @@ struct BatchReport {
     /// Present for a composed batch that is incomplete: the diagnostic its
     /// first incompleteness renders. Each policy root of the batch receives it.
     composition_diagnostics: Vec<PolicyDiagnostic>,
+    composition_finding_diagnostics: Vec<PolicyDiagnostic>,
     /// The snapshot input status of a composed batch's first incompleteness,
     /// when it has one. The completion reason reads it.
     composition_status: Option<SemanticInputStatus>,
@@ -7035,6 +7198,8 @@ struct BatchReport {
     /// frontier. The compile bound none of them, so the projection reads
     /// these beside the compiled ones.
     frontier_sources: Vec<CompiledTaintEndpoint>,
+    /// Per-row frontier refusals retained independently of the first cause.
+    composition_refusals: Vec<PolicyDiagnostic>,
 }
 
 /// The engine of a batch. Every policy of one batch shares its engine, because
@@ -7145,6 +7310,8 @@ fn solve_icfg_batch(
         propagation_elapsed,
         reconstruction_elapsed,
         composition_diagnostics: Vec::new(),
+        composition_finding_diagnostics: Vec::new(),
+        composition_refusals: Vec::new(),
         composition_status: None,
         frontier_sources: Vec::new(),
     })
@@ -7180,6 +7347,15 @@ impl FrontierEndpoint {
         debug_assert_eq!(procedure, output.point.procedure().durable_key());
         procedure
     }
+}
+
+/// One frontier selection's endpoints, incompleteness, and per-row refusals.
+/// Refusals also stay separate so an earlier composition cause cannot hide
+/// their row-specific diagnostics (#4919).
+pub(crate) struct FrontierBindings {
+    pub(crate) endpoints: Vec<FrontierEndpoint>,
+    pub(crate) gaps: Vec<String>,
+    pub(crate) refusals: Vec<String>,
 }
 
 /// What the composition needs to match one policy's sources, sanitizers and
@@ -7314,7 +7490,7 @@ impl<'a> FrontierEndpointBinder<'a> {
         &mut self,
         selector: FrontierSelector,
         sites: Vec<SelectedSite>,
-    ) -> Result<(Vec<FrontierEndpoint>, Vec<String>), TaintPolicyCompileError> {
+    ) -> Result<FrontierBindings, TaintPolicyCompileError> {
         let resolved = self.selector(selector)?;
         let spec = self.spec;
         let mut endpoints = Vec::new();
@@ -7340,9 +7516,14 @@ impl<'a> FrontierEndpointBinder<'a> {
                 ),
             }
         }
-        let mut gaps = refusal_messages(&std::mem::take(&mut self.compiler.refused_sites));
+        let refusals = refusal_messages(&std::mem::take(&mut self.compiler.refused_sites));
+        let mut gaps = refusals.clone();
         gaps.extend(self.compiler.selectors.take_incomplete_taint_selectors());
-        Ok((endpoints, gaps))
+        Ok(FrontierBindings {
+            endpoints,
+            gaps,
+            refusals,
+        })
     }
 
     /// The evidence the ICFG engine would give a frontier matched-value
@@ -7591,6 +7772,23 @@ fn compose_batch(
     });
     let (composition_diagnostics, composition_status) =
         composition_first_cause(workspace, &provider, &outcome.incompleteness)?;
+    let mut composition_finding_diagnostics = Vec::new();
+    if outcome.report.is_complete() || outcome.report.is_proven_by_authored_summaries() {
+        for cause in &outcome.finding_incompleteness {
+            let (family, message, primary) = composition_cause_text(workspace, &provider, cause)?;
+            if let Ok(diagnostic) = PolicyDiagnostic::try_new_in_family(
+                PolicyDiagnosticCode::EvaluationFailure,
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::FindingPartial,
+                family,
+                message,
+                primary,
+                Vec::new(),
+            ) {
+                composition_finding_diagnostics.push(diagnostic);
+            }
+        }
+    }
     if let Some(lane) = first_exhausted_taint_lane(execution_budget) {
         return Err(TaintBatchError::BudgetExhausted(lane));
     }
@@ -7599,11 +7797,25 @@ fn compose_batch(
             ExhaustedTaintLane::Findings,
         ));
     }
+    let composition_refusals = provider
+        .refusal_messages()
+        .into_iter()
+        .map(|message| {
+            PolicyDiagnostic::new_bounded(
+                PolicyDiagnosticCode::EvaluationFailure,
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::RunIncomplete,
+                message,
+            )
+        })
+        .collect();
     Ok(BatchReport {
         report: outcome.report,
         propagation_elapsed,
         reconstruction_elapsed: Duration::ZERO,
         composition_diagnostics,
+        composition_finding_diagnostics,
+        composition_refusals,
         composition_status,
         frontier_sources: provider.frontier_sources(),
     })
@@ -7643,6 +7855,8 @@ fn solve_and_project_batch(
         propagation_elapsed,
         reconstruction_elapsed,
         composition_diagnostics,
+        composition_finding_diagnostics,
+        composition_refusals,
         composition_status,
         frontier_sources,
     } = match engine {
@@ -7755,6 +7969,14 @@ fn solve_and_project_batch(
             &mut dropped_for_missing_origins,
             store_write_evidence,
         )?;
+        let has_partial_finding = projected.iter().any(|projection| {
+            projection.pairs.iter().any(|pair| {
+                matches!(
+                    pair.report.completeness,
+                    FindingCompleteness::Partial { .. }
+                )
+            })
+        });
         let payload = payloads
             .get_mut(&plan.policy_id)
             .ok_or_else(|| "compiled taint policy has no prepared payload".to_owned())?;
@@ -7774,6 +7996,18 @@ fn solve_and_project_batch(
         for (identity, projection) in fresh {
             identities.insert(identity);
             payload.projections.push(projection);
+        }
+        if !composition_refusals.is_empty() {
+            let mut reasons = match &payload.completion {
+                PolicyRunCompletion::Inconclusive { reasons } => reasons.clone(),
+                _ => Vec::new(),
+            };
+            reasons.push(PolicyIncompleteReason::CapabilityIncomplete);
+            payload.completion =
+                PolicyRunCompletion::inconclusive(reasons).map_err(|error| error.to_string())?;
+            payload
+                .diagnostics
+                .extend(composition_refusals.iter().cloned());
         }
         // A composed batch's first incompleteness is the run's diagnostic for
         // this root (spec M3.4). The completion below already downgrades the run.
@@ -7869,107 +8103,8 @@ fn solve_and_project_batch(
                     .map_err(|error| error.to_string())?;
                 payload.authored_arm_closures.clear();
                 if let Some(cause) = cause {
-                    let name = cause_procedure_name(cause);
-                    let status = cause_status_label(cause);
-                    let (generic_family, generic_detail) = procedure_cause_text(cause, &status);
-                    let call_resolution_evidence = match cause {
-                        ValueFlowIncompleteCause::CallResolution { call, .. } => {
-                            if is_rust_taint_call(call) {
-                                let key = call.durable_key();
-                                plan.call_resolution_evidence
-                                    .as_ref()
-                                    .filter(|evidence| evidence.call == key)
-                                    .or_else(|| {
-                                        metadata.values().find_map(|candidate| {
-                                            candidate
-                                                .call_resolution_evidence
-                                                .as_ref()
-                                                .filter(|evidence| evidence.call == key)
-                                        })
-                                    })
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    };
-                    let rust_call_site = match cause {
-                        ValueFlowIncompleteCause::CallResolution { call, .. }
-                        | ValueFlowIncompleteCause::CallBinding { call, .. }
-                        | ValueFlowIncompleteCause::CallBindingCoverage { call, .. } => {
-                            is_rust_taint_call(call)
-                        }
-                        _ => false,
-                    };
-                    let family = if rust_call_site
-                        && matches!(cause, ValueFlowIncompleteCause::CallResolution { .. })
-                    {
-                        CALL_SITE_EVIDENCE_FAMILY.to_owned()
-                    } else {
-                        generic_family
-                    };
-                    let (primary, detail) = match cause {
-                        ValueFlowIncompleteCause::CallResolution { call, .. } => {
-                            if let Some(evidence) = call_resolution_evidence {
-                                (
-                                    Some(evidence.location.clone()),
-                                    call_resolution_detail(evidence),
-                                )
-                            } else if is_rust_taint_call(call) {
-                                let locator = super::semantic_identity::call_site_locator(call);
-                                (
-                                    Some(super::semantic_identity::policy_location(
-                                        workspace, locator,
-                                    )?),
-                                    format!(
-                                        "taint discovery is incomplete at call site {} bytes {}..{}; snapshot input status is {status}; resolver boundary status is unavailable",
-                                        locator.path().as_str(),
-                                        locator.anchor().span().start_byte(),
-                                        locator.anchor().span().end_byte(),
-                                    ),
-                                )
-                            } else {
-                                let locator = super::semantic_identity::call_site_locator(call);
-                                (
-                                    Some(super::semantic_identity::policy_location(
-                                        workspace, locator,
-                                    )?),
-                                    format!(
-                                        "taint discovery is incomplete: {} for {}:{name} is {status}; this exact call has neither a completely resolved executable target nor an applicable complete external model",
-                                        cause.label(),
-                                        locator.path().as_str(),
-                                    ),
-                                )
-                            }
-                        }
-                        ValueFlowIncompleteCause::CallBinding { call, .. }
-                        | ValueFlowIncompleteCause::CallBindingCoverage { call, .. } => {
-                            let locator = super::semantic_identity::call_site_locator(call);
-                            if rust_call_site {
-                                (
-                                    Some(super::semantic_identity::policy_location(
-                                        workspace, locator,
-                                    )?),
-                                    format!(
-                                        "taint discovery is incomplete: call binding for {} is {status}; it is not completely covered by executable code or an applicable complete external model",
-                                        locator.path().as_str(),
-                                    ),
-                                )
-                            } else {
-                                (
-                                    Some(super::semantic_identity::policy_location(
-                                        workspace, locator,
-                                    )?),
-                                    format!(
-                                        "taint discovery is incomplete: {} for {}:{name} is {status}; this exact call binding is not completely covered by executable code or an applicable complete external model",
-                                        cause.label(),
-                                        locator.path().as_str(),
-                                    ),
-                                )
-                            }
-                        }
-                        _ => (None, generic_detail),
-                    };
+                    let (family, detail, primary) =
+                        value_flow_cause_text(cause, plan, metadata, workspace)?;
                     // The family names only the repeating cause. A corpus
                     // produces one of these per procedure, so without a family
                     // the per-policy diagnostic cap kept the first 256 by sort
@@ -7987,6 +8122,39 @@ fn solve_and_project_batch(
                     }
                 }
                 ensure_taint_incomplete_diagnostic(payload, retained.report(), workspace);
+            }
+        }
+        if matches!(
+            payload.completion,
+            PolicyRunCompletion::Complete | PolicyRunCompletion::ProvenBySummary
+        ) && has_partial_finding
+        {
+            match engine {
+                TaintEngine::Composition => {
+                    for diagnostic in &composition_finding_diagnostics {
+                        if !payload.diagnostics.contains(diagnostic) {
+                            payload.diagnostics.push(diagnostic.clone());
+                        }
+                    }
+                }
+                TaintEngine::Icfg { .. } => {
+                    if let Some(cause) = batch.analysis().value_flow().first_incomplete_cause() {
+                        let (family, message, primary) =
+                            value_flow_cause_text(cause, plan, metadata, workspace)?;
+                        if let Ok(diagnostic) = PolicyDiagnostic::try_new_in_family(
+                            PolicyDiagnosticCode::EvaluationFailure,
+                            PolicyDiagnosticSeverity::Warning,
+                            PolicyDiagnosticImpact::FindingPartial,
+                            family,
+                            message,
+                            primary,
+                            Vec::new(),
+                        ) && !payload.diagnostics.contains(&diagnostic)
+                        {
+                            payload.diagnostics.push(diagnostic);
+                        }
+                    }
+                }
             }
         }
     }
@@ -9623,6 +9791,8 @@ fn taint_endpoint_kind(
 
 /// What one selector row names in the semantic model.
 enum SelectedCallSites {
+    /// No semantic call matches the row; it may still name a literal source.
+    Missing,
     /// One source call site. The vector holds every semantic call site that
     /// lowers it, which is more than one whenever the lowering specializes the
     /// surrounding code per control-flow route.
@@ -9651,7 +9821,7 @@ enum SelectedCallSites {
 /// without parentheses, whose structural rows and semantic call anchors share
 /// one node (#1953). A call whose anchor strictly encloses the row is a
 /// secondary candidate for adapters whose rows sit inside the call expression.
-/// No candidate stays a typed capability failure.
+/// No candidate is a per-row refusal, unless a literal source can bind it.
 ///
 /// Equal-rank candidates are not automatically an ambiguity (#2308). A call
 /// site is anchored at its call expression, so tied candidates that share one
@@ -9667,10 +9837,7 @@ enum SelectedCallSites {
 /// Tied candidates that carry *different* source ranges are a genuine
 /// ambiguity: the row's evidence names no single call, and binding refuses it
 /// rather than guess.
-fn select_call(
-    procedures: &[ProcedureHandle],
-    selection: &SelectedSite,
-) -> Result<SelectedCallSites, TaintPolicyCompileError> {
+fn select_call(procedures: &[ProcedureHandle], selection: &SelectedSite) -> SelectedCallSites {
     let selected_call_span = selection
         .call_binding
         .as_ref()
@@ -9720,9 +9887,7 @@ fn select_call(
             ))
     });
     let Some(best) = candidates.first() else {
-        return Err(TaintPolicyCompileError::SemanticUnavailable(
-            "selected row does not identify a semantic call site".to_owned(),
-        ));
+        return SelectedCallSites::Missing;
     };
     let rank = (best.inexact, best.range.len());
     let tied = candidates
@@ -9740,13 +9905,13 @@ fn select_call(
             .map(|candidate| candidate.procedure.durable_key())
             .collect::<Vec<_>>();
         procedures.dedup();
-        return Ok(SelectedCallSites::Ambiguous { ranges, procedures });
+        return SelectedCallSites::Ambiguous { ranges, procedures };
     }
-    Ok(SelectedCallSites::One(
+    SelectedCallSites::One(
         tied.into_iter()
             .map(|candidate| (candidate.procedure.clone(), candidate.handle.clone()))
             .collect(),
-    ))
+    )
 }
 
 /// The value and observation point a port names at one selected call. `None`
@@ -13321,6 +13486,88 @@ pub fn run() {
         );
     }
 
+    #[test]
+    #[hardwon(
+        "a6f4c6b2ca52: a matched-value sanitizer at a call other than its observation point was not applied"
+    )]
+    fn composition_applies_a_matched_value_sanitizer_at_a_later_call_use() {
+        const SOURCE: &str = r#"fn source() -> String {
+    String::new()
+}
+
+fn sink(value: String) -> usize {
+    value.len()
+}
+
+fn clean(value: String) -> String {
+    value
+}
+
+pub fn run() {
+    let raw = source();
+    let cleaned = clean(raw);
+    sink(cleaned);
+}
+"#;
+        const POLICY: &str = r#"(policy
+      :schema-version 1
+      :id "test.composed-sanitizer"
+      :name "Composed sanitizer"
+      :message "tainted data reached sink"
+      :severity warning
+      :analysis (analysis
+        :type taint
+        :mode may
+        :call-modeling (call-modeling :unmodeled optimistic)
+        :sources (endpoint-set :entries [
+          (source :id raw-input :display-name "raw input" :categories [input.user]
+            :selector (rql :schema-version 1
+              (language rust (call :callee (name "source"))))
+            :bind return-value :labels [attacker-controlled])])
+        :sanitizers (endpoint-set :entries [
+          (sanitizer :id clean-value :selector (rql :schema-version 1
+              (language rust (occurrences-in :role value_reference :namespace value
+                (identifier :name/regex "^cleaned$"))))
+            :input matched-value :output matched-value :removes [attacker-controlled])])
+        :sinks (endpoint-set :entries [
+          (sink :id sink :display-name "sink" :categories [data.sensitive]
+            :selector (rql :schema-version 1
+              (language rust (call :callee (name "sink"))))
+            :dangerous-operand (argument :index 0)
+            :accepts [attacker-controlled])])))"#;
+
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", SOURCE)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let outcome = evaluate_policy_source(
+            project.root(),
+            PolicySourceIdentity::new("test:composed-sanitizer.rqlp"),
+            POLICY,
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &PolicyEvaluationOptions::new(
+                PolicyEvaluationDate::from_ymd(2026, 10, 12).expect("fixed evaluation date"),
+            ),
+            None,
+        )
+        .expect("the sanitizer policy evaluates");
+        let [run] = outcome.report().runs() else {
+            panic!("one policy produces one run: {:?}", outcome.report());
+        };
+        assert_eq!(
+            run.engine().map(TaintEngine::render).as_deref(),
+            Some("composition")
+        );
+        assert!(
+            run.findings().is_empty(),
+            "the sanitizer removes the source label: {run:#?}"
+        );
+    }
+
     /// `run` passes its source to `std::convert::identity`, which has no body
     /// in the workspace, and logs the result. Only the policy's
     /// unmodeled-call behavior can carry the source across the call.
@@ -13463,6 +13710,85 @@ pub fn run() {
             );
             composed.2.len()
         })
+    }
+
+    #[test]
+    #[hardwon("#4919: one non-call sink row aborted valid flows in the whole policy")]
+    fn both_engines_refuse_a_non_call_sink_row() {
+        // The literal shares a procedure with the valid sink. Excluding
+        // that whole region would erase the valid sink's finding too.
+        let source = COMPOSED_SOURCE
+            .replace("let moved = pass_through(raw);", "let moved = raw;")
+            .replace(
+                "let raw = source();",
+                "\"refused_sink\";\n    let raw = source();",
+            );
+        let policy = COMPOSED_POLICY.replace(
+            ":sinks (endpoint-set :entries [",
+            r#":sinks (endpoint-set :entries [
+              (sink :id non-call :display-name "non-call" :categories [data.sensitive]
+                :selector (rql :schema-version 1
+                  (language rust (string_literal :text/regex "refused_sink")))
+                :dangerous-operand (argument :index 0) :accepts [attacker-controlled])"#,
+        );
+        for run in engine_runs_of(&policy, &source, "optimistic") {
+            assert_eq!(run.2.len(), 1, "valid sink retains its finding: {run:?}");
+            assert!(
+                matches!(run.1, PolicyRunCompletion::Inconclusive { .. }),
+                "refusal leaves the run incomplete: {run:?}"
+            );
+            assert!(
+                run.4
+                    .iter()
+                    .any(|message| message.contains("selector row at src/lib.rs:")
+                        && message.contains("does not identify a semantic call site")),
+                "refusal names the row and reason: {run:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#4919: one source without a point-sensitive observation aborted valid flows")]
+    fn both_engines_refuse_a_source_without_a_value_observation() {
+        let source = COMPOSED_SOURCE
+            .replace("let moved = pass_through(raw);", "let moved = raw;")
+            .replace(
+                "let raw = source();",
+                "const GAP: &str = \"unobserved_source\";\n    let raw = source();",
+            );
+        // A nested constant's initializer is selected structurally but is
+        // excluded from the surrounding procedure's runtime observations.
+        for binding in ["matched-value", "return-value"] {
+            let policy = COMPOSED_POLICY.replace(
+                ":sources (endpoint-set :entries [",
+                &format!(
+                    r#":sources (endpoint-set :entries [
+                  (source :id gap :display-name "gap" :categories [input.user]
+                    :selector (rql :schema-version 1
+                      (language rust (string_literal :text/regex "unobserved_source")))
+                    :bind {binding} :labels [attacker-controlled])"#
+                ),
+            );
+            for run in engine_runs_of(&policy, &source, "optimistic") {
+                assert_eq!(run.2.len(), 1, "valid source retains its finding: {run:?}");
+                assert!(
+                    matches!(run.1, PolicyRunCompletion::Inconclusive { .. }),
+                    "refusal leaves the run incomplete: {run:?}"
+                );
+                let reason = if binding == "matched-value" {
+                    "produced no point-sensitive value observation"
+                } else {
+                    "does not identify a semantic call site"
+                };
+                assert!(
+                    run.4
+                        .iter()
+                        .any(|message| message.contains("row at src/lib.rs:")
+                            && message.contains(reason)),
+                    "refusal names the row and reason: {run:?}"
+                );
+            }
+        }
     }
 
     /// `run` passes its source as the second argument of a two-argument
@@ -14017,7 +14343,7 @@ pub fn run(receiver: String) {
                     64,
                     &cancellation,
                 )
-                .with_active_semantic_model_snapshot(Some(snapshot)),
+                .with_active_semantic_model_snapshot(Some(Arc::clone(&snapshot))),
                 policy,
                 spec,
                 plan.universe().clone(),
@@ -14043,6 +14369,18 @@ pub fn run(receiver: String) {
         );
         let findings = outcome.report.findings();
         assert_eq!(findings.len(), 1, "one finding is expected: {findings:#?}");
+        let [cause] = outcome.finding_incompleteness.as_slice() else {
+            panic!(
+                "one external finding cause: {:?}",
+                outcome.finding_incompleteness
+            );
+        };
+        let (family, message, primary) =
+            super::composition_cause_text(&workspace, &provider, cause)
+                .expect("the retained external call renders");
+        assert_eq!(family, super::CALL_SITE_EVIDENCE_FAMILY);
+        assert!(message.contains("replace"), "{message}");
+        assert!(primary.is_some());
     }
 
     const COMPOSED_FIELD_SOURCE: &str = r#"pub struct Config {

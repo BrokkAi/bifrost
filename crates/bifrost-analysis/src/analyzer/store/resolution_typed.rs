@@ -7,6 +7,7 @@
 //! selected-first and keyset-paged, and parent rows are emitted only after all
 //! ordered children and completion reasons have been decoded.
 
+mod external_owners;
 pub(super) mod go_members;
 pub(super) mod java_access;
 pub(super) mod java_inheritance;
@@ -53,6 +54,12 @@ use super::resolution_selection::{
 };
 use super::{Result as StoreResult, StoreError};
 
+pub(in crate::analyzer::store) const INVOCATION_ROLES_FOR_REFERENCES_SQL: &str = "SELECT role.site, role.role FROM json_each(?2) request \
+     CROSS JOIN main.resolution_semantic_sites site ON site.blob_id=?1 \
+         AND site.semantic_role='reference' AND site.semantic_key=request.value \
+     CROSS JOIN main.resolution_invocation_roles role ON role.blob_id=site.blob_id \
+         AND role.site=site.source_site";
+
 /// The one tier 1 family every typed read's membership comes from: which
 /// blobs hold a fact of a named relation under an interned identity.
 ///
@@ -73,6 +80,8 @@ pub(crate) struct SelectedResolutionTypedSource<'selection, 'store> {
     selection: &'selection SelectedResolutionMountInventory<'store>,
     selected_interiors_validation_stamp: Cell<Option<SelectedResolutionReadStamp>>,
     authority: Rc<SelectedResolutionAuthority<'selection>>,
+    context_identities: crate::analyzer::resolution::SelectedContextIdentities,
+    external_providers: Vec<String>,
 }
 
 impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
@@ -93,7 +102,22 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             selection,
             selected_interiors_validation_stamp: Cell::new(None),
             authority,
+            context_identities: crate::analyzer::resolution::SelectedContextIdentities::new(),
+            external_providers: Vec::new(),
         }
+    }
+
+    pub(super) fn with_external_providers(mut self, providers: Vec<String>) -> Self {
+        self.external_providers = providers;
+        self
+    }
+
+    pub(super) fn with_context_identities(
+        mut self,
+        identities: crate::analyzer::resolution::SelectedContextIdentities,
+    ) -> Self {
+        self.context_identities = identities;
+        self
     }
 
     /// Read a positioned named-argument label from its exact selected source
@@ -881,6 +905,49 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         self.read_callable_parameter_for_label(callable, label, cancellation)
     }
 
+    fn lookup_namespace(
+        &self,
+        lookup: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace>>
+    {
+        let names = self
+            .selection
+            .shared_name_table()
+            .interner(self.selection.connection());
+        let Some(name) = lookup
+            .shared_name_id()
+            .and_then(|name| names.to_persisted(name))
+        else {
+            return Ok(None);
+        };
+        let ids = json_array([i64::from(name.get())]);
+        let result = self.read_statement(cancellation, |conn| {
+            let mut statement = conn.prepare_cached(
+                super::resolution_prepare::resolution_rows::RESOLUTION_IDENTITY_RECIPES_SQL,
+            )?;
+            let mut rows = statement.query([ids])?;
+            let namespace = if let Some(row) = rows.next()? {
+                if let Some(language) = row.get::<_, Option<i64>>(1)? {
+                    Some(
+                        super::resolution_prepare::resolution_rows::decode_lookup_recipe(
+                            language,
+                            row.get(2)?,
+                            &row.get::<_, String>(3)?,
+                        )
+                        .namespace(),
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Ok(Some(namespace))
+        })?;
+        Ok(result.flatten())
+    }
+
     fn selection_has_java_semantics(&self) -> bool {
         self.selection.has_java_semantics()
     }
@@ -1131,6 +1198,129 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             }
         }
         Ok(Some(result))
+    }
+
+    fn invocation_roles_for_references(
+        &self,
+        references: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<crate::analyzer::resolution::SelectedInvocationRole>>> {
+        use crate::analyzer::resolution::{SelectedInvocationRole, mounted_site_semantic};
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionInvocationRole;
+        let mut coordinates = Vec::new();
+        for (ordinal, &reference) in references.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let Some(provenance) = self
+                .authority
+                .semantic_catalog_provenance(reference, cancellation)?
+            else {
+                return Ok(None);
+            };
+            if let Some(SelectedSemanticProvenance::FragmentLocal(local)) = provenance {
+                coordinates.push(RequestCoordinate::new(
+                    ordinal,
+                    local.mount().ordinal(),
+                    local.local_key().get(),
+                ));
+            }
+        }
+        let mut result = Vec::new();
+        for (ordinal, keys) in group_keys(coordinates.into_iter()) {
+            let mount = self.mount(ordinal)?;
+            let key_array = json_array(keys);
+            let Some(rows) = self.read_statement(cancellation, |conn| {
+                let mut statement = conn.prepare_cached(INVOCATION_ROLES_FOR_REFERENCES_SQL)?;
+                let mut rows = statement.query(rusqlite::params![mount.blob_id(), key_array])?;
+                let mut result = Vec::new();
+                while let Some(row) = rows.next()? {
+                    if cancellation.is_cancelled() {
+                        return Ok(None);
+                    }
+                    let label: String = row.get(1)?;
+                    let role = match label.as_str() {
+                        "unapply" => ResolutionInvocationRole::Unapply,
+                        "unapply_seq" => ResolutionInvocationRole::UnapplySeq,
+                        "direct" => ResolutionInvocationRole::Direct,
+                        "apply" => ResolutionInvocationRole::Apply,
+                        _ => {
+                            return Err(StoreError::new(format!(
+                                "unknown invocation role {label:?}"
+                            )));
+                        }
+                    };
+                    result.push(SelectedInvocationRole {
+                        reference: mounted_site_semantic(
+                            mount.fragment_id(),
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId::new(
+                                row.get(0)?,
+                            ),
+                        ),
+                        language: mount.semantic_language(),
+                        role,
+                    });
+                }
+                Ok(Some(result))
+            })?
+            else {
+                return Ok(None);
+            };
+            result.extend(rows);
+        }
+        Ok(Some(result))
+    }
+
+    fn lookups_outside_implicit_root(
+        &self,
+        lookups: &[(BindingFragmentId, SemanticId)],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        use super::resolution_lexical::{
+            SelectedLookupRecipeReadOutcome, SelectedLookupRecipeRequest,
+            SelectedResolutionLexicalSource,
+        };
+        use crate::analyzer::resolution::{
+            MAX_SOURCE_ROWS_PER_BATCH, language_has_jvm_semantics, language_identity_domain,
+            language_implicit_root_member_names,
+        };
+        let lexical = SelectedResolutionLexicalSource::with_authority(
+            self.selection,
+            Rc::clone(&self.authority),
+        );
+        let mut result = Vec::new();
+        for chunk in lookups.chunks(MAX_SOURCE_ROWS_PER_BATCH) {
+            let requests = chunk
+                .iter()
+                .map(|&(fragment, semantic)| SelectedLookupRecipeRequest { fragment, semantic })
+                .collect::<Vec<_>>();
+            let SelectedLookupRecipeReadOutcome::Ready(recipes) =
+                lexical.lookup_semantic_recipes(&requests, cancellation, None)?
+            else {
+                return Ok(None);
+            };
+            for ((_, lookup), recipe) in chunk.iter().zip(recipes.iter()) {
+                let Some(recipe) = recipe else {
+                    continue;
+                };
+                // Java, Kotlin and Scala share one lookup identity domain, so
+                // the recipe names the domain, not the source language. The
+                // lookup is outside the implicit root only when no language of
+                // its domain has an implicit-root member of that spelling.
+                let mut languages = Language::ALL.into_iter().filter(|&language| {
+                    language_identity_domain(language) == recipe.identity_domain()
+                });
+                let spelling = recipe.spelling();
+                if languages.clone().any(language_has_jvm_semantics)
+                    && languages.all(|language| {
+                        !language_implicit_root_member_names(language).contains(&spelling)
+                    })
+                {
+                    result.push(*lookup);
+                }
+            }
+        }
+        Ok((!cancellation.is_cancelled()).then_some(result))
     }
 
     fn go_member_declarations(
@@ -2419,7 +2609,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberScopeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        self.visit_local_and_staged_typed_rows(
+        let source = self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
             |source, cancellation| {
@@ -2439,7 +2629,24 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     visitor,
                 )
             },
-        )
+        )?;
+        if !source.is_exhausted() {
+            return Ok(source);
+        }
+        let external =
+            self.visit_external_member_scopes(definitions.as_slice(), cancellation, visitor)?;
+        let completion = source.evidence().combine(external.evidence());
+        Ok(match external.terminal() {
+            crate::analyzer::resolution::TypedFactReadTerminal::Exhausted => {
+                TypedFactReadOutcome::exhausted(completion)
+            }
+            crate::analyzer::resolution::TypedFactReadTerminal::Stopped => {
+                TypedFactReadOutcome::stopped(completion)
+            }
+            crate::analyzer::resolution::TypedFactReadTerminal::Cancelled => {
+                TypedFactReadOutcome::cancelled(completion)
+            }
+        })
     }
 
     fn visit_companion_relation_pages_for_enclosing_types(
@@ -2529,7 +2736,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberOwnerProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        self.visit_local_and_staged_typed_rows(
+        let source = self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
             |source, cancellation| {
@@ -2549,7 +2756,24 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     visitor,
                 )
             },
-        )
+        )?;
+        if !source.is_exhausted() {
+            return Ok(source);
+        }
+        let external =
+            self.visit_external_member_owners(owner_definitions.as_slice(), cancellation, visitor)?;
+        let completion = source.evidence().combine(external.evidence());
+        Ok(match external.terminal() {
+            crate::analyzer::resolution::TypedFactReadTerminal::Exhausted => {
+                TypedFactReadOutcome::exhausted(completion)
+            }
+            crate::analyzer::resolution::TypedFactReadTerminal::Stopped => {
+                TypedFactReadOutcome::stopped(completion)
+            }
+            crate::analyzer::resolution::TypedFactReadTerminal::Cancelled => {
+                TypedFactReadOutcome::cancelled(completion)
+            }
+        })
     }
 
     fn visit_deferred_member_owner_pages_for_definitions(
@@ -2641,7 +2865,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredSupertypeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        self.visit_local_and_staged_typed_rows(
+        let source = self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
             |source, cancellation| {
@@ -2661,7 +2885,24 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     visitor,
                 )
             },
-        )
+        )?;
+        if !source.is_exhausted() {
+            return Ok(source);
+        }
+        let external =
+            self.visit_external_supertypes(definitions.as_slice(), cancellation, visitor)?;
+        let completion = source.evidence().combine(external.evidence());
+        Ok(match external.terminal() {
+            crate::analyzer::resolution::TypedFactReadTerminal::Exhausted => {
+                TypedFactReadOutcome::exhausted(completion)
+            }
+            crate::analyzer::resolution::TypedFactReadTerminal::Stopped => {
+                TypedFactReadOutcome::stopped(completion)
+            }
+            crate::analyzer::resolution::TypedFactReadTerminal::Cancelled => {
+                TypedFactReadOutcome::cancelled(completion)
+            }
+        })
     }
 
     fn visit_supertype_pages_for_references(
@@ -3853,6 +4094,39 @@ mod row_evidence_tests {
             let (outcome, rows) = read(&cancelled).unwrap();
             assert!(outcome.is_cancelled());
             assert!(rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn invocation_role_reader_is_keyed_under_both_statistics_states() {
+        use super::super::planner_statistics::pinned_plans::{pinned, plan_rows};
+        use super::super::resolution_selection::tests::SelectionFixture;
+        use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+        for statistics in PlannerStatisticsState::BOTH {
+            let fixture = SelectionFixture::new(32);
+            let writer = fixture.store.conn.lock().unwrap();
+            statistics.install(&writer);
+            let query = pinned("invocation_roles_for_references");
+            let plan = plan_rows(&writer, &query).unwrap();
+            for alias in ["site", "role"] {
+                assert!(
+                    plan.iter()
+                        .any(|row| row.contains(&format!("SEARCH {alias} "))),
+                    "{statistics:?}: {plan:?}"
+                );
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|row| row.contains(&format!("SCAN {alias}"))),
+                    "{statistics:?}: {plan:?}"
+                );
+            }
+            assert!(
+                !plan
+                    .iter()
+                    .any(|row| row.contains("AUTOMATIC") || row.contains("TEMP B-TREE")),
+                "{statistics:?}: {plan:?}"
+            );
         }
     }
 

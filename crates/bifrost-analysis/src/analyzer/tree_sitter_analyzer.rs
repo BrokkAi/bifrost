@@ -4456,6 +4456,9 @@ where
     }
 
     pub(crate) fn snapshot_caches(&self) -> &crate::analyzer::AnalyzerSnapshotCaches {
+        self.snapshot_caches
+            .semantic_models()
+            .bind_inventory_store(self.analyzer_store());
         &self.snapshot_caches
     }
 
@@ -9714,6 +9717,23 @@ where
                 }
             },
         );
+        if self.adapter.language() == Language::Rust {
+            // Re-persisting a blob withdraws every Rust summary version that
+            // lists it (`WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL`). A warm start
+            // runs no other reconcile, and the Rust route readers answer only
+            // from live summary rows, so derive those units again here.
+            let (snapshots, _) = self.capture_relational_workspace_snapshots();
+            if let Some(snapshot) = snapshots.get("rust")
+                && let Err(error) = self
+                    .store_context
+                    .store
+                    .reconcile_rust_crates_unless_current(snapshot)
+            {
+                self.record_store_error(
+                    error.context("re-deriving Rust summaries after a live blob repair"),
+                );
+            }
+        }
     }
 
     /// The analyzer store, for a language module that answers a question from
@@ -17138,6 +17158,9 @@ where
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
+        self.snapshot_caches()
+            .semantic_models()
+            .bind_inventory_store(self.analyzer_store());
         Some(self.snapshot_caches())
     }
 

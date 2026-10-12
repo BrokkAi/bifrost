@@ -126,6 +126,7 @@ fn go_test_type(id: &str, name: &str, kind: TypeKind, symbol: &str) -> TypeFact 
         type_parameter_constraints: Vec::new(),
         underlying_type: None,
         value_semantics: None,
+        jvm_inventory: None,
         ambient_use: None,
         embedded_types: Vec::new(),
         hierarchy: Vec::new(),
@@ -1590,6 +1591,7 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
     };
     relations.clear();
     types.push(TypeFact {
+        jvm_inventory: None,
         ambient_use: None,
         id: "type.java.lang.string".to_owned(),
         name: "java.lang.String".to_owned(),

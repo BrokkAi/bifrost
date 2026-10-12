@@ -90,7 +90,8 @@ pub(crate) use rust_privacy::{
     read_selected_rust_declaration_authority_with_cancellation,
 };
 pub(crate) use rust_reverse::{
-    SelectedRustReverseBatchOutcome, SelectedRustReverseQueries, SelectedRustTargetReferences,
+    ReferenceOmission, ReferenceResolution, SelectedRustReverseBatchOutcome,
+    SelectedRustReverseQueries, SelectedRustTargetReferences,
 };
 
 use std::cell::{OnceCell, RefCell};
@@ -1122,7 +1123,27 @@ impl<'store> ReadySelectedResolution<'store, '_> {
     }
 
     pub(super) fn typed_source(&self) -> SelectedResolutionTypedSource<'_, 'store> {
+        let mut providers = self
+            .analyzer
+            .map(crate::analyzer::languages::selected_external_inventory_providers)
+            .unwrap_or_default();
+        if let Some(snapshot) = self
+            .analyzer
+            .and_then(|analyzer| analyzer.active_semantic_model_snapshot())
+        {
+            providers.extend(
+                snapshot
+                    .active_models()
+                    .shards()
+                    .iter()
+                    .map(|shard| shard.manifest.semantic_sha256.clone()),
+            );
+        }
+        providers.sort_unstable();
+        providers.dedup();
         SelectedResolutionTypedSource::new_on_demand(&self.inventory)
+            .with_context_identities(self.context_identities.clone())
+            .with_external_providers(providers)
     }
 
     /// Read route-prefix spellings from the selected ordinary or stage source.
@@ -3397,9 +3418,6 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             }
             let mut occurrence_start_lines = None;
             for input in inputs {
-                if input.native_frontier.is_none() {
-                    continue;
-                }
                 let invocation = connection
                     .prepare_cached(MACRO_INVOCATION_START_AND_NAME_SQL)?
                     .query_row(
@@ -3452,6 +3470,26 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                     .inventory
                     .persisted_mount_record(mount.ordinal())?
                     .expect("selected macro host has an inventory record");
+                // Name binding is independent of argument matching and
+                // expansion replay. Only those later operations need a
+                // native frontier.
+                if input.native_frontier.is_none() {
+                    if stage
+                        .admit_macro_head_pair(
+                            &host,
+                            head,
+                            seed.node(),
+                            &definition_host,
+                            definition,
+                            definition_node,
+                            cancellation,
+                        )?
+                        .is_none()
+                    {
+                        return Ok(SelectedResolutionStageOutcome::Cancelled);
+                    }
+                    continue;
+                }
                 // The macro name binds independently of argument matching.
                 let Some(Ok(arm)) = self.match_selected_textual_macro(
                     caller,
@@ -4501,74 +4539,13 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             return Ok(RustSelectedBuildOutcome::Stopped);
         }
         let caller = crate::path_utils::normalize_pattern(&caller.to_string_lossy());
-        let sql = "WITH candidates(rel_path, declaration_id, local_extent, is_glob) AS (
-            SELECT DISTINCT target_source.rel_path, bridge.declaration_id,
-                   COALESCE(source.local_end-source.local_start, 9223372036854775807), 0
-            FROM rust_crate_container_sources AS owner
-            CROSS JOIN selected_rust_crates AS selected
-              ON selected.topology_id=owner.topology_id
-            CROSS JOIN rust_crate_imports AS import
-              ON import.topology_id=owner.topology_id
-             AND import.module_path=owner.container_path
-             AND import.blob_id=owner.blob_id
-            CROSS JOIN source_rust_import_targets AS source
-              ON source.blob_id=import.blob_id
-             AND source.ordinal=import.import_ordinal
-             AND source.native_scope=import.binder_scope
-            CROSS JOIN selected_rust_crates AS target
-              ON target.crate_key=import.target_crate_key
-            CROSS JOIN rust_crate_exports AS export
-              ON export.topology_id=target.topology_id
-             AND export.module_path=import.target_module_path
-             AND export.namespace='macro'
-             AND export.name=import.target_name
-            CROSS JOIN source_native_declaration_bridges AS bridge
-              ON bridge.blob_id=export.declaration_blob_id
-             AND bridge.source_site=export.declaration_site
-            CROSS JOIN rust_crate_container_sources AS target_source
-              ON target_source.topology_id=export.topology_id
-             AND target_source.blob_id=export.declaration_blob_id
-            WHERE owner.rel_path=?1 AND import.namespace='macro'
-              AND import.bound_name=?3
-              AND source.owner_start<=?2 AND ?2<source.owner_end
-              AND (source.local_start IS NULL
-                   OR (source.local_start<=?2 AND ?2<source.local_end))
-            UNION ALL
-            SELECT DISTINCT target_source.rel_path, bridge.declaration_id,
-                   COALESCE(source.local_end-source.local_start, 9223372036854775807), 1
-            FROM rust_crate_container_sources AS owner
-            CROSS JOIN selected_rust_crates AS selected
-              ON selected.topology_id=owner.topology_id
-            CROSS JOIN rust_crate_glob_imports AS import
-              ON import.topology_id=owner.topology_id
-             AND import.module_path=owner.container_path
-             AND import.blob_id=owner.blob_id
-            CROSS JOIN source_rust_import_targets AS source
-              ON source.blob_id=import.blob_id
-             AND source.ordinal=import.import_ordinal
-             AND source.native_scope=import.binder_scope
-            CROSS JOIN selected_rust_crates AS target
-              ON target.crate_key=import.target_crate_key
-            CROSS JOIN rust_crate_exports AS export
-              ON export.topology_id=target.topology_id
-             AND export.module_path=import.target_module_path
-             AND export.namespace='macro' AND export.name=?3
-            CROSS JOIN source_native_declaration_bridges AS bridge
-              ON bridge.blob_id=export.declaration_blob_id
-             AND bridge.source_site=export.declaration_site
-            CROSS JOIN rust_crate_container_sources AS target_source
-              ON target_source.topology_id=export.topology_id
-             AND target_source.blob_id=export.declaration_blob_id
-            WHERE owner.rel_path=?1
-              AND source.owner_start<=?2 AND ?2<source.owner_end
-              AND (source.local_start IS NULL
-                   OR (source.local_start<=?2 AND ?2<source.local_end))
-        )
-        SELECT rel_path, declaration_id, local_extent, is_glob
-        FROM candidates ORDER BY local_extent, is_glob, rel_path, declaration_id";
         let mut nearest = None;
         let mut selected = BTreeSet::new();
-        let mut statement = self.ready.inventory.connection().prepare_cached(sql)?;
+        let mut statement = self
+            .ready
+            .inventory
+            .connection()
+            .prepare_cached(rust_crate_context::SELECT_IMPORTED_MACRO_DEFINITION)?;
         for row in statement.query_map(rusqlite::params![caller, position, name], |row| {
             Ok((
                 PathBuf::from(row.get::<_, String>(0)?),
@@ -5717,31 +5694,10 @@ fn boundary_import_names(
         let (Some(ordinal), Some(key)) = (semantic.ordinal(), semantic.local_key()) else {
             continue;
         };
-        let mut statement = ready.inventory.connection().prepare_cached(
-            "SELECT DISTINCT json((SELECT json_group_array(segment) FROM (
-                 SELECT segment FROM source_rust_import_module_segments
-                 WHERE blob_id=import.blob_id AND import_ordinal=import.ordinal ORDER BY ordinal
-             ))), import.imported_name
-             FROM temp.selected_resolution_mounts AS mount
-             CROSS JOIN resolution_paths AS binding ON binding.blob_id=mount.blob_id
-              AND binding.end_node=-1 AND binding.start_node<>-1 AND binding.end_open_tail=1
-              AND json_extract(binding.end_fixed_key,'$[#-2][0]')=?2
-             CROSS JOIN resolution_identities AS identity ON identity.id=binding.root_terminal
-             CROSS JOIN resolution_node_catalog AS scope
-              ON scope.blob_id=binding.blob_id AND scope.local_key=binding.start_node
-             CROSS JOIN source_rust_import_targets AS import
-              ON import.blob_id=scope.blob_id AND import.native_scope=scope.source_scope
-              AND import.bound_name=identity.spelling AND import.is_glob=0
-             CROSS JOIN rust_crate_container_sources AS placement
-              ON placement.blob_id=import.blob_id AND placement.rel_path=mount.persisted_relative_path
-             CROSS JOIN selected_rust_crates AS owner ON owner.topology_id=placement.topology_id
-             CROSS JOIN rust_crate_gaps AS gap ON gap.topology_id=owner.topology_id
-              AND gap.gap_kind='external_dependency'
-              AND gap.subject=placement.container_path || '::' || import.bound_name
-             CROSS JOIN json_each(gap.detail, '$.evidence') AS evidence
-              ON evidence.value ->> 'import_ordinal'=import.ordinal
-             WHERE mount.mount_ordinal=?1 AND import.imported_name IS NOT NULL",
-        )?;
+        let mut statement = ready
+            .inventory
+            .connection()
+            .prepare_cached(rust_crate_context::BOUNDARY_IMPORT_NAMES)?;
         for row in statement.query_map(rusqlite::params![ordinal, key], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })? {
@@ -6311,7 +6267,7 @@ fn rust_reference_workspace_crate(
     Ok(ready
         .inventory
         .connection()
-        .prepare_cached(rust_crate_rows::REFERENCE_NAMES_WORKSPACE_CRATE)?
+        .prepare_cached(rust_crate_rows::REFERENCE_NAMES_WORKSPACE_CRATE.as_str())?
         .query_row(rusqlite::params![mount.get(), key, name], |row| row.get(0))
         .optional()?)
 }
@@ -6708,6 +6664,7 @@ fn rust_macro_use_binding_targets(
         return Ok(Vec::new());
     };
     let rows = rust_crate_rows::RustCrateRows { ready };
+    let connection = ready.inventory.connection();
     let mut targets = Vec::new();
     for module in rows.modules_for_mount(mounts, mount, &[], cancellation)? {
         if cancellation.is_cancelled() {
@@ -6727,6 +6684,39 @@ fn rust_macro_use_binding_targets(
             let rust_crate_rows::RustCrateDeclaration::Site(site) = export.declaration else {
                 unreachable!("a macro export is a persisted declaration: {export:?}");
             };
+            // The crate rows answer with the declaration a path reaches at
+            // the crate root, so this fallback admits only names the crate
+            // root really exports by path. A `macro_rules!` is textually
+            // scoped: its site's own namespace is the macro namespace, and
+            // only `#[macro_export]` moves it to the crate root. Without that
+            // attribute the source-order walk owns the name (#4925). A
+            // procedural macro is an ordinary function promoted into the
+            // macro namespace (`#[proc_macro]`, `#[proc_macro_attribute]`),
+            // so its site's own namespace is the value namespace and a facade
+            // glob re-export such as `pub use rocket_codegen::*;` carries it
+            // to the `#[macro_use] extern crate` binding this fallback asks
+            // for (#3072).
+            let exported_by_path = connection
+                .prepare_cached(
+                    r#"SELECT COALESCE(properties.macro_exported=1 OR sites.namespace<>'macro',0)
+                       FROM resolution_rust_declaration_authorities AS authority
+                       CROSS JOIN source_rust_declaration_properties AS properties
+                         ON properties.blob_id=authority.blob_id
+                        AND properties.declaration_id=authority.declaration
+                       CROSS JOIN resolution_semantic_sites AS sites
+                         ON sites.blob_id=authority.blob_id
+                        AND sites.semantic_key=authority.semantic_key
+                        AND sites.semantic_role='definition'
+                       WHERE authority.blob_id=?1 AND authority.source_site=?2"#,
+                )?
+                .query_row(rusqlite::params![export.blob, site], |row| {
+                    row.get::<_, bool>(0)
+                })
+                .optional()?
+                .unwrap_or(false);
+            if !exported_by_path {
+                continue;
+            }
             targets.push(crate::analyzer::resolution::mounted_site_semantic(
                 mounts.mount_by_ordinal(export.mount)?.fragment(),
                 ResolutionSiteId::new(site),
@@ -10549,7 +10539,38 @@ pub(super) fn rust_crate_point_sql_pins() -> Vec<(&'static str, &'static str, us
     rust_crate_context::sql_pins()
         .into_iter()
         .chain(rust_demand::rows::sql_pins())
+        .chain([
+            (
+                "rust_point_unresolved_trait_impl_files",
+                super::RUST_UNRESOLVED_TRAIT_IMPL_FILES_SQL,
+                1,
+            ),
+            (
+                "rust_point_item_macro_decisions",
+                super::RUST_ITEM_MACRO_DECISIONS_SQL,
+                2,
+            ),
+            (
+                "rust_point_selected_macro_item_unit",
+                super::selected_macro_item_unit_sql_for_plan(),
+                4,
+            ),
+            (
+                "rust_point_summary_importing_files",
+                super::rust_unit_summaries::IMPORTING_FILES_FOR_MEMBER_SQL,
+                2,
+            ),
+        ])
         .collect()
 }
 
-pub(super) const RUST_GRAPH_DEFINITIONS_SQL: &str = "SELECT DISTINCT mount.mount_ordinal, site.semantic_key FROM selected_rust_crate_containers AS member CROSS JOIN temp.selected_resolution_mounts AS mount ON mount.blob_id=member.blob_id AND mount.persisted_relative_path=member.rel_path AND mount.storage_language='rust' CROSS JOIN resolution_semantic_sites AS site ON site.blob_id=member.blob_id AND site.semantic_role='definition' CROSS JOIN resolution_definition_unit_crosswalks AS unit ON unit.blob_id=site.blob_id AND unit.definition_semantic_key=site.semantic_key";
+pub(super) const RUST_GRAPH_DEFINITIONS_SQL: &str =
+    "SELECT DISTINCT mount.mount_ordinal, site.semantic_key
+ FROM selected_rust_unit_members AS member
+ CROSS JOIN temp.selected_resolution_mounts AS mount
+  ON mount.blob_id=member.blob_id
+ AND mount.persisted_relative_path=member.rel_path AND mount.storage_language='rust'
+ CROSS JOIN main.resolution_semantic_sites AS site
+  ON site.blob_id=member.blob_id AND site.semantic_role='definition'
+ CROSS JOIN main.resolution_definition_unit_crosswalks AS unit
+  ON unit.blob_id=site.blob_id AND unit.definition_semantic_key=site.semantic_key";

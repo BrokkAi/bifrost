@@ -19,7 +19,9 @@ use crate::taint::{
     TaintAnalysisPlan, TaintFact, TaintFinding, TaintFindingReport, TaintOriginFindingEvidence,
     TaintOriginStatus, TaintSummaryResult,
 };
-use crate::value_flow::{AuthoredArmClosure, DurableProcedureKey, ValueFlowSinkId};
+use crate::value_flow::{
+    AuthoredArmClosure, DurableCallSiteKey, DurableProcedureKey, ValueFlowSinkId,
+};
 
 use super::graph::{ComposedSourceId, Endpoint, Hop, HopQuality};
 use super::labels::LabeledPath;
@@ -40,7 +42,7 @@ pub(super) fn build_report<Provider: CompositionProvider>(
     outcome: &SearchOutcome,
     labeled: Vec<LabeledPath>,
     request: &mut SemanticRequest<'_>,
-) -> Result<TaintFindingReport, ComposeError> {
+) -> Result<(TaintFindingReport, Vec<Incompleteness>), ComposeError> {
     let termination = termination(budget, &outcome.incomplete);
     let complete = outcome.incomplete.is_empty() && outcome.sanitizers_resolved;
     // A composition that rests on an authored external summary is not
@@ -73,6 +75,7 @@ pub(super) fn build_report<Provider: CompositionProvider>(
     }
     by_sink.sort_by_key(|(sink, _)| *sink);
     let mut findings = Vec::new();
+    let mut finding_incompleteness = Vec::new();
     for (sink, paths) in by_sink {
         let mut classes = plan.universe().empty_set();
         let mut qualities = PathQualityFrontier::default();
@@ -140,6 +143,24 @@ pub(super) fn build_report<Provider: CompositionProvider>(
                 .iter()
                 .all(TaintOriginFindingEvidence::has_accepted_path);
         let finding_complete = (derived_complete && qualities.has_complete_path()) || accepted;
+        if !finding_complete {
+            for path in &paths {
+                for call in path_calls(plan, path)? {
+                    if let Some(model) = provider.model(&call)
+                        && (model.authored.is_some() || !model.quality().complete)
+                    {
+                        let cause = Incompleteness::Dispatch {
+                            call,
+                            reason: "reported path crosses an authored or partial external model"
+                                .into(),
+                        };
+                        if !finding_incompleteness.contains(&cause) {
+                            finding_incompleteness.push(cause);
+                        }
+                    }
+                }
+            }
+        }
         findings.push(
             TaintFinding::composed(
                 plan,
@@ -160,18 +181,17 @@ pub(super) fn build_report<Provider: CompositionProvider>(
         derived_complete,
         authored,
     );
-    Ok(TaintFindingReport::composed(result, findings))
+    Ok((
+        TaintFindingReport::composed(result, findings),
+        finding_incompleteness,
+    ))
 }
 
-/// The authored closures one path depends on: those of every model it
-/// takes, of every call its stored and interior flows cross, and of the
-/// sink's own call, as the ICFG engine's `witness_arm_closures` reads them
-/// from a witness's call steps.
-fn path_closures<Provider: CompositionProvider>(
+/// Calls crossed by the path, including its sink's dispatch obligation.
+fn path_calls(
     plan: &TaintAnalysisPlan,
-    provider: &Provider,
     path: &LabeledPath,
-) -> Result<Vec<AuthoredArmClosure>, ComposeError> {
+) -> Result<Vec<DurableCallSiteKey>, ComposeError> {
     let sink = plan
         .value_flow()
         .sink(path.sink)
@@ -179,7 +199,7 @@ fn path_closures<Provider: CompositionProvider>(
     let sink_call = invoked_call_at(sink.point())
         .map_err(provider_error)?
         .map(|call| (sink.point().procedure().durable_key(), call));
-    let calls = path
+    Ok(path
         .hops
         .iter()
         .flat_map(|hop| match hop {
@@ -195,7 +215,20 @@ fn path_closures<Provider: CompositionProvider>(
                 .collect(),
             _ => Vec::new(),
         })
-        .chain(sink_call);
+        .chain(sink_call)
+        .collect())
+}
+
+/// The authored closures one path depends on: those of every model it
+/// takes, of every call its stored and interior flows cross, and of the
+/// sink's own call, as the ICFG engine's `witness_arm_closures` reads them
+/// from a witness's call steps.
+fn path_closures<Provider: CompositionProvider>(
+    plan: &TaintAnalysisPlan,
+    provider: &Provider,
+    path: &LabeledPath,
+) -> Result<Vec<AuthoredArmClosure>, ComposeError> {
+    let calls = path_calls(plan, path)?;
     let mut closures = Vec::new();
     for call in calls {
         let authored = provider.model(&call).and_then(|model| model.authored);

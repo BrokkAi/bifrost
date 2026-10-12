@@ -23,6 +23,557 @@ fn parse_ok(json: Value) -> CodeQuery {
     parse(json).expect("query should parse")
 }
 
+fn typed_query(source: CodeQueryPlanSource, steps: Vec<QueryStep>) -> CodeQuery {
+    CodeQuery {
+        schema_version: SCHEMA_VERSION,
+        plan: CodeQueryPlan { source, steps },
+        limit: DEFAULT_LIMIT,
+        result_detail: CodeQueryResultDetail::Compact,
+        execution_mode: CodeQueryExecutionMode::Results,
+    }
+}
+
+fn match_source(languages: Vec<Language>) -> CodeQueryPlanSource {
+    CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
+        languages,
+        root: Pattern {
+            kinds: vec![NormalizedKind::Call],
+            ..Pattern::default()
+        },
+        where_globs: QueryPathScope::default(),
+        inside: None,
+        inside_decl: None,
+        not_inside: None,
+    }))
+}
+
+fn configuration_plan() -> CodeQueryPlan {
+    CodeQueryPlan {
+        source: CodeQueryPlanSource::ConfigurationFacts(Box::default()),
+        steps: Vec::new(),
+    }
+}
+
+fn dependency_evidence_plan() -> CodeQueryPlan {
+    CodeQueryPlan {
+        source: CodeQueryPlanSource::DependencyEvidence(Box::new(DependencyEvidenceSeed {
+            where_globs: QueryPathScope::default(),
+            filter: DependencyEvidenceFilter::default(),
+        })),
+        steps: Vec::new(),
+    }
+}
+
+#[test]
+fn static_dependencies_walk_all_typed_sources_and_steps_in_stable_order() {
+    let nested = CodeQueryPlanSource::Set {
+        op: SetOperator::Intersect,
+        branches: vec![
+            CodeQueryPlan {
+                source: CodeQueryPlanSource::Occurrences(Box::new(OccurrenceSeed {
+                    languages: vec![Language::Rust],
+                    ..OccurrenceSeed::default()
+                })),
+                steps: vec![
+                    QueryStep::ImportsOf,
+                    QueryStep::ImportersOf,
+                    QueryStep::ImportsOf,
+                ],
+            },
+            CodeQueryPlan {
+                source: CodeQueryPlanSource::Scopes(Box::default()),
+                steps: vec![QueryStep::Owner],
+            },
+        ],
+    };
+    let nested_sources = CodeQueryPlanSource::Set {
+        op: SetOperator::Except,
+        branches: vec![
+            CodeQueryPlan {
+                source: CodeQueryPlanSource::Bindings(Box::new(BindingSeed {
+                    languages: vec![Language::Python],
+                    ..BindingSeed::default()
+                })),
+                steps: vec![QueryStep::Members],
+            },
+            CodeQueryPlan {
+                source: CodeQueryPlanSource::Paths(Box::new(PathSeed {
+                    languages: vec![Language::Python],
+                    ..PathSeed::default()
+                })),
+                steps: vec![QueryStep::Members, QueryStep::FileOf],
+            },
+            CodeQueryPlan {
+                source: CodeQueryPlanSource::GenerationSites(Box::new(GenerationSiteSeed {
+                    languages: vec![Language::Java],
+                    ..GenerationSiteSeed::default()
+                })),
+                steps: vec![QueryStep::Members],
+            },
+            CodeQueryPlan {
+                source: CodeQueryPlanSource::Exports(Box::new(ExportSeed {
+                    languages: vec![Language::Java],
+                    ..ExportSeed::default()
+                })),
+                steps: vec![QueryStep::Members],
+            },
+            CodeQueryPlan {
+                source: CodeQueryPlanSource::ConfigurationFacts(Box::default()),
+                steps: vec![QueryStep::Members],
+            },
+            dependency_evidence_plan(),
+        ],
+    };
+    let query = typed_query(
+        CodeQueryPlanSource::Set {
+            op: SetOperator::Union,
+            branches: vec![
+                CodeQueryPlan {
+                    source: match_source(vec![Language::TypeScript, Language::Rust]),
+                    steps: vec![QueryStep::FileOf, QueryStep::Members, QueryStep::FileOf],
+                },
+                CodeQueryPlan {
+                    source: nested,
+                    steps: vec![QueryStep::Owner],
+                },
+                CodeQueryPlan {
+                    source: nested_sources,
+                    steps: vec![QueryStep::Owner],
+                },
+            ],
+        },
+        vec![QueryStep::FileOf],
+    );
+
+    let dependencies = query.static_dependencies();
+    assert_eq!(dependencies.schema_version, SCHEMA_VERSION);
+    assert_eq!(
+        dependencies.may_use_semantic_packs,
+        query.may_use_semantic_packs()
+    );
+    assert_eq!(
+        dependencies.source_operations,
+        vec![
+            QuerySourceOperation::Match,
+            QuerySourceOperation::Occurrences,
+            QuerySourceOperation::Scopes,
+            QuerySourceOperation::Bindings,
+            QuerySourceOperation::Paths,
+            QuerySourceOperation::GenerationSites,
+            QuerySourceOperation::Exports,
+            QuerySourceOperation::ConfigurationFacts,
+            QuerySourceOperation::DependencyEvidence,
+        ]
+    );
+    assert_eq!(
+        dependencies.step_operations,
+        vec![
+            QueryStepOp::FileOf,
+            QueryStepOp::Members,
+            QueryStepOp::Owner,
+            QueryStepOp::ImportsOf,
+            QueryStepOp::ImportersOf,
+        ]
+    );
+    assert_eq!(
+        dependencies.language_scopes,
+        Some(vec![
+            vec![Language::TypeScript, Language::Rust],
+            vec![Language::Rust],
+            vec![],
+            vec![Language::Python],
+            vec![Language::Java],
+        ])
+    );
+}
+
+#[test]
+fn static_dependencies_walk_nested_correlations_without_inventing_language_scopes() {
+    let nested_correlation = CodeQueryPlanSource::Correlate(Box::new(CrossDomainCorrelation {
+        relation: CrossDomainRelation::ConfigurationKey(ConfigurationKeyRelation {
+            documents: vec!["config/application.properties".to_owned()],
+        }),
+        code: CodeQueryPlan {
+            source: CodeQueryPlanSource::RequireBoth(Box::new(CrossDomainRequirement {
+                code: CodeQueryPlan {
+                    source: CodeQueryPlanSource::Correlate(Box::new(CrossDomainCorrelation {
+                        relation: CrossDomainRelation::ConfigurationKey(ConfigurationKeyRelation {
+                            documents: vec!["config/nested.properties".to_owned()],
+                        }),
+                        code: CodeQueryPlan {
+                            source: match_source(vec![Language::Rust]),
+                            steps: Vec::new(),
+                        },
+                        configuration: configuration_plan(),
+                    })),
+                    steps: vec![QueryStep::Owner],
+                },
+                configuration: dependency_evidence_plan(),
+            })),
+            steps: vec![QueryStep::FileOf],
+        },
+        configuration: configuration_plan(),
+    }));
+
+    let dependencies =
+        typed_query(nested_correlation, vec![QueryStep::Members]).static_dependencies();
+    assert_eq!(
+        dependencies.source_operations,
+        vec![
+            QuerySourceOperation::Match,
+            QuerySourceOperation::ConfigurationFacts,
+            QuerySourceOperation::DependencyEvidence,
+        ]
+    );
+    assert_eq!(
+        dependencies.step_operations,
+        vec![
+            QueryStepOp::Members,
+            QueryStepOp::FileOf,
+            QueryStepOp::Owner
+        ]
+    );
+    assert_eq!(
+        dependencies.language_scopes,
+        Some(vec![vec![Language::Rust]])
+    );
+    assert_eq!(
+        dependencies
+            .source_scopes
+            .iter()
+            .map(|scope| (
+                scope.operation,
+                scope.plan_path.clone(),
+                scope.languages.clone()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                QuerySourceOperation::Match,
+                vec![0, 0, 0],
+                Some(vec![Language::Rust]),
+            ),
+            (
+                QuerySourceOperation::ConfigurationFacts,
+                vec![0, 0, 1],
+                None,
+            ),
+            (QuerySourceOperation::DependencyEvidence, vec![0, 1], None,),
+            (QuerySourceOperation::ConfigurationFacts, vec![1], None,),
+        ]
+    );
+}
+
+#[test]
+fn static_dependencies_preserve_distinct_source_path_scopes() {
+    let source = parse_ok(json!({
+        "languages": ["rust"],
+        "where": ["src/**"],
+        "match": { "kind": "call" }
+    }));
+    let library = parse_ok(json!({
+        "languages": ["rust"],
+        "where": ["lib/**"],
+        "match": { "kind": "call" }
+    }));
+    let source_dependencies = source.static_dependencies();
+    let library_dependencies = library.static_dependencies();
+    let source_scope = &source_dependencies.source_scopes[0];
+    let library_scope = &library_dependencies.source_scopes[0];
+
+    assert_eq!(source_scope.operation, QuerySourceOperation::Match);
+    assert_eq!(source_scope.plan_path, Vec::<usize>::new());
+    assert_eq!(source_scope.languages, Some(vec![Language::Rust]));
+    assert!(source_scope.where_globs.matches("src/main.rs"));
+    assert!(!source_scope.where_globs.matches("lib/main.rs"));
+    assert_eq!(library_scope.operation, QuerySourceOperation::Match);
+    assert_eq!(library_scope.plan_path, Vec::<usize>::new());
+    assert_eq!(library_scope.languages, Some(vec![Language::Rust]));
+    assert!(library_scope.where_globs.matches("lib/main.rs"));
+    assert!(!library_scope.where_globs.matches("src/main.rs"));
+}
+
+#[test]
+fn static_dependencies_preserve_nested_branch_paths_and_path_scopes() {
+    let query = parse_ok(json!({
+        "union": [
+            {
+                "languages": ["rust"],
+                "where": ["src/**"],
+                "match": { "kind": "call" }
+            },
+            {
+                "union": [
+                    {
+                        "languages": ["python"],
+                        "where": ["lib/**"],
+                        "match": { "kind": "call" }
+                    },
+                    {
+                        "languages": ["java"],
+                        "where": ["tests/**"],
+                        "match": { "kind": "call" }
+                    }
+                ]
+            }
+        ]
+    }));
+    let dependencies = query.static_dependencies();
+
+    assert_eq!(
+        dependencies
+            .source_scopes
+            .iter()
+            .map(|scope| (
+                scope.operation,
+                scope.plan_path.clone(),
+                scope.languages.clone()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                QuerySourceOperation::Match,
+                vec![0],
+                Some(vec![Language::Rust]),
+            ),
+            (
+                QuerySourceOperation::Match,
+                vec![1, 0],
+                Some(vec![Language::Python]),
+            ),
+            (
+                QuerySourceOperation::Match,
+                vec![1, 1],
+                Some(vec![Language::Java]),
+            ),
+        ]
+    );
+    let scopes = &dependencies.source_scopes;
+    assert!(scopes[0].where_globs.matches("src/main.rs"));
+    assert!(scopes[1].where_globs.matches("lib/main.py"));
+    assert!(scopes[2].where_globs.matches("tests/main.java"));
+    assert_eq!(
+        dependencies.composition_scopes,
+        vec![
+            QueryCompositionScope {
+                operation: QueryCompositionOperation::Set(SetOperator::Union),
+                plan_path: Vec::new(),
+            },
+            QueryCompositionScope {
+                operation: QueryCompositionOperation::Set(SetOperator::Union),
+                plan_path: vec![1],
+            },
+        ]
+    );
+    assert_eq!(
+        dependencies
+            .step_scopes
+            .iter()
+            .map(|scope| scope.plan_path.clone())
+            .collect::<Vec<_>>(),
+        vec![Vec::new(), vec![0], vec![1], vec![1, 0], vec![1, 1]]
+    );
+}
+
+#[test]
+fn static_dependencies_record_parser_compositions_and_plan_local_steps() {
+    let branches = || {
+        json!([
+            {
+                "match": { "kind": "class", "name": "Legacy" },
+                "steps": [{ "op": "enclosing_decl" }]
+            },
+            {
+                "match": { "kind": "class", "name": "Replacement" },
+                "steps": [{ "op": "enclosing_decl" }]
+            }
+        ])
+    };
+    let union = parse_ok(json!({
+        "union": branches(),
+        "steps": [{ "op": "file_of" }]
+    }));
+    let intersect = parse_ok(json!({
+        "intersect": branches(),
+        "steps": [{ "op": "file_of" }]
+    }));
+    let except = parse_ok(json!({
+        "except": branches(),
+        "steps": [{ "op": "file_of" }]
+    }));
+
+    let assert_set = |query: CodeQuery, operator: SetOperator| {
+        let dependencies = query.static_dependencies();
+        assert_eq!(
+            dependencies.composition_scopes,
+            vec![QueryCompositionScope {
+                operation: QueryCompositionOperation::Set(operator),
+                plan_path: Vec::new(),
+            }]
+        );
+        assert_eq!(
+            dependencies.step_scopes,
+            vec![
+                QueryStepScope {
+                    plan_path: Vec::new(),
+                    operations: vec![QueryStepOp::FileOf],
+                },
+                QueryStepScope {
+                    plan_path: vec![0],
+                    operations: vec![QueryStepOp::EnclosingDecl],
+                },
+                QueryStepScope {
+                    plan_path: vec![1],
+                    operations: vec![QueryStepOp::EnclosingDecl],
+                },
+            ]
+        );
+    };
+    assert_set(union, SetOperator::Union);
+    assert_set(intersect, SetOperator::Intersect);
+    assert_set(except, SetOperator::Except);
+
+    assert_eq!(
+        QueryCompositionOperation::Set(SetOperator::Union).label(),
+        "union"
+    );
+    assert_eq!(QueryCompositionOperation::Correlate.label(), "correlate");
+    assert_eq!(
+        QueryCompositionOperation::RequireBoth.label(),
+        "require_both"
+    );
+
+    let correlate = parse_ok(json!({
+        "correlate": {
+            "relation": {
+                "configuration_key": {
+                    "documents": ["config/application.properties"]
+                }
+            },
+            "code": {
+                "match": { "kind": "callable", "name": "sink" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    { "op": "call_sites_to" },
+                    { "op": "call_input", "parameter_index": 0 }
+                ]
+            },
+            "configuration": { "configuration_facts": {} }
+        }
+    }));
+    let correlation_dependencies = correlate.static_dependencies();
+    assert_eq!(
+        correlation_dependencies.composition_scopes,
+        vec![QueryCompositionScope {
+            operation: QueryCompositionOperation::Correlate,
+            plan_path: Vec::new(),
+        }]
+    );
+    assert_eq!(
+        correlation_dependencies.step_scopes,
+        vec![
+            QueryStepScope {
+                plan_path: Vec::new(),
+                operations: Vec::new(),
+            },
+            QueryStepScope {
+                plan_path: vec![0],
+                operations: vec![
+                    QueryStepOp::EnclosingDecl,
+                    QueryStepOp::CallSitesTo,
+                    QueryStepOp::CallInput,
+                ],
+            },
+            QueryStepScope {
+                plan_path: vec![1],
+                operations: Vec::new(),
+            },
+        ]
+    );
+
+    let require_both = parse_ok(json!({
+        "require_both": {
+            "code": { "match": { "kind": "class", "name": "Legacy" } },
+            "configuration": { "configuration_facts": {} }
+        }
+    }));
+    let requirement_dependencies = require_both.static_dependencies();
+    assert_eq!(
+        requirement_dependencies.composition_scopes,
+        vec![QueryCompositionScope {
+            operation: QueryCompositionOperation::RequireBoth,
+            plan_path: Vec::new(),
+        }]
+    );
+    assert_eq!(
+        requirement_dependencies
+            .step_scopes
+            .iter()
+            .map(|scope| (scope.plan_path.clone(), scope.operations.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Vec::new(), Vec::new()),
+            (vec![0], Vec::new()),
+            (vec![1], Vec::new()),
+        ]
+    );
+}
+
+#[test]
+fn static_dependencies_keep_non_program_source_paths_without_language_axes() {
+    let source_scope = parse_ok(json!({
+        "languages": ["rust"],
+        "where": ["config/**"],
+        "match": { "kind": "call" }
+    }))
+    .seed()
+    .unwrap()
+    .where_globs
+    .clone();
+    let dependency_scope = parse_ok(json!({
+        "languages": ["rust"],
+        "where": ["deps/**"],
+        "match": { "kind": "call" }
+    }))
+    .seed()
+    .unwrap()
+    .where_globs
+    .clone();
+    let query = typed_query(
+        CodeQueryPlanSource::Set {
+            op: SetOperator::Union,
+            branches: vec![
+                CodeQueryPlan {
+                    source: CodeQueryPlanSource::ConfigurationFacts(Box::new(
+                        ConfigurationFactsSeed {
+                            where_globs: source_scope.clone(),
+                            ..ConfigurationFactsSeed::default()
+                        },
+                    )),
+                    steps: Vec::new(),
+                },
+                CodeQueryPlan {
+                    source: CodeQueryPlanSource::DependencyEvidence(Box::new(
+                        DependencyEvidenceSeed {
+                            where_globs: dependency_scope.clone(),
+                            filter: DependencyEvidenceFilter::default(),
+                        },
+                    )),
+                    steps: Vec::new(),
+                },
+            ],
+        },
+        Vec::new(),
+    );
+    let dependencies = query.static_dependencies();
+
+    assert_eq!(dependencies.language_scopes, None);
+    assert_eq!(dependencies.source_scopes[0].languages, None);
+    assert_eq!(dependencies.source_scopes[1].languages, None);
+    assert_eq!(dependencies.source_scopes[0].where_globs, source_scope);
+    assert_eq!(dependencies.source_scopes[1].where_globs, dependency_scope);
+}
+
 #[test]
 fn cpp_fact_steps_round_trip_across_json_and_rql() {
     let json_query = parse_ok(json!({

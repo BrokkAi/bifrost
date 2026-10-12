@@ -467,10 +467,12 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
                         .expect("selected source half has its mount")
                         .semantic_language();
                     evidence = answer.completion().combine(&prefix_route_completion);
-                    if evidence == ResolutionCompletion::Complete {
-                        discharges = Some(
-                            DemandClosureDischarges::with_operation_local_placeholders([]),
-                        );
+                    if answer.completion() == &ResolutionCompletion::Complete {
+                        if evidence == ResolutionCompletion::Complete {
+                            discharges = Some(
+                                DemandClosureDischarges::with_operation_local_placeholders([]),
+                            );
+                        }
                     } else {
                         let Some(prefix_evidence) = self.jvm_type_prefix_evidence(
                             language,
@@ -687,7 +689,9 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
                         .filter(|bridge| {
                             matches!(
                                 bridge.source_demand().namespace(),
-                                ResolutionNamespace::Type | ResolutionNamespace::TypeOrValue
+                                ResolutionNamespace::Type
+                                    | ResolutionNamespace::TypeOrValue
+                                    | ResolutionNamespace::Value
                             )
                         })
                         .cloned()
@@ -700,7 +704,7 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
                     });
                     if !prefix_bridges.is_empty() {
                         let Some((targets, completion)) =
-                            self.jvm_root_bridge_targets(&prefix_bridges)?
+                            self.jvm_root_bridge_prefix_targets(prefix_bridges)?
                         else {
                             return Ok(LanguageClosure {
                                 completion: cancelled_completion(),
@@ -1215,6 +1219,63 @@ impl JvmDemandLanguage<'_, '_, '_> {
             )));
         }
         Ok(Some(JvmPackagePrefix::Witness(semantics)))
+    }
+
+    /// The owners an import hands to the head of a qualified name.
+    ///
+    /// A bridge under a Type or TypeOrValue demand names a type, or a term the
+    /// head's members are selected from. A bridge under a Value demand names a
+    /// term, and only a term that owns a member scope (a Scala object, package
+    /// object or companion) can own the terminal: a val's members come from
+    /// its type through the typed projection, never from the import.
+    fn jvm_root_bridge_prefix_targets(
+        &self,
+        bridges: Vec<SelectedRootBridgeDescriptor>,
+    ) -> Result<Option<(BTreeSet<SemanticId>, ResolutionCompletion)>> {
+        let (terms, types): (Vec<_>, Vec<_>) = bridges
+            .into_iter()
+            .partition(|bridge| bridge.source_demand().namespace() == ResolutionNamespace::Value);
+        let Some((mut targets, mut completion)) = self.jvm_root_bridge_targets(&types)? else {
+            return Ok(None);
+        };
+        let Some((term_targets, term_completion)) = self.jvm_root_bridge_targets(&terms)? else {
+            return Ok(None);
+        };
+        let Some(scope_owners) = self.jvm_member_scope_owners(&term_targets)? else {
+            return Ok(None);
+        };
+        if !scope_owners.is_empty() {
+            targets.extend(scope_owners);
+            completion = completion.combine(&term_completion);
+        }
+        Ok(Some((targets, completion)))
+    }
+
+    /// The definitions among `definitions` that own a persisted member scope.
+    fn jvm_member_scope_owners(
+        &self,
+        definitions: &BTreeSet<SemanticId>,
+    ) -> Result<Option<BTreeSet<SemanticId>>> {
+        let definitions = definitions.iter().copied().collect::<Vec<_>>();
+        let mut owners = BTreeSet::new();
+        for chunk in definitions.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+            let outcome = self
+                .operation
+                .ready
+                .typed_source()
+                .visit_member_scope_pages_for_definitions(
+                    TypedFactRequest::new(chunk),
+                    self.cancellation,
+                    &mut FactPageVisitor::new(&mut |page| {
+                        owners.extend(page.iter().map(|row| row.row().definition()));
+                        Ok(true)
+                    }),
+                )?;
+            if !outcome.is_exhausted() || self.cancellation.is_cancelled() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(owners))
     }
 
     fn jvm_root_bridge_targets(

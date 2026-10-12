@@ -74,6 +74,10 @@ pub struct WorkspaceSemanticOracle<'a> {
     runtime_reads: runtime_values::RuntimeReadCache,
     runtime_syntax: runtime_values::RuntimeSyntaxCache,
     runtime_write_footprints: runtime_values::WorkspaceRuntimeWriteFootprintCache,
+    // Completed incoming bindings live only as long as this query provider.
+    incoming_actuals: Arc<
+        std::sync::Mutex<crate::hash::HashMap<heap::IncomingActualKey, heap::IncomingActualSet>>,
+    >,
     limits: OracleLimits,
     hierarchy_expansion: DispatchHierarchyExpansion,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
@@ -145,6 +149,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         Self {
             workspace,
             runtime_reads: runtime_values::runtime_read_cache(),
+            incoming_actuals: Arc::default(),
             runtime_syntax: workspace
                 .analyzer()
                 .snapshot_caches()

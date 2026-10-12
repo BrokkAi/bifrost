@@ -108,6 +108,7 @@ mod selector_compiler;
 mod semantic_identity;
 mod serde_utils;
 mod source;
+mod static_dependencies;
 mod suppression;
 mod taint_compose_provider;
 mod taint_policy;
@@ -201,6 +202,7 @@ pub use resolved::*;
 pub use scope::*;
 pub use source::rqlp_source_completion_at;
 pub use source::*;
+pub use static_dependencies::*;
 pub use suppression::*;
 pub use units::*;
 // The retained plan/report pair and its phase metrics are produced by the taint

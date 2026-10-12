@@ -235,8 +235,11 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
     }
 
     fn semantics_version(&self) -> AdapterSemanticsVersion {
-        AdapterSemanticsVersion::hash_bytes("ruby-type-flow", b"ruby-type-flow-open-runtime-v6")
-            .expect("adapter name is non-empty")
+        AdapterSemanticsVersion::hash_bytes(
+            "ruby-type-flow",
+            b"ruby-type-flow-open-runtime-same-name-external-class-records-v7",
+        )
+        .expect("adapter name is non-empty")
     }
 
     fn constructed_class(

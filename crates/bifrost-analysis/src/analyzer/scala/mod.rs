@@ -1212,6 +1212,7 @@ impl ScalaAnalyzer {
             &self.external_index,
             &self.java_config,
             self.inner.project(),
+            self.inner.analyzer_store(),
         )
     }
 
@@ -2326,6 +2327,13 @@ static SCALA_USAGE_STRATEGY: ScalaUsageGraphStrategy = ScalaUsageGraphStrategy::
 pub(crate) struct ScalaSupport;
 
 impl LanguageSupport for ScalaSupport {
+    fn external_inventory_providers(
+        &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+    ) -> Vec<String> {
+        crate::analyzer::jvm::external::scala_inventory_providers(analyzer)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn native_rollout_points(
         &self,

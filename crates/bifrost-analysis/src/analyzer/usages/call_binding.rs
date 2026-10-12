@@ -302,6 +302,9 @@ pub enum CallBindingTarget {
     },
     /// The callee resolves, but nothing recorded its formal parameter list.
     FormalsUnrecorded { unit: CodeUnit },
+    /// An exact external callee resolves, but nothing recorded its formal
+    /// parameter list.
+    FormalsUnrecordedExternal,
     /// The callee reference named several declarations.
     Ambiguous,
     /// The callee lookup stayed incomplete. A single retained source candidate
@@ -440,6 +443,20 @@ pub fn call_binding_report(
         CallBindingTarget::FormalsUnrecorded { unit } => {
             return base(
                 Some(unit),
+                CallBindingCoverage::Unknown,
+                actual_count,
+                0,
+                vec![terminal_row(
+                    &site_id,
+                    outcome.range,
+                    CallBindingMapping::Incomplete,
+                    Some(CallBindingReason::FormalsUnrecorded),
+                )],
+            );
+        }
+        CallBindingTarget::FormalsUnrecordedExternal => {
+            return base(
+                None,
                 CallBindingCoverage::Unknown,
                 actual_count,
                 0,
@@ -1289,6 +1306,27 @@ mod tests {
         assert_eq!(report.coverage, CallBindingCoverage::Unknown);
         assert_eq!(report.actual_count, 1);
         assert_eq!(report.bound_count, 0);
+    }
+
+    #[test]
+    fn an_external_callee_without_recorded_formals_uses_the_existing_reason() {
+        let source = "class App { static void run() { target(1); } }";
+        let facts = java_facts(source);
+        let shape = shape_for(source, &facts, "target(1)");
+        let report = call_binding_report(
+            &file("Main.java"),
+            &shape,
+            CallBindingTarget::FormalsUnrecordedExternal,
+        );
+
+        assert!(report.target.is_none());
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].mapping, CallBindingMapping::Incomplete);
+        assert_eq!(
+            report.rows[0].reason,
+            Some(CallBindingReason::FormalsUnrecorded)
+        );
+        assert_eq!(report.coverage, CallBindingCoverage::Unknown);
     }
 
     /// A receiver row is a fact about the call that no written actual accounts

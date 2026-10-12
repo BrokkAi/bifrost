@@ -2294,7 +2294,7 @@ fn call_target_boundary_evidence(
     {
         return BoundaryStatus::ExternalIndexed;
     }
-    super::get_definition::trace::boundary_evidence(analyzer, file, resolved_target).0
+    super::get_definition::trace::call_target_boundary_evidence(analyzer, file, resolved_target).0
 }
 
 /// Resolve already-structured call reference ranges in one shared batch.

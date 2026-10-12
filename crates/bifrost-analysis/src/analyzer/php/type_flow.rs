@@ -787,8 +787,11 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
     }
 
     fn semantics_version(&self) -> AdapterSemanticsVersion {
-        AdapterSemanticsVersion::hash_bytes("php-type-flow", b"php-type-flow-v1")
-            .expect("adapter name is non-empty")
+        AdapterSemanticsVersion::hash_bytes(
+            "php-type-flow",
+            b"php-type-flow-same-name-external-class-records-v2",
+        )
+        .expect("adapter name is non-empty")
     }
 
     fn constructed_class(

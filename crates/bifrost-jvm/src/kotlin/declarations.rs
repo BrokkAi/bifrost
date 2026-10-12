@@ -872,6 +872,16 @@ pub fn kotlin_class_like_kind(node: Node<'_>) -> Option<KotlinClassLikeKind> {
     }
 }
 
+/// Whether a class declaration carries Kotlin's `data` class modifier token.
+pub fn kotlin_is_data_class(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "class_declaration"
+        && first_named_child(node, "modifiers").is_some_and(|modifiers| {
+            named_children_of(modifiers).into_iter().any(|modifier| {
+                modifier.kind() == "class_modifier" && node_text_trimmed(modifier, source) == "data"
+            })
+        })
+}
+
 /// The visibility a Kotlin declaration declares, defaulting to `public`.
 ///
 /// Kotlin has no package-private tier: an unmarked declaration is visible

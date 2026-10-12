@@ -57,7 +57,7 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v31";
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v33";
 const RUST_REPEAT_ARRAY_ELEMENT_CAP: u128 = 1024;
 /// Bound on the reference levels peeled from a method receiver while
 /// recovering the written type the call auto-derefs through. Real receiver
@@ -2948,6 +2948,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 );
             }
         }
+        if matches!(
+            classification,
+            RustOwnershipClass::AggregateCopy | RustOwnershipClass::Move
+        ) && let Some(fields) = self.declared_struct_fields(source_node)
+        {
+            // The shared oracle requires copied contents at the transfer point.
+            // Read them before a move consumes the source binding.
+            for field in fields {
+                self.append_struct_field_transfer(
+                    builder,
+                    point,
+                    source_node,
+                    source,
+                    target,
+                    field,
+                )?;
+            }
+        }
         self.append_effect(
             builder,
             point,
@@ -3194,6 +3212,83 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .get(&(name, field.into()))
             .cloned()
             .flatten()
+    }
+
+    /// The complete named field set of one unambiguous, non-generic struct
+    /// declaration in this file. Unknown layouts never become an empty set.
+    fn declared_struct_fields(&self, node: Node<'tree>) -> Option<Vec<Node<'tree>>> {
+        let RustValueShape::Struct(owner) = self.expression_shape(node)? else {
+            return None;
+        };
+        let body = self
+            .facts
+            .struct_field_lists
+            .get(&owner)
+            .copied()
+            .flatten()?;
+        Some(
+            named_children(body)
+                .into_iter()
+                .filter(|field| field.kind() == "field_declaration")
+                .map(|field| {
+                    field
+                        .child_by_field_name("name")
+                        .expect("Rust field declaration has a name")
+                })
+                .collect(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_struct_field_transfer(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        structure: Node<'tree>,
+        source: ValueId,
+        target: ValueId,
+        field: Node<'tree>,
+    ) -> Result<(), RustLoweringError> {
+        let (member, resolved, exact_member_key) = self.memory_member_locator(structure, field)?;
+        let source_location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Field {
+                base: source,
+                member: member.clone(),
+            },
+        )?;
+        let target_location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Field {
+                base: target,
+                member,
+            },
+        )?;
+        if !resolved {
+            self.add_field_identity_gap(builder, point, source_location, exact_member_key)?;
+            self.add_field_identity_gap(builder, point, target_location, exact_member_key)?;
+        }
+        let value = self.value(builder, point, SemanticValueKind::Temporary)?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Field,
+                location: source_location,
+                result: value,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::MemoryStore {
+                kind: MemoryAccessKind::Field,
+                location: target_location,
+                value,
+            },
+        )
     }
 
     /// Whether a field expression denotes no runtime memory location.
@@ -4562,15 +4657,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), RustLoweringError> {
         match node.kind() {
             "call_expression" => self.call_expression(builder, node, entry, next, scope, stack),
-            "struct_expression" => self.allocation_expression(
-                builder,
-                node,
-                AllocationKind::Object,
-                entry,
-                next,
-                scope,
-                stack,
-            ),
+            "struct_expression" => {
+                self.struct_allocation_expression(builder, node, entry, next, scope, stack)
+            }
             "array_expression" => {
                 self.array_allocation_expression(builder, node, entry, next, scope, stack)
             }
@@ -4742,11 +4831,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn allocation_expression(
+    fn struct_allocation_expression(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
-        kind: AllocationKind,
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
@@ -4755,13 +4843,92 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let terminal = self.point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
         self.session
-            .add_allocation(builder, terminal, result, kind)?;
+            .add_allocation(builder, terminal, result, AllocationKind::Object)?;
+        let body = required_field(node, "body")?;
+        let mut evaluations = Vec::new();
+        let mut initialized = HashSet::default();
+        let mut update = None;
+        for initializer in named_children(body) {
+            let (field, value) = match initializer.kind() {
+                "field_initializer" => (
+                    required_field(initializer, "field")?,
+                    required_field(initializer, "value")?,
+                ),
+                "shorthand_field_initializer" => {
+                    let field = named_children(initializer)
+                        .into_iter()
+                        .find(|child| child.kind() == "identifier")
+                        .expect("Rust shorthand initializer has a field identifier");
+                    (field, field)
+                }
+                "base_field_initializer" => {
+                    let base = first_named_child(initializer)
+                        .expect("Rust struct update has a base expression");
+                    evaluations.push(base);
+                    update = Some(base);
+                    continue;
+                }
+                _ => continue,
+            };
+            evaluations.push(value);
+            initialized.insert(
+                rust_field_member_key(self.source, field)
+                    .expect("Rust initializer has a named field key"),
+            );
+            let value = self.expression_value(builder, value, expression_value_kind(value))?;
+            let (member, resolved, exact_member_key) = self.memory_member_locator(node, field)?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Field {
+                    base: result,
+                    member,
+                },
+            )?;
+            if !resolved {
+                self.add_field_identity_gap(builder, terminal, location, exact_member_key)?;
+            }
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    value,
+                },
+            )?;
+        }
+        if let Some(base) = update {
+            if let Some(fields) = self.declared_struct_fields(node) {
+                let base_value =
+                    self.expression_value(builder, base, expression_value_kind(base))?;
+                for field in fields {
+                    if initialized.contains(
+                        &rust_field_member_key(self.source, field)
+                            .expect("declared Rust field has a named key"),
+                    ) {
+                        continue;
+                    }
+                    self.append_struct_field_transfer(
+                        builder, terminal, node, base_value, result, field,
+                    )?;
+                }
+            } else {
+                self.session.record_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::FieldMemory,
+                    SemanticGapKind::Unknown,
+                    "Rust struct update has no known declaration field set",
+                )?;
+            }
+        }
         self.session.add_target_edge(builder, terminal, next)?;
-        let children = runtime_expression_children(node);
         self.schedule_expressions(
             builder,
             entry,
-            &children,
+            &evaluations,
             EdgeTarget::normal(terminal),
             scope,
             stack,
@@ -9121,6 +9288,9 @@ struct RustFileFacts<'tree> {
     /// Every `(struct, field)` this file declares. `None` marks a pair the
     /// file states more than once, which no longer picks a declaration.
     struct_fields: HashMap<(Box<str>, Box<str>), Option<RustFieldDeclaration>>,
+    /// Unambiguous named-field struct bodies, including empty field sets.
+    /// Kept only for this file lowering; duplicate declarations retain None.
+    struct_field_lists: HashMap<Box<str>, Option<Node<'tree>>>,
     /// Structs this file declares whose values provably run no destructor:
     /// every field is a primitive or another such struct, the struct takes no
     /// type parameters, and this file states no `impl Drop` for it.
@@ -9182,6 +9352,7 @@ fn rust_file_facts_from_tree<'tree>(
     let mut non_dropping_return_functions: HashMap<Box<str>, bool> = HashMap::default();
     let mut struct_fields: HashMap<(Box<str>, Box<str>), Option<RustFieldDeclaration>> =
         HashMap::default();
+    let mut struct_field_lists = HashMap::default();
     // Every struct this file declares, with the field types it states, plus
     // the names this file declares more than once and the names it implements
     // `Drop` for. Both disqualify a struct from the plainness fixpoint below.
@@ -9226,6 +9397,15 @@ fn rust_file_facts_from_tree<'tree>(
                     .and_then(|name| node_text(source, name))
                 {
                     shadowed_type_names.insert(name.into());
+                    struct_field_lists
+                        .entry(name.into())
+                        .and_modify(|body| *body = None)
+                        .or_insert_with(|| {
+                            node.child_by_field_name("body").filter(|body| {
+                                body.kind() == "field_declaration_list"
+                                    && node.child_by_field_name("type_parameters").is_none()
+                            })
+                        });
                     let fields = node
                         .child_by_field_name("body")
                         .filter(|body| body.kind() == "field_declaration_list")
@@ -9488,6 +9668,7 @@ fn rust_file_facts_from_tree<'tree>(
         function_return_types,
         non_dropping_return_functions,
         struct_fields,
+        struct_field_lists,
         plain_structs,
         use_bindings,
         receiver_use_bindings,
@@ -10337,7 +10518,7 @@ fn rust_integer_literal_value(source: &str, node: Node<'_>) -> Option<u128> {
 /// does not need a declaration lookup or source-text search.
 fn rust_field_member_key(source: &str, field: Node<'_>) -> Option<String> {
     match field.kind() {
-        "field_identifier" => {
+        "field_identifier" | "identifier" => {
             let name = node_text(source, field)?;
             Some(format!("named:{}", name.strip_prefix("r#").unwrap_or(name)))
         }
@@ -10824,6 +11005,24 @@ mod semantic_lowering_tests {
             panic!("fixture lowering must complete");
         };
         value
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4913: unknown struct update fields were silently omitted"
+    )]
+    fn rust_struct_update_unknown_field_set_retains_gap() {
+        let procedures = lower_fixture(
+            "fn run(base: External) { let updated = External { value: 1, ..base }; }",
+        );
+        let [procedure] = procedures.as_slice() else {
+            panic!("one source procedure is expected");
+        };
+        assert!(procedure.gaps.iter().any(|gap| {
+            gap.capability == SemanticCapability::FieldMemory
+                && gap.kind == SemanticGapKind::Unknown
+                && matches!(gap.subject, SemanticGapSubject::Value(_))
+        }));
     }
 
     #[test]

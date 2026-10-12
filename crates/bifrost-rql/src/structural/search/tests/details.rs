@@ -1,4 +1,12 @@
 use super::*;
+use crate::analyzer::semantic_model::{
+    CatalogOptions, CompilerOptions, SemanticModelActivationEvidence,
+    SemanticModelActivationRequest, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
+    SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat,
+    acquire_active_semantic_models, compile_source,
+};
+use crate::cancellation::CancellationToken;
+use semver::Version;
 
 /// Parameter decorator rows keep the decorator application anchored to its
 /// parameter while resolving aliased imports structurally. A same-named
@@ -2281,6 +2289,437 @@ fn effect_row_domains_project_their_registered_surface_without_an_active_pack() 
     assert_eq!(value.derivation, "none");
     assert_eq!(value.coverage, "exhaustive");
     assert_row_projects_its_whole_registered_surface(&procedure_effects.results[0].value);
+}
+
+/// A Java effect row must retain the resolver's exact structural joins all the
+/// way through the activated public model. A workspace method with the same
+/// member spelling is a near miss, and an unresolved callee keeps procedure
+/// coverage open instead of becoming an empty-effect claim.
+#[test]
+fn java_effect_contracts_publish_structural_identity_and_typed_uncertainty() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "App.java",
+            r#"import java.io.IOException;
+import java.net.URL;
+import java.net.URLConnection;
+
+class Service {
+  static URLConnection run(URL url) throws IOException {
+    return url.openConnection();
+  }
+}
+
+class Other {
+  URLConnection openConnection() { return null; }
+}
+
+class Caller {
+  static URLConnection positive(URL url) throws IOException {
+    return Service.run(url);
+  }
+
+  static URLConnection near(Other other) {
+    return other.openConnection();
+  }
+
+  static URLConnection unknown(URL url) {
+    return MissingGateway.dispatch(url);
+  }
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+
+    let pack = compile_source(
+        SourceFormat::Json,
+        include_str!(
+            "../../../../../../semantic-packs/web-network/jvm/bifrost.web-network-jvm.json"
+        )
+        .as_bytes(),
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("public JVM web-network pack compiles: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+        .expect("ephemeral semantic-pack catalog");
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "test:public-java-network-effects".to_owned(),
+            },
+        )
+        .expect("register public JVM web-network pack");
+    let activation = acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "java".to_owned(),
+                ecosystem: "jdk".to_owned(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        },
+        &CancellationToken::default(),
+    );
+    let snapshot = match activation {
+        SemanticModelRuntimeOutcome::Ready { snapshot, .. } => snapshot,
+        other => panic!("public JVM web-network pack activates: {other:#?}"),
+    };
+    let _semantic_model_scope =
+        crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            workspace.analyzer(),
+            Some(snapshot),
+        );
+
+    let declaration_id = |class_name: &str, method_name: &str| {
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &CodeQuery::from_json(&json!({
+                "languages": ["java"],
+                "match": { "kind": "method", "name": method_name },
+                "inside_decl": { "kind": "class", "name": class_name },
+                "steps": [{ "op": "enclosing_decl" }],
+                "result_detail": "full"
+            }))
+            .expect("declaration query"),
+        );
+        let [item] = result.results.as_slice() else {
+            panic!("one {class_name}.{method_name} declaration: {result:#?}");
+        };
+        let CodeQueryResultValue::Declaration { value } = &item.value else {
+            panic!("declaration query returns a declaration row: {item:#?}");
+        };
+        value.id.clone().expect("declaration id")
+    };
+    let service_run_id = declaration_id("Service", "run");
+    let other_open_connection_id = declaration_id("Other", "openConnection");
+    let caller_positive_id = declaration_id("Caller", "positive");
+
+    let positive_dispatch = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &CodeQuery::from_json(&json!({
+            "languages": ["java"],
+            "match": { "kind": "call", "callee": { "name": "openConnection" } },
+            "inside": { "kind": "method", "name": "run" },
+            "steps": [{ "op": "dispatch_targets" }],
+            "result_detail": "full"
+        }))
+        .expect("positive dispatch-target query"),
+    );
+    assert_eq!(
+        positive_dispatch.completion(),
+        CodeQueryCompletion::Complete
+    );
+    let [positive_dispatch_item] = positive_dispatch.results.as_slice() else {
+        panic!("one modeled URL.openConnection target: {positive_dispatch:#?}");
+    };
+    let CodeQueryResultValue::DispatchTarget {
+        value: positive_target,
+    } = &positive_dispatch_item.value
+    else {
+        panic!("dispatch-target query returns a target row: {positive_dispatch_item:#?}");
+    };
+    assert_eq!(positive_target.proof, "proven");
+    // The activated summary proves the exact external URL member and can
+    // publish a complete effect transfer, while Java receiver dispatch still
+    // retains an unnamed residual for the external member family. The named
+    // arm is therefore proven but partial, with open site coverage and
+    // no exact dispatch conjunction. Query completion is a separate run-level
+    // fact and must not upgrade this arm to complete dispatch.
+    assert_eq!(positive_target.completeness, "partial");
+    assert_eq!(positive_target.coverage, "open");
+    assert_eq!(positive_target.dispatch, "may_dispatch");
+    assert_eq!(positive_target.boundary_kind, Some("external"));
+    let positive_target_id = positive_target.target_id.clone();
+
+    let positive_effects = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &CodeQuery::from_json(&json!({
+            "languages": ["java"],
+            "match": { "kind": "call", "callee": { "name": "openConnection" } },
+            "inside": { "kind": "method", "name": "run" },
+            "steps": [{ "op": "call_shape" }, { "op": "call_effects" }],
+            "result_detail": "full"
+        }))
+        .expect("positive call-effect query"),
+    );
+    assert_eq!(positive_effects.completion(), CodeQueryCompletion::Complete);
+    let positive_effect = positive_effects
+        .results
+        .iter()
+        .find_map(|item| match &item.value {
+            CodeQueryResultValue::CallEffect { value }
+                if value.effect_id.as_deref() == Some("bifrost.network_io") =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("declared URL.openConnection effect: {positive_effects:#?}"));
+    // Dispatch and call-effect site IDs are operator-scoped domains. The
+    // facts-arena AST identity is the cross-operator join key.
+    assert_eq!(
+        positive_target.site_ast_id.as_deref(),
+        Some(positive_effect.site_ast_id.as_str())
+    );
+    assert_eq!(
+        positive_effect.target_id.as_deref(),
+        Some(positive_target_id.as_str())
+    );
+    assert_eq!(positive_effect.derivation, "declared");
+    assert_eq!(positive_effect.coverage, "exhaustive");
+    assert_eq!(positive_effect.proof, Some("proven"));
+    assert_eq!(positive_effect.certainty, Some("definite"));
+    assert_eq!(positive_effect.timing, Some("immediate"));
+    assert_eq!(positive_effect.execution_timing, Some("same_invocation"));
+    assert_eq!(
+        positive_effect.pack_id.as_deref(),
+        Some("bifrost.web-network-jvm")
+    );
+    assert_eq!(
+        positive_effect.model_id.as_deref(),
+        Some("bifrost.web-network-jvm#summary.web-network.jvm.java-net-url.openconnection")
+    );
+    assert_eq!(
+        positive_effect.summary_id.as_deref(),
+        Some("summary.web-network.jvm.java-net-url.openconnection")
+    );
+    assert!(!positive_effect.terminal);
+
+    let service_call_dispatch = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &CodeQuery::from_json(&json!({
+            "languages": ["java"],
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "inside": { "kind": "method", "name": "positive" },
+            "steps": [{ "op": "dispatch_targets" }],
+            "result_detail": "full"
+        }))
+        .expect("workspace Service.run dispatch-target query"),
+    );
+    assert_eq!(
+        service_call_dispatch.completion(),
+        CodeQueryCompletion::Complete
+    );
+    let [service_call_item] = service_call_dispatch.results.as_slice() else {
+        panic!("one workspace Service.run target: {service_call_dispatch:#?}");
+    };
+    let CodeQueryResultValue::DispatchTarget {
+        value: service_call_target,
+    } = &service_call_item.value
+    else {
+        panic!("workspace dispatch query returns a target row: {service_call_item:#?}");
+    };
+    assert_eq!(
+        service_call_target
+            .target_declaration
+            .as_ref()
+            .and_then(|declaration| declaration.id.as_deref()),
+        Some(service_run_id.as_str())
+    );
+
+    let service_call_shape = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &CodeQuery::from_json(&json!({
+            "languages": ["java"],
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "inside": { "kind": "method", "name": "positive" },
+            "steps": [{ "op": "call_shape" }],
+            "result_detail": "full"
+        }))
+        .expect("Service.run call-shape query"),
+    );
+    assert_eq!(
+        service_call_shape.completion(),
+        CodeQueryCompletion::Complete
+    );
+    let [service_call_shape_item] = service_call_shape.results.as_slice() else {
+        panic!("one Service.run call-shape row: {service_call_shape:#?}");
+    };
+    let CodeQueryResultValue::CallShape {
+        value: service_call_shape_row,
+    } = &service_call_shape_item.value
+    else {
+        panic!("call-shape query returns a call-shape row: {service_call_shape_item:#?}");
+    };
+    assert_eq!(
+        service_call_target.site_ast_id.as_deref(),
+        Some(service_call_shape_row.site_ast_id.as_str())
+    );
+    let service_call_shape_site_id = service_call_shape_row.site_id.clone();
+
+    let near_dispatch = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &CodeQuery::from_json(&json!({
+            "languages": ["java"],
+            "match": { "kind": "call", "callee": { "name": "openConnection" } },
+            "inside": { "kind": "method", "name": "near" },
+            "steps": [{ "op": "dispatch_targets" }],
+            "result_detail": "full"
+        }))
+        .expect("near-miss dispatch-target query"),
+    );
+    assert_eq!(near_dispatch.completion(), CodeQueryCompletion::Complete);
+    let [near_dispatch_item] = near_dispatch.results.as_slice() else {
+        panic!("one workspace Other.openConnection target: {near_dispatch:#?}");
+    };
+    let CodeQueryResultValue::DispatchTarget { value: near_target } = &near_dispatch_item.value
+    else {
+        panic!("near-miss dispatch query returns a target row: {near_dispatch_item:#?}");
+    };
+    assert_eq!(near_target.proof, "proven");
+    assert_eq!(near_target.completeness, "complete");
+    assert_eq!(near_target.coverage, "exhaustive");
+    assert_ne!(near_target.target_id, positive_target_id);
+    assert_eq!(
+        near_target
+            .target_declaration
+            .as_ref()
+            .and_then(|declaration| declaration.id.as_deref()),
+        Some(other_open_connection_id.as_str())
+    );
+    let near_dispatch_site_ast_id = near_target
+        .site_ast_id
+        .clone()
+        .expect("near-miss dispatch has a structural AST identity");
+
+    let near_effects = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &CodeQuery::from_json(&json!({
+            "languages": ["java"],
+            "match": { "kind": "call", "callee": { "name": "openConnection" } },
+            "inside": { "kind": "method", "name": "near" },
+            "steps": [{ "op": "call_shape" }, { "op": "call_effects" }],
+            "result_detail": "full"
+        }))
+        .expect("near-miss call-effect query"),
+    );
+    assert_eq!(near_effects.completion(), CodeQueryCompletion::Complete);
+    let [near_effect_item] = near_effects.results.as_slice() else {
+        panic!("one terminal near-miss call-effect row: {near_effects:#?}");
+    };
+    let CodeQueryResultValue::CallEffect { value: near_effect } = &near_effect_item.value else {
+        panic!("near-miss query returns a call-effect row: {near_effect_item:#?}");
+    };
+    assert_eq!(near_effect.site_ast_id, near_dispatch_site_ast_id);
+    assert!(near_effect.terminal);
+    assert_eq!(near_effect.effect_id, None);
+    assert_eq!(near_effect.derivation, "none");
+    assert_eq!(near_effect.coverage, "exhaustive");
+    assert_eq!(near_effect.pack_id, None);
+    assert_eq!(near_effect.model_id, None);
+    assert_eq!(near_effect.summary_id, None);
+
+    let positive_procedure = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &CodeQuery::from_json(&json!({
+            "languages": ["java"],
+            "match": { "kind": "method", "name": "positive" },
+            "inside_decl": { "kind": "class", "name": "Caller" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "procedure_effects" }],
+            "result_detail": "full"
+        }))
+        .expect("transitive procedure-effect query"),
+    );
+    assert_eq!(
+        positive_procedure.completion(),
+        CodeQueryCompletion::Complete
+    );
+    let positive_procedure_effect = positive_procedure
+        .results
+        .iter()
+        .find_map(|item| match &item.value {
+            CodeQueryResultValue::ProcedureEffect { value }
+                if value.effect_id.as_deref() == Some("bifrost.network_io") =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("transitive network effect: {positive_procedure:#?}"));
+    assert_eq!(positive_procedure_effect.procedure_id, caller_positive_id);
+    assert_eq!(positive_procedure_effect.classification, Some("transitive"));
+    assert_eq!(positive_procedure_effect.depth, Some(2));
+    assert_eq!(positive_procedure_effect.derivation, "declared");
+    assert_eq!(positive_procedure_effect.coverage, "exhaustive");
+    assert_eq!(
+        positive_procedure_effect.witness_site_id.as_deref(),
+        Some(service_call_shape_site_id.as_str())
+    );
+    assert_eq!(
+        positive_procedure_effect.witness_effect_site_id.as_deref(),
+        Some(positive_effect.site_id.as_str())
+    );
+    assert_eq!(
+        positive_procedure_effect.pack_id.as_deref(),
+        Some("bifrost.web-network-jvm")
+    );
+    assert_eq!(
+        positive_procedure_effect.model_id.as_deref(),
+        Some("bifrost.web-network-jvm#summary.web-network.jvm.java-net-url.openconnection")
+    );
+    assert_eq!(
+        positive_procedure_effect.summary_id.as_deref(),
+        Some("summary.web-network.jvm.java-net-url.openconnection")
+    );
+    assert!(!positive_procedure_effect.terminal);
+
+    let unknown_procedure = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &CodeQuery::from_json(&json!({
+            "languages": ["java"],
+            "match": { "kind": "method", "name": "unknown" },
+            "inside_decl": { "kind": "class", "name": "Caller" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "procedure_effects" }],
+            "result_detail": "full"
+        }))
+        .expect("typed-uncertainty procedure-effect query"),
+    );
+    assert!(
+        matches!(
+            unknown_procedure.completion(),
+            CodeQueryCompletion::Incomplete { .. }
+        ),
+        "unresolved callee keeps the query incomplete: {unknown_procedure:#?}"
+    );
+    let [unknown_item] = unknown_procedure.results.as_slice() else {
+        panic!("one typed terminal uncertainty row: {unknown_procedure:#?}");
+    };
+    let CodeQueryResultValue::ProcedureEffect {
+        value: unknown_effect,
+    } = &unknown_item.value
+    else {
+        panic!("uncertainty query returns a procedure-effect row: {unknown_item:#?}");
+    };
+    assert!(unknown_effect.terminal);
+    assert_eq!(unknown_effect.effect_id, None);
+    assert_eq!(unknown_effect.derivation, "incomplete");
+    assert_eq!(unknown_effect.reason, Some("dispatch_unresolved"));
+    assert_eq!(unknown_effect.coverage, "open");
+    assert_eq!(unknown_effect.pack_id, None);
+    assert_eq!(unknown_effect.model_id, None);
+    assert_eq!(unknown_effect.summary_id, None);
 }
 
 /// A row rendered from a file that an earlier row's nested rendering probed

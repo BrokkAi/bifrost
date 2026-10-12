@@ -1891,10 +1891,11 @@ impl<'a> PolicySelectorSession<'a> {
     /// candidate caller-side receiver. Complete callable-reference evidence
     /// can prove a bound receiver or a receiverless function locally. When the
     /// syntax is deliberately ambiguous, only uninterrupted, exhaustive
-    /// dispatch may refine it. Exact Go declarations prove their receiver
-    /// shape independently of a named formal receiver binding: materialized
-    /// methods carry declaration-owned procedure kinds, while external targets
-    /// carry resolver-owned call shape. Other materialized targets still need
+    /// dispatch may refine it. Exact Go and Java declarations prove their
+    /// receiver shape independently of a named formal receiver binding:
+    /// materialized methods carry declaration-owned procedure kinds and
+    /// staticness, while external targets carry resolver-owned call shape.
+    /// Other materialized targets still need
     /// complete candidate-specific call bindings. Anything less remains
     /// indeterminate and reaches the compiler's fail-closed diagnostic.
     pub(super) fn receiver_binding_applicability(
@@ -1934,7 +1935,48 @@ impl<'a> PolicySelectorSession<'a> {
                 )
             })
         {
-            return Ok(ReceiverBindingApplicability::Applicable);
+            // A complete caller-side binding does not require a complete
+            // callee body. Java nevertheless permits a written operand on a
+            // static invocation: an exact declaration-owned receiverless
+            // contract overrides that operand, not every open body boundary.
+            let oracle = self.workspace.semantic_oracle_provider();
+            let leases = self.begin_semantic_lease_window();
+            let mut receiverless = 0;
+            for (procedure, call) in calls {
+                if procedure.artifact().key().language()
+                    != brokk_bifrost_analysis::analyzer::semantic::SemanticLanguage::Standard(
+                        brokk_bifrost_analysis::analyzer::Language::Java,
+                    )
+                {
+                    continue;
+                }
+                let outcome = self.continue_semantic_in_window(&leases, |request| {
+                    oracle.resolve_call(call, request)
+                })?;
+                self.require_uninterrupted(&outcome, "receiver-port declaration")?;
+                self.require_execution_budget("receiver-port declaration")?;
+                let receiver_shape = match &outcome {
+                    SemanticOutcome::Complete { value, .. }
+                    | SemanticOutcome::Unproven { partial: value, .. } => {
+                        value.proven_receiver_shape()
+                    }
+                    _ => None,
+                };
+                if receiver_shape == Some(false) {
+                    receiverless += 1;
+                }
+                drop(outcome);
+            }
+            return leases.finish_scalar(
+                if receiverless == calls.len() {
+                    ReceiverBindingApplicability::ExactNonMatch
+                } else if receiverless > 0 {
+                    ReceiverBindingApplicability::Inconsistent
+                } else {
+                    ReceiverBindingApplicability::Applicable
+                },
+                "receiver-port declaration",
+            );
         }
 
         if !first

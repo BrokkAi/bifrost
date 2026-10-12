@@ -58,6 +58,42 @@ fn reference_site(source: &str, spelling: &str) -> ResolvedReferenceSite {
     reference_site_from_range(source, start_byte, start_byte + spelling.len())
 }
 
+fn rust_2018_macro_reexport_project() -> (BuiltInlineTestProject, &'static str) {
+    let other = "pub fn a() -> u32 { crate::macros::m!() }\n\
+use crate::macros::m;\n\
+pub fn b() -> u32 { m!() }\n";
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"macro_reexport\"\nversion = \"0.1.0\"\nedition = \"2018\"\n",
+        )
+        .file("src/lib.rs", "mod macros;\nmod other;\n")
+        .file(
+            "src/macros.rs",
+            "macro_rules! m { () => { 1u32 }; }\npub(crate) use m;\n",
+        )
+        .file("src/other.rs", other)
+        .build();
+    (fixture, other)
+}
+
+fn rust_2018_reexport_site(source: &str, start: usize) -> ResolvedReferenceSite {
+    let start_line = source[..start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    crate::test_support::resolved_reference_site(
+        "src/other.rs".to_owned(),
+        "m".to_owned(),
+        Range {
+            start_byte: start,
+            end_byte: start + 1,
+            start_line,
+            end_line: start_line,
+        },
+    )
+}
+
 fn run_definition(
     source: &str,
     spelling: &str,
@@ -225,6 +261,163 @@ fn native_textual_macro_is_not_reopened_by_an_unindexed_glob() {
         outcome.definitions[0].short_name(),
         "textual_macro",
         "{outcome:#?}"
+    );
+}
+
+#[test]
+#[hardwon("#4925: macro head binding ignored textual scope without an expansion frontier")]
+fn native_macro_heads_follow_textual_scope_and_import_authority() {
+    let lib = "mod before;\n\
+macro_rules! shadowed { () => { 1 }; }\n\
+fn between() { shadowed!(); }\n\
+macro_rules! shadowed { () => { 2 }; }\n\
+mod after;\n\
+mod inline { pub fn use_parent() { shadowed!(); } }\n\
+#[macro_export]\nmacro_rules! exported { () => {}; }\n\
+#[macro_use]\nmod imported;\n\
+pub mod local_shadow {\n\
+    use crate::exported as selected;\n\
+    macro_rules! selected { () => {}; }\n\
+    pub fn call() { selected!(); imported!(); }\n\
+}\n\
+pub mod external { pub fn call() { exported!(); } }\n";
+    let lib = format!("{lib}\npub fn use_imported() {{ imported!(); }}\n");
+    let before = "pub fn call() { shadowed!(); }\n";
+    let after = "pub fn call() { shadowed!(); }\n";
+    let imported = "pub fn call() { imported!(); }\nmacro_rules! imported { () => {}; }\n";
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"macro_scope\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .file("src/lib.rs", &lib)
+        .file("src/before.rs", before)
+        .file("src/after.rs", after)
+        .file("src/imported.rs", imported)
+        .build();
+    let analyzer = RustAnalyzer::new(fixture.project_dyn());
+
+    let answer = |path: &str, source: &str, spelling: &str| {
+        let start = source
+            .rfind(spelling)
+            .unwrap_or_else(|| panic!("{spelling:?} is absent in {path}"));
+        let site = reference_site_from_range(source, start, start + spelling.len());
+        resolve_point_answers(&analyzer, &fixture.file(path), &site)
+            .into_iter()
+            .next()
+            .expect("macro reference has one selected answer")
+    };
+    let before_answer = answer("src/before.rs", before, "shadowed");
+    assert!(
+        before_answer.definitions.is_empty(),
+        "{:?}",
+        before_answer.definitions
+    );
+    assert_eq!(
+        before_answer.resolution.completion(),
+        &ResolutionCompletion::Complete
+    );
+    let between_start = lib.find("fn between() { ").unwrap() + "fn between() { ".len();
+    let between_site = reference_site_from_range(&lib, between_start, between_start + 8);
+    let between_answer =
+        resolve_point_answers(&analyzer, &fixture.file("src/lib.rs"), &between_site)
+            .into_iter()
+            .next()
+            .expect("between macro reference has one selected answer");
+    let after_answer = answer("src/after.rs", after, "shadowed");
+    let inline_source_start = lib.find("mod inline").unwrap();
+    let inline_source = &lib[inline_source_start..];
+    let inline_start = inline_source.find("shadowed!").unwrap();
+    let inline_site = reference_site_from_range(
+        &lib,
+        lib.find("mod inline").unwrap() + inline_start,
+        lib.find("mod inline").unwrap() + inline_start + "shadowed".len(),
+    );
+    let inline_answer = resolve_point_answers(&analyzer, &fixture.file("src/lib.rs"), &inline_site)
+        .into_iter()
+        .next()
+        .expect("inline macro reference has one selected answer");
+    assert_eq!(between_answer.resolution.binding().targets().len(), 1);
+    assert_eq!(after_answer.resolution.binding().targets().len(), 1);
+    assert_eq!(inline_answer.resolution.binding().targets().len(), 1);
+    assert_ne!(
+        between_answer.resolution.binding().targets(),
+        after_answer.resolution.binding().targets(),
+        "later textual definition has a distinct canonical site"
+    );
+    assert_eq!(
+        after_answer.resolution.binding().targets(),
+        inline_answer.resolution.binding().targets(),
+        "inline module inherits the latest visible textual macro"
+    );
+
+    let imported_answer = answer("src/lib.rs", &lib, "imported");
+    assert_eq!(imported_answer.resolution.binding().targets().len(), 1);
+    let exported_answer = answer("src/lib.rs", &lib, "exported");
+    assert_eq!(exported_answer.resolution.binding().targets().len(), 1);
+    let shadowed_import_answer = answer("src/lib.rs", &lib, "selected");
+    assert_eq!(
+        shadowed_import_answer.resolution.binding().targets().len(),
+        1
+    );
+}
+
+#[test]
+fn rust_2018_macro_reexport_import_binds_exact_declaration() {
+    let (fixture, other) = rust_2018_macro_reexport_project();
+    let analyzer = RustAnalyzer::new(fixture.project_dyn());
+    let imported_start = other.rfind("m!()").unwrap();
+    let site = rust_2018_reexport_site(other, imported_start);
+    let answer = resolve_point_answers(&analyzer, &fixture.file("src/other.rs"), &site)
+        .into_iter()
+        .next()
+        .expect("imported macro reference has one selected answer");
+    assert_eq!(
+        answer.resolution.binding().completion(),
+        &ResolutionCompletion::Complete
+    );
+    assert_eq!(answer.resolution.binding().targets().len(), 1);
+    assert_eq!(answer.definition_names.len(), 1);
+    assert_eq!(
+        answer.resolution.binding().targets()[0],
+        answer.definition_names[0].0,
+        "the canonical binding and displayed definition name the same declaration site"
+    );
+    assert_eq!(answer.definition_names[0].1, "macro_reexport.macros.m");
+}
+
+#[test]
+#[ignore = "finds real bug (#4938): path-qualified macro through a pub(crate) use re-export is unresolved"]
+fn rust_2018_macro_reexport_qualified_path_resolves_exact_declaration() {
+    let (fixture, other) = rust_2018_macro_reexport_project();
+    let analyzer = RustAnalyzer::new(fixture.project_dyn());
+    let imported_start = other.rfind("m!()").unwrap();
+    let imported_site = rust_2018_reexport_site(other, imported_start);
+    let imported_answer =
+        resolve_point_answers(&analyzer, &fixture.file("src/other.rs"), &imported_site)
+            .into_iter()
+            .next()
+            .expect("imported macro reference has one selected answer");
+
+    let qualified_start = other.find("crate::macros::m!()").unwrap() + "crate::macros::".len();
+    let qualified_site = rust_2018_reexport_site(other, qualified_start);
+    let qualified_answer =
+        resolve_point_answers(&analyzer, &fixture.file("src/other.rs"), &qualified_site)
+            .into_iter()
+            .next()
+            .expect("qualified macro reference has one selected answer");
+    assert_eq!(
+        qualified_answer.resolution.binding().completion(),
+        &ResolutionCompletion::Complete
+    );
+    assert_eq!(
+        qualified_answer.resolution.binding().targets(),
+        imported_answer.resolution.binding().targets(),
+        "qualified path must bind to the imported macro's exact declaration site"
+    );
+    assert_eq!(
+        qualified_answer.definition_names,
+        imported_answer.definition_names
     );
 }
 

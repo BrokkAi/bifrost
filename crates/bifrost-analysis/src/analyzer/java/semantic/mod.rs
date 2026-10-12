@@ -24,7 +24,7 @@ use crate::analyzer::{JavaAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
 
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v28";
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v31";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 
@@ -217,6 +217,12 @@ enum Work<'tree> {
         scope: ScopeFrameId,
     },
     Expression {
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    },
+    FieldInitializer {
         node: Node<'tree>,
         entry: ProgramPointId,
         next: EdgeTarget,

@@ -38,6 +38,7 @@ mod contracts;
 mod details;
 mod execution;
 mod index_access;
+mod member_targets_contract;
 mod python_call_callee;
 mod python_comparison;
 mod python_imports;

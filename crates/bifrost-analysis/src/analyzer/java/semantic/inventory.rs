@@ -13,6 +13,8 @@ pub(super) struct ProcedureSpec<'tree> {
     pub(super) captures_receiver: bool,
     pub(super) captures: Vec<JavaCaptureSpec<'tree>>,
     pub(super) captures_incomplete: bool,
+    pub(super) constructor_superclass_gap: bool,
+    pub(super) constructor_gaps: Vec<(SemanticCapability, SemanticGapImpacts, &'static str)>,
 }
 
 impl ReceiverCaptureSpec for ProcedureSpec<'_> {
@@ -65,6 +67,8 @@ pub(super) fn enumerate_procedures<'tree>(
     let mut inventory =
         ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "java-source", budget)?;
     let mut specs = Vec::new();
+    let mut synthetic_constructors = HashMap::default();
+    let mut classes_with_uncomposed_instance_initialization = HashSet::default();
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
         lexical_parent: None,
@@ -91,8 +95,167 @@ pub(super) fn enumerate_procedures<'tree>(
             )?;
         }
 
+        // Instance-field expressions execute in the synthetic constructor.
+        // Resolve the owner from the exact AST class whose constructor was
+        // already allocated, without changing the owner of written members.
+        let composed_field_owner = if frame.node.kind() == "variable_declarator"
+            && frame.node.child_by_field_name("value").is_some()
+            && let Some(field) = frame.node.parent()
+            && field.kind() == "field_declaration"
+            && !has_modifier(field, "static")
+            && let Some(body) = field.parent()
+            && body.kind() == "class_body"
+            && let Some(class) = body.parent()
+        {
+            synthetic_constructors.get(&class.id()).copied()
+        } else {
+            None
+        };
         let mut child_parent = frame.lexical_parent;
-        if let Some((kind, segment_kind, body, properties)) = callable_shape(frame.node) {
+        if let Some((owner, declaration_path)) = composed_field_owner {
+            child_parent = Some(owner);
+            child_path = declaration_path;
+        }
+        let mut default_constructor = None;
+        let mut constructor_gaps = Vec::new();
+        let mut constructor_superclass_gap = false;
+        let invocation = if matches!(
+            frame.node.kind(),
+            "constructor_declaration" | "compact_constructor_declaration"
+        ) && let Some(body) = frame.node.child_by_field_name("body")
+        {
+            match first_explicit_constructor_invocation(body, || {
+                charge_capture_inventory(&mut inventory, cancellation)
+            }) {
+                Ok(invocation) => invocation,
+                Err(JavaCaptureInventoryStop::Budget(stop)) => return Ok(stop.into_outcome()),
+                Err(JavaCaptureInventoryStop::Cancelled) => return Ok(inventory.cancelled()),
+            }
+        } else {
+            None
+        };
+        let delegates_to_this = invocation.is_some_and(invocation_delegates_to_this);
+        let explicit_constructor_has_uncomposed_instance_initialization =
+            matches!(
+                frame.node.kind(),
+                "constructor_declaration" | "compact_constructor_declaration"
+            ) && frame.node.parent().is_some_and(|body| {
+                body.kind() == "class_body"
+                    && body.parent().is_some_and(|class| {
+                        classes_with_uncomposed_instance_initialization.contains(&class.id())
+                    })
+            }) && !delegates_to_this;
+        if explicit_constructor_has_uncomposed_instance_initialization {
+            constructor_gaps.push((
+                SemanticCapability::DeferredExecution,
+                SemanticGapImpacts::CALL_EVALUATION,
+                "explicit constructor instance field and initializer-block execution is not yet composed",
+            ));
+        }
+        if frame.node.kind() == "class_declaration"
+            && !frame.node.has_error()
+            && !frame.node.is_missing()
+            && let Some(body) = frame.node.child_by_field_name("body")
+            && !body.is_missing()
+        {
+            let mut explicit = false;
+            let mut unmodeled_storage = false;
+            let mut initializer = false;
+            let mut uncomposed_instance_initialization = false;
+            let mut cursor = body.walk();
+            for child in body.named_children(&mut cursor) {
+                if cancellation.is_cancelled() {
+                    return Ok(inventory.cancelled());
+                }
+                if let Err(stop) = inventory.charge_traversal_entry() {
+                    return Ok(stop.into_outcome());
+                }
+                explicit |= matches!(
+                    child.kind(),
+                    "constructor_declaration" | "compact_constructor_declaration"
+                );
+                initializer |= matches!(child.kind(), "block" | "static_initializer");
+                if child.kind() == "field_declaration" {
+                    let is_static = has_modifier(child, "static");
+                    unmodeled_storage |= is_static;
+                    let mut declarators = child.walk();
+                    for declarator in child.named_children(&mut declarators) {
+                        if cancellation.is_cancelled() {
+                            return Ok(inventory.cancelled());
+                        }
+                        if let Err(stop) = inventory.charge_traversal_entry() {
+                            return Ok(stop.into_outcome());
+                        }
+                        let has_initializer = declarator.kind() == "variable_declarator"
+                            && declarator.child_by_field_name("value").is_some();
+                        uncomposed_instance_initialization |= !is_static && has_initializer;
+                        initializer |= has_modifier(child, "static") && has_initializer;
+                    }
+                } else if child.kind() == "block" {
+                    uncomposed_instance_initialization = true;
+                }
+            }
+            if explicit && uncomposed_instance_initialization {
+                let inserted =
+                    classes_with_uncomposed_instance_initialization.insert(frame.node.id());
+                assert!(
+                    inserted,
+                    "class instance initialization obligation recorded once"
+                );
+            }
+            if !explicit {
+                default_constructor = Some((
+                    ProcedureKind::Constructor,
+                    DeclarationSegmentKind::Constructor,
+                    body,
+                    ProcedureProperties {
+                        is_synthetic: true,
+                        construction_return: ConstructionReturn::PreservesAllocation,
+                        dispatch_extensibility: DispatchExtensibility::Closed,
+                        ..ProcedureProperties::default()
+                    },
+                ));
+                if frame.node.child_by_field_name("superclass").is_some() {
+                    constructor_superclass_gap = true;
+                }
+                // JLS 12.4.1: superinterfaces declaring default methods are
+                // initialized before construction. Their bodies are not known
+                // intrafile, so retain the class-initialization obligation.
+                if frame.node.child_by_field_name("interfaces").is_some() || initializer {
+                    constructor_gaps.push((
+                        SemanticCapability::DeferredExecution,
+                        SemanticGapImpacts::CALL_EVALUATION,
+                        "default constructor static and instance-block initialization is not yet composed",
+                    ));
+                }
+                if unmodeled_storage {
+                    constructor_gaps.push((
+                        SemanticCapability::FieldMemory,
+                        SemanticGapImpacts::DEFERRED_EFFECTS,
+                        "default constructor static field stores are not yet modeled",
+                    ));
+                }
+                let parent = frame.node.parent().expect("class has a parent");
+                let static_member = parent.kind() == "class_body"
+                    && (has_modifier(frame.node, "static")
+                        || parent.parent().is_some_and(|owner| {
+                            matches!(
+                                owner.kind(),
+                                "interface_declaration" | "annotation_type_declaration"
+                            )
+                        }));
+                if parent.kind() != "program" && !static_member {
+                    constructor_gaps.push((SemanticCapability::Captures, SemanticGapImpacts::DEFERRED_EFFECTS,
+                        "default constructor enclosing-instance and lexical capture inputs are not yet modeled"));
+                }
+            }
+        }
+        let shape = if composed_field_owner.is_some() {
+            None
+        } else {
+            callable_shape(frame.node).or(default_constructor)
+        };
+        if let Some((kind, segment_kind, body, properties)) = shape {
             let name = callable_name(prepared.source(), frame.node);
             let anchor =
                 source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
@@ -124,9 +287,20 @@ pub(super) fn enumerate_procedures<'tree>(
                 captures_receiver,
                 captures: Vec::new(),
                 captures_incomplete: false,
+                constructor_superclass_gap,
+                constructor_gaps,
             });
-            child_parent = Some(identity.id);
-            child_path = identity.declaration_path;
+            // The map is bounded by this file's budget-charged procedures.
+            // A synthetic constructor owns instance-field expression work,
+            // but does not become the parent of written class members.
+            if properties.is_synthetic {
+                let previous = synthetic_constructors
+                    .insert(frame.node.id(), (identity.id, identity.declaration_path));
+                assert!(previous.is_none(), "one synthetic constructor per class");
+            } else {
+                child_parent = Some(identity.id);
+                child_path = identity.declaration_path;
+            }
         }
 
         let mut cursor = frame.node.walk();

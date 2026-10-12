@@ -153,6 +153,8 @@ pub(crate) fn project_rust_rich_call_relation(
     let mut facts_by_file = HashMap::default();
     let mut rejected_files = crate::hash::HashSet::default();
     let mut incomplete_binding_references = Vec::new();
+    let mut time_budget_exhausted = false;
+    let mut omitted_by_lane = HashMap::<&str, usize>::default();
     let mut work = CallRelationWork::default();
     for (edge, &reference) in selected.edges.iter().zip(references) {
         if cancellation.is_cancelled() {
@@ -257,37 +259,75 @@ pub(crate) fn project_rust_rich_call_relation(
             edge.proof,
         ));
     }
+    let projection_limits_exceeded = result.truncated;
     for references in incomplete_binding_references.chunks(MAX_REFERENCE_SEEDS_PER_BATCH) {
+        if time_budget_exhausted {
+            *omitted_by_lane.entry("time_budget").or_default() += references.len();
+            result.truncated = true;
+            continue;
+        }
         let Some(answers) = queries.resolve_references(references)? else {
             return Ok(None);
         };
         assert_eq!(answers.len(), references.len());
-        for (&reference, answer) in references.iter().zip(answers) {
-            if answer.completion() != &ResolutionCompletion::Complete {
-                result.diagnostics.push(diagnostic(
+        for (&reference, slot) in references.iter().zip(answers) {
+            use crate::analyzer::store::resolution_operation::{
+                ReferenceOmission, ReferenceResolution,
+            };
+            let answers = match slot {
+                ReferenceResolution::Answered(answers) => answers,
+                ReferenceResolution::Omitted(reason) => {
+                    let (lane, is_time_budget) = match reason {
+                        ReferenceOmission::ReceiverBudget(limit) => (limit.as_str(), false),
+                        ReferenceOmission::TimeBudgetExceeded => ("time_budget", true),
+                    };
+                    *omitted_by_lane.entry(lane).or_default() += 1;
+                    result.truncated = true;
+                    time_budget_exhausted |= is_time_budget;
+                    continue;
+                }
+            };
+            for answer in answers {
+                if answer.completion() != &ResolutionCompletion::Complete {
+                    result.diagnostics.push(diagnostic(
                     "native_call_resolution_incomplete",
                     format!("selected Rust call {reference} has incomplete aggregate evidence: {:?}; receiver dispositions: {:?}",
                         answer.completion(), answer.callable_receiver_dispositions()),
                     reference.to_string(),
                 ));
-            }
-            if answer.binding().targets().len() > 1 {
-                result.diagnostics.push(CallRelationDiagnostic {
-                    code: CallRelationDiagnosticCode::TargetsAmbiguous,
-                    message: format!(
-                        "selected Rust call {reference} has ambiguous targets: {:?}",
-                        answer.binding().targets()
-                    ),
-                    context: reference.to_string(),
-                    reason_kind: None,
-                });
+                }
+                if answer.binding().targets().len() > 1 {
+                    result.diagnostics.push(CallRelationDiagnostic {
+                        code: CallRelationDiagnosticCode::TargetsAmbiguous,
+                        message: format!(
+                            "selected Rust call {reference} has ambiguous targets: {:?}",
+                            answer.binding().targets()
+                        ),
+                        context: reference.to_string(),
+                        reason_kind: None,
+                    });
+                }
             }
         }
+    }
+    for (lane, omitted) in omitted_by_lane {
+        if lane == "time_budget" {
+            result.diagnostics.retain(|diagnostic| {
+                !(diagnostic.code == CallRelationDiagnosticCode::AnalysisFailed
+                    && diagnostic.reason_kind.as_deref() == Some("time_budget"))
+            });
+        }
+        result.diagnostics.push(CallRelationDiagnostic {
+            code: CallRelationDiagnosticCode::BudgetExhausted,
+            message: format!("{omitted} incoming call sites kept unproven because the {lane} budget stopped their binding recheck"),
+            context: target.fq_name().to_string(),
+            reason_kind: None,
+        });
     }
     if cancellation.is_cancelled() {
         return Ok(None);
     }
-    if result.truncated {
+    if projection_limits_exceeded {
         result.diagnostics.push(CallRelationDiagnostic {
             code: CallRelationDiagnosticCode::BudgetExhausted,
             message: format!("selected Rust incoming call projection exceeded limits {limits:?}"),

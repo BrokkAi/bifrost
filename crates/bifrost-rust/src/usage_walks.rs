@@ -419,12 +419,7 @@ impl<'a> RustUsageWalks<'a> {
         analyzer: &'a dyn RustFactSource,
         token: QueryToken<'a>,
     ) -> Result<Self, RustCargoRouteError> {
-        Ok(Self::with_cargo_routes(
-            analyzer,
-            token,
-            analyzer.cargo_routes()?,
-            None,
-        ))
+        Self::with_cargo_routes(analyzer, token, analyzer.cargo_routes()?, None)
     }
 
     /// The request-scope proof this walker was built with (issue #2414 step 3).
@@ -442,12 +437,12 @@ impl<'a> RustUsageWalks<'a> {
         token: QueryToken<'a>,
         keep_going: &'a dyn Fn() -> bool,
     ) -> Result<Self, RustCargoRouteError> {
-        Ok(Self::with_cargo_routes(
+        Self::with_cargo_routes(
             analyzer,
             token,
             analyzer.cargo_routes_while(keep_going)?,
             Some(keep_going),
-        ))
+        )
     }
 
     /// A walk starts from the route publication currently visible to the
@@ -458,19 +453,27 @@ impl<'a> RustUsageWalks<'a> {
         token: QueryToken<'a>,
         cargo_routes: Arc<RustCargoRouteIndex>,
         keep_going: Option<&'a dyn Fn() -> bool>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, RustCargoRouteError> {
+        let files = match keep_going {
+            Some(keep_going) => analyzer.package_file_index_while(token, keep_going)?,
+            None => analyzer.package_file_index_while(token, &|| true)?,
+        };
+        Ok(Self {
             analyzer,
             token,
             queries: RustUsageQueries::new(analyzer),
             cargo_routes,
-            files: analyzer.package_file_index(),
+            files,
             caches: Arc::clone(analyzer.walk_caches()),
             keep_going,
             alias_walk: RefCell::new(CycleWalk::default()),
             binding_walk: RefCell::new(CycleWalk::default()),
             computations: Cell::new(0),
-        }
+        })
+    }
+
+    pub fn package_files(&self) -> &RustPackageFileIndex {
+        &self.files
     }
 
     /// The request asked this walk to stop.

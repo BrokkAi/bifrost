@@ -8017,6 +8017,10 @@ func run(a S) string {
             "Go states the copied members, so the copy is an exact root: {go:#?}"
         );
 
+        // A Rust transfer separates storage identity only when the producer
+        // publishes the copied members at the transfer point. A named-field
+        // struct layout states them (#4913), so the copy is an exact root with
+        // definitions to answer a member read.
         let rust = destination_origins(
             Language::Rust,
             "src/lib.rs",
@@ -8031,8 +8035,33 @@ fn run(a: S) -> i32 {
             "run",
         );
         assert!(
-            rust.iter().all(|origin| *origin == LoadOrigin::Ambiguous),
-            "a derived Copy states no contents, so the copy stays ambiguous: {rust:#?}"
+            rust.iter()
+                .all(|origin| matches!(origin, LoadOrigin::Separated { .. })),
+            "a named-field struct layout states its members, so the copy is an exact root: {rust:#?}"
+        );
+
+        // Where the producer states no copied members, the same transfer shape
+        // must stay ambiguous instead of answering a member read against an
+        // exact root that has no definition. A positional struct layout states
+        // none.
+        let unstated_layout = destination_origins(
+            Language::Rust,
+            "src/lib.rs",
+            r#"#[derive(core::clone::Clone, core::marker::Copy)]
+struct S(i32);
+
+fn run(a: S) -> i32 {
+    let b = a;
+    b.0
+}
+"#,
+            "run",
+        );
+        assert!(
+            unstated_layout
+                .iter()
+                .all(|origin| *origin == LoadOrigin::Ambiguous),
+            "an unstated layout states no contents, so the copy stays ambiguous: {unstated_layout:#?}"
         );
     }
 

@@ -1532,6 +1532,7 @@ impl CSharpAssemblyPackProducer {
                 }
             }
             types.push(TypeFact {
+                jvm_inventory: None,
                 ambient_use: None,
                 id: type_id.clone(),
                 name: ty.fqn.clone(),

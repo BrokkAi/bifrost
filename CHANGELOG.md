@@ -116,6 +116,30 @@ projection and its commit history does not contain every source commit.
 - Rust reverse usages enumerate each target candidate set once per request,
   retaining generation checks and explicit macro frontier gaps.
 
+- Semantic-pack startup treats a stale or foreign cached manifest index as a
+  cache miss rather than aborting, while preserving corrupt-cache integrity
+  checks and offline fallback behavior.
+
+- Rust incoming-call analysis retains partial caller results when a binding
+  recheck exhausts its budget, reporting truncation and unproven sites instead
+  of discarding the entire result.
+
+- Rust macro resolution respects textual scope and shadowing for `macro_rules!`
+  and preserves supported procedural-macro re-exports through `#[macro_use]`.
+
+- Rust value-flow analysis preserves named-field contents through struct
+  initializers, updates, copies, and moves; unknown field sets remain incomplete.
+
+- Taint policies reject unsuitable endpoint rows individually, retaining
+  findings from valid rows while reporting incomplete coverage.
+
+- External type analysis reconciles class records from multiple semantic packs,
+  restoring member and type-guard reasoning when packs describe the same class;
+  conflicting hierarchy evidence remains uncertain.
+
+- Python flow analysis no longer invents exception-suppression paths for
+  context managers whose exit methods are proven non-suppressing, avoiding
+  spurious implicit `None` results while retaining uncertain cases.
 
 - Taint findings retain uncertainty when the endpoint dispatch needed to
   select a sink is unresolved, while independently proven findings remain

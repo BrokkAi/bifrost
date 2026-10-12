@@ -10,6 +10,21 @@ use crate::analyzer::java_integral_parameter::{
     JavaIntegralDomain, JavaScalarType, decimal_integer_value,
 };
 
+fn preserve_pre_drive_work(
+    builder: &ProcedureCfgBuilder,
+    error: JavaLoweringError,
+) -> JavaLoweringError {
+    match error {
+        JavaLoweringError::Budget(exceeded, _) => {
+            JavaLoweringError::Budget(exceeded, Box::new(builder.prospective_work()))
+        }
+        JavaLoweringError::Cancelled(_) => {
+            JavaLoweringError::Cancelled(Box::new(builder.prospective_work()))
+        }
+        other => other,
+    }
+}
+
 pub(super) fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
@@ -60,7 +75,9 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     context.emit_procedure_inputs(&mut builder, spec.callable, spec.kind, spec.properties)?;
     context.emit_captured_receiver(&mut builder, entry, spec)?;
     context.emit_lexical_capture_inputs(&mut builder, entry, spec)?;
-    context.emit_local_bindings(&mut builder, spec.body)?;
+    if !spec.properties.is_synthetic {
+        context.emit_local_bindings(&mut builder, spec.body)?;
+    }
 
     // #2553: "source-order composition across initializer fragments" is the
     // gap's own documented reason (JLS 12.4.2/12.5 compose every static-or-
@@ -86,80 +103,173 @@ pub(super) fn lower_procedure<'tree, 'targets>(
             "initializer scheduling and source-order composition across initializer fragments are not yet modeled",
         )?;
     }
-    let implicit_super = spec.kind == ProcedureKind::Constructor
-        && !named_children(spec.body)
-            .into_iter()
-            .any(|child| child.kind() == "explicit_constructor_invocation");
-    if implicit_super {
-        context.add_gap(
+    for &(capability, impacts, reason) in &spec.constructor_gaps {
+        context.session.add_gap_with_impacts(
             &mut builder,
             entry,
-            SemanticGapSubject::Point,
-            SemanticCapability::Calls,
+            SemanticGapSubject::Procedure,
+            capability,
+            impacts,
             SemanticGapKind::Unsupported,
-            "implicit super-constructor invocation is not yet represented as a call site",
+            reason,
         )?;
     }
-
-    let body_entry = context.point(&mut builder, spec.body, Vec::new())?;
-    let initial = if matches!(spec.body.kind(), "block" | "constructor_body") {
-        Work::Statement {
-            node: spec.body,
-            entry: body_entry,
-            next: EdgeTarget::normal(normal_exit),
-            scope: function_scope,
-        }
-    } else if spec.kind == ProcedureKind::Initializer {
-        Work::Expression {
-            node: spec.body,
-            entry: body_entry,
-            next: EdgeTarget::normal(normal_exit),
-            scope: function_scope,
-        }
+    let invocation = if spec.kind == ProcedureKind::Constructor && !spec.properties.is_synthetic {
+        first_explicit_constructor_invocation(spec.body, || {
+            if cancellation.is_cancelled() {
+                return Err(JavaLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            builder.descend_nested_entry()?;
+            Ok(())
+        })
+        .map_err(|error| preserve_pre_drive_work(&builder, error))?
     } else {
-        let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
-        let source =
-            context.expression_value(&mut builder, spec.body, expression_value_kind(spec.body))?;
-        let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
-        context.append_effect(
-            &mut builder,
-            implicit_return,
-            SemanticEffect::ValueFlow {
-                kind: ValueFlowKind::Return,
-                source,
-                target: value,
-            },
-        )?;
-        context.append_effect(
-            &mut builder,
-            implicit_return,
-            SemanticEffect::ProcedureReturn { value: Some(value) },
-        )?;
-        context.edge(
-            &mut builder,
-            implicit_return,
-            EdgeTarget::normal(normal_exit),
-        )?;
-        Work::Expression {
-            node: spec.body,
-            entry: body_entry,
-            next: EdgeTarget::normal(implicit_return),
-            scope: function_scope,
-        }
+        None
     };
-    context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
-    let mut pending = vec![initial];
-    // The implicit `super()` runs before the body, outside every handler the
-    // body declares, so its exception leaves the constructor.
-    if implicit_super {
-        context.implicit_abort_edge(
+    let implicit_super = spec.kind == ProcedureKind::Constructor
+        && !spec.properties.is_synthetic
+        && invocation.is_none();
+    let delegates_to_this = invocation.is_some_and(invocation_delegates_to_this);
+    let body_entry = context.point(&mut builder, spec.body, Vec::new())?;
+    let mut pending = Vec::new();
+    // Allocation initializes instance storage before any superclass work
+    // (JLS 12.5). A this(...) delegate uses the target constructor's stores.
+    let default_entry = if spec.kind == ProcedureKind::Constructor && !delegates_to_this {
+        let point = context.point(&mut builder, spec.body, Vec::new())?;
+        let class_body = if spec.properties.is_synthetic {
+            Some(spec.body)
+        } else {
+            spec.callable.parent().filter(|parent| {
+                parent.kind() == "class_body"
+                    && parent
+                        .parent()
+                        .is_some_and(|owner| owner.kind() == "class_declaration")
+            })
+        };
+        if let Some(class_body) = class_body {
+            context
+                .emit_default_field_stores(&mut builder, class_body, point)
+                .map_err(|error| preserve_pre_drive_work(&builder, error))?;
+        }
+        context
+            .edge(&mut builder, entry, EdgeTarget::normal(point))
+            .map_err(|error| preserve_pre_drive_work(&builder, error))?;
+        point
+    } else {
+        entry
+    };
+    let superclass_entry = if implicit_super || spec.constructor_superclass_gap {
+        let point = context.point(&mut builder, spec.callable, Vec::new())?;
+        context
+            .edge(&mut builder, default_entry, EdgeTarget::normal(point))
+            .map_err(|error| preserve_pre_drive_work(&builder, error))?;
+        let reason = if spec.constructor_superclass_gap {
+            "default constructor superclass invocation is not yet modeled"
+        } else {
+            "implicit super-constructor invocation is not yet represented as a call site"
+        };
+        context
+            .session
+            .add_gap_with_impacts(
+                &mut builder,
+                point,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                if spec.constructor_superclass_gap {
+                    SemanticGapImpacts::CALL_EVALUATION
+                } else {
+                    SemanticGapImpacts::NONE
+                },
+                SemanticGapKind::Unsupported,
+                reason,
+            )
+            .map_err(|error| preserve_pre_drive_work(&builder, error))?;
+        context
+            .implicit_abort_edge(
+                &mut builder,
+                spec.callable,
+                point,
+                function_scope,
+                None,
+                &mut pending,
+            )
+            .map_err(|error| preserve_pre_drive_work(&builder, error))?;
+        point
+    } else {
+        default_entry
+    };
+    context
+        .edge(
             &mut builder,
-            spec.callable,
-            entry,
-            function_scope,
-            None,
-            &mut pending,
-        )?;
+            superclass_entry,
+            EdgeTarget::normal(body_entry),
+        )
+        .map_err(|error| preserve_pre_drive_work(&builder, error))?;
+    if spec.properties.is_synthetic {
+        // Object's no-argument constructor has no user body or exceptional
+        // successor. An explicit superclass remains an open obligation above.
+        context
+            .schedule_field_initializers(
+                &mut builder,
+                body_entry,
+                spec.body,
+                EdgeTarget::normal(normal_exit),
+                function_scope,
+                &mut pending,
+            )
+            .map_err(|error| preserve_pre_drive_work(&builder, error))?;
+    } else {
+        let initial = if matches!(spec.body.kind(), "block" | "constructor_body") {
+            Work::Statement {
+                node: spec.body,
+                entry: body_entry,
+                next: EdgeTarget::normal(normal_exit),
+                scope: function_scope,
+            }
+        } else if spec.kind == ProcedureKind::Initializer {
+            Work::Expression {
+                node: spec.body,
+                entry: body_entry,
+                next: EdgeTarget::normal(normal_exit),
+                scope: function_scope,
+            }
+        } else {
+            let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
+            let source = context.expression_value(
+                &mut builder,
+                spec.body,
+                expression_value_kind(spec.body),
+            )?;
+            let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
+            context.append_effect(
+                &mut builder,
+                implicit_return,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return,
+                    source,
+                    target: value,
+                },
+            )?;
+            context.append_effect(
+                &mut builder,
+                implicit_return,
+                SemanticEffect::ProcedureReturn { value: Some(value) },
+            )?;
+            context.edge(
+                &mut builder,
+                implicit_return,
+                EdgeTarget::normal(normal_exit),
+            )?;
+            Work::Expression {
+                node: spec.body,
+                entry: body_entry,
+                next: EdgeTarget::normal(implicit_return),
+                scope: function_scope,
+            }
+        };
+        pending.push(initial);
     }
 
     drive_and_finish_procedure(
@@ -714,6 +824,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 next,
                 scope,
             } => self.expression(builder, node, entry, next, scope, stack),
+            Work::FieldInitializer {
+                node,
+                entry,
+                next,
+                scope,
+            } => {
+                let name = required_field(node, "name")?;
+                let initializer = required_field(node, "value")?;
+                let terminal = self.point(builder, node, Vec::new())?;
+                let value = self.expression_value(
+                    builder,
+                    initializer,
+                    expression_value_kind(initializer),
+                )?;
+                self.emit_field_initialization_store(builder, name, terminal, value)?;
+                self.edge(builder, terminal, next)?;
+                stack.push(Work::Expression {
+                    node: initializer,
+                    entry,
+                    next: EdgeTarget::normal(terminal),
+                    scope,
+                });
+                Ok(())
+            }
             Work::Condition {
                 node,
                 entry,
@@ -3549,6 +3683,73 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             &detail,
         )
+    }
+
+    fn schedule_field_initializers(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        body: Node<'tree>,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), JavaLoweringError> {
+        let mut children = Vec::new();
+        let mut fields = body.walk();
+        for field in body.named_children(&mut fields) {
+            if self.session.cancellation().is_cancelled() {
+                return Err(JavaLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            builder.descend_nested_entry()?;
+            if field.kind() == "field_declaration" && !has_modifier(field, "static") {
+                let mut declarators = field.walk();
+                for declarator in field.children_by_field_name("declarator", &mut declarators) {
+                    if self.session.cancellation().is_cancelled() {
+                        return Err(JavaLoweringError::Cancelled(Box::new(
+                            builder.prospective_work(),
+                        )));
+                    }
+                    builder.descend_nested_entry()?;
+                    if declarator.child_by_field_name("value").is_some() {
+                        children.push(declarator);
+                    }
+                }
+            }
+        }
+        if children.is_empty() {
+            return self.edge(builder, entry, next);
+        }
+        let mut entries = Vec::with_capacity(children.len());
+        for child in &children {
+            if self.session.cancellation().is_cancelled() {
+                return Err(JavaLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            entries.push(self.point(builder, *child, Vec::new())?);
+        }
+        if self.session.cancellation().is_cancelled() {
+            return Err(JavaLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        schedule_sequential_work(
+            stack,
+            &children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::FieldInitializer {
+                node,
+                entry,
+                next,
+                scope,
+            },
+        );
+        Ok(())
     }
 
     fn schedule_statements(

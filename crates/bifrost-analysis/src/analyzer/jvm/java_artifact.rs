@@ -45,9 +45,10 @@ pub(super) struct JavaApiType {
     is_abstract: bool,
     is_sealed: bool,
     callable_surface_complete: bool,
+    jvm_inventory: Option<Box<super::super::semantic_model::JvmOwnerInventory>>,
     type_parameters: Vec<String>,
     hierarchy: Vec<HierarchyFact>,
-    locator: Locator,
+    locator: Box<Locator>,
     members: Vec<JavaApiMember>,
 }
 
@@ -558,6 +559,7 @@ pub(super) fn java_api_facts(
             .expect("parsed Java type receives an id")
             .clone();
         types.push(TypeFact {
+            jvm_inventory: declaration.jvm_inventory.map(|inventory| *inventory),
             ambient_use: None,
             id: type_id.clone(),
             name: declaration.name,
@@ -578,7 +580,7 @@ pub(super) fn java_api_facts(
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
             guard: None,
-            locator: declaration.locator,
+            locator: *declaration.locator,
         });
         for mut member in declaration.members {
             if types.len().saturating_add(members.len()) >= max_records {
@@ -639,7 +641,7 @@ pub(super) fn java_api_facts(
                 debug_assert_eq!(signature.parameters.len(), 1);
                 signature.parameters[0].name = Some(formal_name.to_owned());
             }
-            members.push(MemberFact {
+            let fact = MemberFact {
                 non_overridable: member.non_overridable,
                 ambient_use: None,
                 value_type: None,
@@ -674,7 +676,19 @@ pub(super) fn java_api_facts(
                 aliases,
                 guard: None,
                 locator: member.locator,
-            });
+            };
+            if matches!(fact.visibility, Visibility::Public | Visibility::Protected) {
+                members.push(fact);
+            } else {
+                types
+                    .last_mut()
+                    .expect("owner fact precedes its members")
+                    .jvm_inventory
+                    .as_mut()
+                    .expect("class-file inventory carries non-public members")
+                    .additional_members
+                    .push(fact);
+            }
         }
     }
     (types, members)
@@ -895,12 +909,13 @@ pub(super) fn source_api_types(
                     || matches!(type_kind, TypeKind::Interface | TypeKind::Annotation),
                 is_sealed: modifiers.contains(&"final") || modifiers.contains(&"sealed"),
                 callable_surface_complete,
+                jvm_inventory: None,
                 type_parameters,
                 hierarchy,
-                locator: Locator::Source {
+                locator: Box::new(Locator::Source {
                     path: source_path.to_owned(),
                     symbol: Some(name.clone()),
-                },
+                }),
                 members,
             });
         }
@@ -2025,7 +2040,8 @@ pub(crate) struct JavaClassSurface {
     pub(super) is_sealed: bool,
     pub(super) type_parameters: Vec<String>,
     pub(super) hierarchy: Vec<HierarchyFact>,
-    pub(super) locator: Locator,
+    pub(super) jvm_inventory: Option<Box<super::super::semantic_model::JvmOwnerInventory>>,
+    pub(super) locator: Box<Locator>,
     pub(super) members: Vec<JavaClassSurfaceMember>,
 }
 
@@ -2107,6 +2123,7 @@ pub(crate) fn class_surface(
                 is_sealed: declaration.is_sealed,
                 type_parameters: declaration.type_parameters,
                 hierarchy: declaration.hierarchy,
+                jvm_inventory: declaration.jvm_inventory,
                 locator: declaration.locator,
                 members: declaration
                     .members
@@ -2153,6 +2170,7 @@ pub(crate) fn class_surface_facts(
         is_abstract: surface.is_abstract,
         is_sealed: surface.is_sealed,
         callable_surface_complete: false,
+        jvm_inventory: surface.jvm_inventory,
         type_parameters: surface.type_parameters,
         hierarchy: surface.hierarchy,
         locator: surface.locator,
@@ -2297,6 +2315,89 @@ fn class_api_type(
     } else {
         TypeKind::Class
     };
+    // Visibility filtering and undecodable signatures leave that namespace
+    // open: a complete public API is not a complete owner inventory.
+    let values_complete = !*record_limit_hit
+        && members
+            .iter()
+            .filter(|member| matches!(member.member_kind, MemberKind::Field | MemberKind::Constant))
+            .count()
+            == class_file.fields().len();
+    let callables_complete = !*record_limit_hit
+        && all_callable_families_complete
+        && incomplete_callable_names.is_empty()
+        && members
+            .iter()
+            .filter(|member| {
+                matches!(
+                    member.member_kind,
+                    MemberKind::Method | MemberKind::Constructor
+                )
+            })
+            .count()
+            == class_file
+                .methods()
+                .iter()
+                .filter(|method| utf8_at(&class_file, method.name_index()) != Some("<clinit>"))
+                .count();
+    let mut nested_types = Vec::new();
+    let mut types_complete = true;
+    for attribute in class_file.attributes() {
+        let Attribute::InnerClasses { classes } = attribute else {
+            continue;
+        };
+        for inner in classes {
+            if class_name_at(&class_file, inner.outer_class_info_index()).as_deref()
+                != Some(internal_name.as_str())
+            {
+                continue;
+            }
+            match (
+                utf8_at(&class_file, inner.inner_name_index()),
+                class_name_at(&class_file, inner.inner_class_info_index()),
+            ) {
+                (Some(simple), Some(binary)) => {
+                    nested_types.push(super::super::semantic_model::JvmNestedType {
+                        name: simple.to_owned(),
+                        owner_fqn: binary_declared_class_name(&class_file, &binary),
+                        visibility: nested_visibility(inner.inner_class_access_flags()),
+                        is_static: inner
+                            .inner_class_access_flags()
+                            .contains(NestedClassFlags::ACC_STATIC),
+                    })
+                }
+                _ => types_complete = false,
+            }
+        }
+    }
+    let mut inventory_hierarchy = hierarchy.clone();
+    if class_file.super_class() != 0
+        && let Some(parent) = class_name_at(&class_file, class_file.super_class())
+        && matches!(
+            parent.as_str(),
+            "java/lang/Object" | "java/lang/Enum" | "java/lang/Record"
+        )
+    {
+        inventory_hierarchy.insert(
+            0,
+            HierarchyFact {
+                hierarchy_kind: HierarchyKind::Extends,
+                target: TypeRef::named(binary_declared_class_name(&class_file, &parent)),
+                declaration_ordinal: None,
+            },
+        );
+    }
+    let supertypes_complete = inventory_hierarchy.len()
+        == class_file.interfaces().len() + usize::from(class_file.super_class() != 0);
+    let jvm_inventory = Some(Box::new(super::super::semantic_model::JvmOwnerInventory {
+        callables_complete,
+        values_complete,
+        types_complete,
+        supertypes_complete,
+        supertypes: inventory_hierarchy,
+        nested_types,
+        additional_members: Vec::new(),
+    }));
     ClassEntryResult::Declaration(JavaApiType {
         name: name.clone(),
         package_name: internal_name
@@ -2311,12 +2412,13 @@ fn class_api_type(
                 .iter()
                 .any(|attribute| matches!(attribute, Attribute::PermittedSubclasses { .. })),
         callable_surface_complete: false,
+        jvm_inventory,
         type_parameters,
         hierarchy,
-        locator: Locator::Artifact {
+        locator: Box::new(Locator::Artifact {
             path: jar_name.to_owned(),
             symbol: class_entry.to_owned(),
-        },
+        }),
         members,
     })
 }
@@ -2409,9 +2511,7 @@ fn class_field_member(
 ) -> Option<JavaApiMember> {
     let flags = field.access_flags();
     let visibility = field_visibility(flags);
-    if !matches!(visibility, Visibility::Public | Visibility::Protected)
-        || flags.contains(FieldFlags::ACC_SYNTHETIC)
-    {
+    if flags.contains(FieldFlags::ACC_SYNTHETIC) {
         return None;
     }
     let name = utf8_at(class_file, field.name_index())?.to_owned();
@@ -2478,9 +2578,7 @@ fn class_method_member(
 ) -> Option<JavaApiMember> {
     let flags = method.access_flags();
     let visibility = method_visibility(flags);
-    if !matches!(visibility, Visibility::Public | Visibility::Protected)
-        || flags.intersects(MethodFlags::ACC_SYNTHETIC | MethodFlags::ACC_BRIDGE)
-    {
+    if flags.intersects(MethodFlags::ACC_SYNTHETIC | MethodFlags::ACC_BRIDGE) {
         return None;
     }
     let Some(binary_name) = utf8_at(class_file, method.name_index()) else {

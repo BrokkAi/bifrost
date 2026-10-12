@@ -40,7 +40,10 @@ async function withRepositoryFixture(run) {
       const source = path.join(repositoryRoot, relativePath);
       const destination = path.join(fixtureRoot, relativePath);
       await mkdir(path.dirname(destination), { recursive: true });
-      await cp(source, destination, { recursive: true });
+      await cp(source, destination, {
+        recursive: true,
+        filter: (sourcePath) => path.basename(sourcePath) !== "node_modules",
+      });
     }
     await run(fixtureRoot);
   } finally {

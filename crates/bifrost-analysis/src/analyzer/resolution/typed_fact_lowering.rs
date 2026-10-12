@@ -635,17 +635,41 @@ impl LoweredDeclarationVisibilityProperty {
 }
 
 /// The binding-node entry point for members declared by one type.
+/// Absence evidence belongs to each member namespace, not an owner as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExternalMemberCoverage {
+    pub callables_complete: bool,
+    pub values_complete: bool,
+    pub types_complete: bool,
+    pub supertypes_complete: bool,
+}
+
+impl ExternalMemberCoverage {
+    pub fn covers(self, namespace: ResolutionNamespace) -> bool {
+        self.supertypes_complete
+            && match namespace {
+                ResolutionNamespace::Callable => self.callables_complete,
+                ResolutionNamespace::Value | ResolutionNamespace::Constant => self.values_complete,
+                ResolutionNamespace::Type => self.types_complete,
+                ResolutionNamespace::TypeOrValue => self.types_complete && self.values_complete,
+                _ => false,
+            }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LoweredMemberScopeProperty {
     definition: SemanticId,
-    scope_head: BindingNodeId,
+    scope_head: Option<BindingNodeId>,
+    external_coverage: Option<ExternalMemberCoverage>,
 }
 
 impl LoweredMemberScopeProperty {
     pub const fn new(definition: SemanticId, scope_head: BindingNodeId) -> Self {
         Self {
             definition,
-            scope_head,
+            scope_head: Some(scope_head),
+            external_coverage: None,
         }
     }
 
@@ -654,6 +678,23 @@ impl LoweredMemberScopeProperty {
     }
 
     pub const fn scope_head(&self) -> BindingNodeId {
+        match self.scope_head {
+            Some(head) => head,
+            None => panic!("external owners have no source scope"),
+        }
+    }
+
+    pub const fn external(definition: SemanticId, coverage: ExternalMemberCoverage) -> Self {
+        Self {
+            definition,
+            scope_head: None,
+            external_coverage: Some(coverage),
+        }
+    }
+    pub const fn external_coverage(&self) -> Option<ExternalMemberCoverage> {
+        self.external_coverage
+    }
+    pub const fn source_scope_head(&self) -> Option<BindingNodeId> {
         self.scope_head
     }
 }
@@ -667,10 +708,12 @@ impl LoweredMemberScopeProperty {
 pub struct LoweredMemberOwnerProperty {
     definition: SemanticId,
     owner_definition: SemanticId,
-    owner_scope_head: BindingNodeId,
+    owner_scope_head: Option<BindingNodeId>,
     kind: ResolutionMemberKind,
     access: ResolutionMemberAccess,
     qualifier_compatibility: ResolutionMemberQualifierCompatibility,
+    external_lookup: Option<[SemanticId; 15]>,
+    external_visibility: Option<DeclaredVisibility>,
 }
 
 impl LoweredMemberOwnerProperty {
@@ -685,10 +728,12 @@ impl LoweredMemberOwnerProperty {
         Self {
             definition,
             owner_definition,
-            owner_scope_head,
+            owner_scope_head: Some(owner_scope_head),
             kind,
             access,
             qualifier_compatibility,
+            external_lookup: None,
+            external_visibility: None,
         }
     }
 
@@ -701,7 +746,39 @@ impl LoweredMemberOwnerProperty {
     }
 
     pub const fn owner_scope_head(&self) -> BindingNodeId {
+        match self.owner_scope_head {
+            Some(head) => head,
+            None => panic!("external members have no source scope"),
+        }
+    }
+    pub const fn source_owner_scope_head(&self) -> Option<BindingNodeId> {
         self.owner_scope_head
+    }
+    pub const fn external_lookup(&self) -> Option<[SemanticId; 15]> {
+        self.external_lookup
+    }
+    pub const fn external_visibility(&self) -> Option<DeclaredVisibility> {
+        self.external_visibility
+    }
+    pub const fn external(
+        definition: SemanticId,
+        owner_definition: SemanticId,
+        kind: ResolutionMemberKind,
+        access: ResolutionMemberAccess,
+        qualifier_compatibility: ResolutionMemberQualifierCompatibility,
+        lookup: [SemanticId; 15],
+        visibility: DeclaredVisibility,
+    ) -> Self {
+        Self {
+            definition,
+            owner_definition,
+            owner_scope_head: None,
+            kind,
+            access,
+            qualifier_compatibility,
+            external_lookup: Some(lookup),
+            external_visibility: Some(visibility),
+        }
     }
 
     pub const fn kind(&self) -> ResolutionMemberKind {
@@ -755,14 +832,23 @@ impl LoweredConstructionRequirementProperty {
     }
 }
 
-/// A declared hierarchy edge whose target remains an unresolved reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A hierarchy target is either a selected source reference or an external
+/// provider coordinate. The latter has no source-reference locator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoweredSupertypeTarget {
+    SelectedReference(SemanticId),
+    External(super::ExternalOwnerIdentity),
+}
+
+/// A declared hierarchy edge and its honest source or external target.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoweredSupertypeProperty {
     definition: SemanticId,
     reference: SemanticId,
     frontier: SemanticId,
-    kind: ResolutionSupertypeKind,
+    kind: Option<ResolutionSupertypeKind>,
     parent_ordinal: u32,
+    target: LoweredSupertypeTarget,
 }
 
 impl LoweredSupertypeProperty {
@@ -777,9 +863,31 @@ impl LoweredSupertypeProperty {
             definition,
             reference,
             frontier,
-            kind,
+            kind: Some(kind),
             parent_ordinal,
+            target: LoweredSupertypeTarget::SelectedReference(reference),
         }
+    }
+
+    pub fn external(
+        definition: SemanticId,
+        reference: SemanticId,
+        frontier: SemanticId,
+        parent_ordinal: u32,
+        target: super::ExternalOwnerIdentity,
+    ) -> Self {
+        Self {
+            definition,
+            reference,
+            frontier,
+            kind: None,
+            parent_ordinal,
+            target: LoweredSupertypeTarget::External(target),
+        }
+    }
+
+    pub const fn target(&self) -> &LoweredSupertypeTarget {
+        &self.target
     }
 
     pub const fn definition(&self) -> SemanticId {
@@ -795,6 +903,12 @@ impl LoweredSupertypeProperty {
     }
 
     pub const fn kind(&self) -> ResolutionSupertypeKind {
+        match self.kind {
+            Some(kind) => kind,
+            None => panic!("external inventory does not fabricate a source edge kind"),
+        }
+    }
+    pub const fn source_kind(&self) -> Option<ResolutionSupertypeKind> {
         self.kind
     }
 
@@ -2641,11 +2755,11 @@ impl LoweredTypedFragment {
         let member_scopes = self
             .member_scopes
             .iter()
-            .map(|property| (property.definition, property.scope_head))
+            .map(|property| (property.definition, property.scope_head()))
             .collect::<HashSet<_>>();
         for owner in &self.member_owners {
             assert!(
-                member_scopes.contains(&(owner.owner_definition, owner.owner_scope_head)),
+                member_scopes.contains(&(owner.owner_definition, owner.owner_scope_head())),
                 "member owner must name its declaring type's exact member scope"
             );
         }
@@ -3892,7 +4006,7 @@ fn lower_definition_properties_with_index(
         lower_declaration_visibility_properties(identities, language, facts, index);
     let member_scope_by_definition = member_scopes
         .iter()
-        .map(|property| (property.definition, property.scope_head))
+        .map(|property| (property.definition, property.scope_head()))
         .collect::<HashMap<_, _>>();
     assert_eq!(
         member_scope_by_definition.len(),
@@ -4092,6 +4206,9 @@ struct TypedFactIndex<'facts> {
     slots: HashMap<ResolutionTypeSlotId, ResolutionTypeSlotFact>,
     slots_by_site: HashMap<ResolutionSiteId, Vec<ResolutionTypeSlotId>>,
     type_body_scope_by_owner: HashMap<ResolutionSiteId, ResolutionScopeId>,
+    /// Namespaces a producer declares for a definition beyond what its site
+    /// kind and primary namespace give it.
+    additional_namespaces: HashSet<(ResolutionSiteId, ResolutionNamespace)>,
 }
 
 impl<'facts> TypedFactIndex<'facts> {
@@ -4285,7 +4402,26 @@ impl<'facts> TypedFactIndex<'facts> {
             slots,
             slots_by_site,
             type_body_scope_by_owner,
+            additional_namespaces: facts
+                .additional_definition_namespaces
+                .iter()
+                .map(|fact| (fact.declaration, fact.namespace))
+                .collect(),
         }
+    }
+
+    /// Whether a type declaration occupies `namespace`: a type declaration
+    /// binds the Type namespace, and a producer can instead declare the term
+    /// namespace for a singleton (a Scala `object` is a term that owns a member
+    /// scope; it is not a type).
+    fn type_declaration_namespace_is_declared(
+        &self,
+        site: ResolutionSiteId,
+        namespace: ResolutionNamespace,
+    ) -> bool {
+        namespace == ResolutionNamespace::Type
+            || (namespace == ResolutionNamespace::Value
+                && self.additional_namespaces.contains(&(site, namespace)))
     }
 
     fn validate_scope_forest(&self) {
@@ -5089,7 +5225,11 @@ fn validate_member_owner(fact: ResolutionMemberOwnerFact, index: &TypedFactIndex
         ),
     };
     assert_eq!(member.kind, site_kind);
-    assert_eq!(identifier.namespace, namespace);
+    if fact.kind == ResolutionMemberKind::NestedType {
+        assert!(index.type_declaration_namespace_is_declared(fact.member, identifier.namespace));
+    } else {
+        assert_eq!(identifier.namespace, namespace);
+    }
 }
 
 fn validate_construction_requirement(
@@ -5144,9 +5284,12 @@ fn validate_member_scope_owner(site: ResolutionSiteId, index: &TypedFactIndex<'_
 
 fn validate_type_definition(site: ResolutionSiteId, index: &TypedFactIndex<'_>) {
     assert_eq!(index.site(site).kind, ResolutionSiteKind::TypeDeclaration);
-    assert_eq!(
-        index.definition_identifier(site).namespace,
-        ResolutionNamespace::Type
+    assert!(
+        index.type_declaration_namespace_is_declared(
+            site,
+            index.definition_identifier(site).namespace
+        ),
+        "a type definition occupies the Type namespace or a declared term namespace: {site:?}"
     );
 }
 
@@ -5629,7 +5772,7 @@ fn member_owner_sort_key(
         member_access_rank(row.access),
         qualifier_compatibility_rank(row.qualifier_compatibility),
         row.owner_definition,
-        row.owner_scope_head,
+        row.owner_scope_head(),
     )
 }
 
@@ -5649,7 +5792,7 @@ fn supertype_sort_key(
     (
         row.definition,
         row.parent_ordinal,
-        supertype_kind_rank(row.kind),
+        supertype_kind_rank(row.kind()),
         row.reference,
         row.frontier,
     )

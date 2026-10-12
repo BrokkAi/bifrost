@@ -9,14 +9,14 @@ use crate::analyzer::resolution::{
     FactPageVisitor, JvmImplicitRootProvider, PrecedenceStep, SelectedJvmBridgeEvidence,
     SelectedJvmBridgeProvenance, SelectedJvmBridgeVisibility, SelectedPackageBridgeDescriptor,
     SelectedResolutionMountContext, SelectedRootBridgeDescriptor, SelectedRootPathHalf,
-    SharedNameInterner, language_direct_member_miss_stays_open, language_implicit_root_providers,
-    package_domain_semantic, visit_selected_root_export_half_pages,
-    visit_selected_root_import_half_pages,
+    SharedNameInterner, language_callables_occupy_value_namespace,
+    language_implicit_root_member_names, language_implicit_root_providers, package_domain_semantic,
+    visit_selected_root_export_half_pages, visit_selected_root_import_half_pages,
 };
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionConstructionRequirementKind, ResolutionGapKind, ResolutionImportRouteKind,
     ResolutionImportSelectorKind, ResolutionMemberAccess, ResolutionMemberKind,
-    ResolutionNamespace, ResolutionSiteId,
+    ResolutionNamespace, ResolutionSiteId, ResolutionSupertypeKind,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{DeclaredVisibility, PrecedenceTier};
 use brokk_bifrost_jvm::java::import_split::{
@@ -121,28 +121,32 @@ WITH caller AS (
  JOIN main.jvm_selected_projects p ON p.context_id=m.context_id AND p.project_id=m.project_id
  WHERE m.context_id=?1 AND
    ((?4 IS NOT NULL AND m.source_file_version_id=?4) OR (?4 IS NULL AND m.rel_path=?5))
+), target_root AS (
+ -- Source roots are shared by JVM languages, while exact selected source-file
+ -- rows are language-scoped. The selected target mount supplies this path.
+ SELECT root.project_id, root.role, project.pom_path, project.pom_content_oid,
+        project.group_id, project.artifact_id, project.version_state, project.version_value
+ FROM main.jvm_source_roots root
+ JOIN main.jvm_selected_projects project
+   ON project.context_id=root.context_id AND project.project_id=root.project_id
+ WHERE root.context_id=?1 AND ?5 >= root.root_path || '/' AND ?5 < root.root_path || '0'
 ), target AS (
  SELECT project_id, role, pom_path, pom_content_oid, group_id, artifact_id, version_state, version_value
  FROM target_exact
  UNION ALL
- -- Maven roots are shared by JVM languages, but selected source-file rows are
- -- language-scoped. The exact target route supplies the file path here.
- SELECT root.project_id, root.role, project.pom_path, project.pom_content_oid,
-        project.group_id, project.artifact_id, project.version_state, project.version_value
- FROM caller
- JOIN main.jvm_source_roots root
-   ON root.context_id=caller.context_id AND root.project_id=caller.project_id
- JOIN main.jvm_selected_projects project
-   ON project.context_id=root.context_id AND project.project_id=root.project_id
- WHERE ?5 >= root.root_path || '/' AND ?5 < root.root_path || '0'
-   AND NOT EXISTS(SELECT 1 FROM target_exact)
+ SELECT project_id, role, pom_path, pom_content_oid, group_id, artifact_id, version_state, version_value
+ FROM target_root
+ WHERE NOT EXISTS(SELECT 1 FROM target_exact)
 )
 SELECT CASE
  WHEN (SELECT count(*) FROM caller)<>1 OR (SELECT count(*) FROM target)<>1 THEN 'unknown'
- WHEN EXISTS(SELECT 1 FROM main.jvm_selected_context_gaps g WHERE g.context_id=?1
-             AND g.project_id IN (caller.project_id,target.project_id)) THEN 'unknown'
  WHEN caller.pom_path=target.pom_path AND caller.pom_content_oid=target.pom_content_oid
  THEN CASE WHEN caller.role='main' AND target.role='test' THEN 'excluded' ELSE 'known' END
+ -- A selected workspace source root establishes visibility for its own files;
+ -- Maven dependency/configuration gaps do not make those files external.
+ WHEN target.project_id=caller.project_id AND (SELECT count(*) FROM target_root)=1 THEN 'known'
+ WHEN EXISTS(SELECT 1 FROM main.jvm_selected_context_gaps g WHERE g.context_id=?1
+             AND g.project_id IN (caller.project_id,target.project_id)) THEN 'unknown'
  WHEN target.role='main' AND target.version_state='resolved' AND EXISTS(
    SELECT 1 FROM main.jvm_direct_dependencies d
    WHERE d.context_id=?1 AND d.project_id=caller.project_id
@@ -475,6 +479,92 @@ impl SelectedResolutionOperation<'_, '_> {
                 qualified_reference_semantics.extend(*prefix_reference);
             }
         }
+        // Synthetic absolute parents and written qualified parents use the
+        // same reviewed external declaration identity as an explicit import.
+        for half in &import_halves {
+            let SelectedRootPathHalf::Reference {
+                source_reference,
+                route,
+                demand,
+                anchor,
+                ..
+            } = half
+            else {
+                continue;
+            };
+            if *anchor != ResolutionRootImportAnchor::Absolute && route.is_empty() {
+                continue;
+            }
+            let classifications =
+                lexical.classify_endpoint_nodes(&[*source_reference], cancellation)?;
+            let Some(reference) = classifications
+                .iter()
+                .find(|classification| classification.node() == *source_reference)
+                .and_then(|classification| classification.reference())
+            else {
+                continue;
+            };
+            let is_supertype: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.resolution_supertypes WHERE blob_id=?1 AND reference=?2)",
+                rusqlite::params![source_record.blob_id(), reference.local_key().expect("a mounted reference has a local key")],
+                |row| row.get(0),
+            )?;
+            if !is_supertype {
+                continue;
+            }
+            let Some(recipes) = self.jvm_lookup_recipes(
+                source.fragment(),
+                route.iter().copied().chain([*demand]),
+                cancellation,
+            )?
+            else {
+                return Ok(JvmImportContext::Cancelled);
+            };
+            let declared = recipes
+                .iter()
+                .map(ResolutionLookupSemanticRecipe::spelling)
+                .collect::<Vec<_>>()
+                .join(".");
+            // Name the producer's existing hierarchy reason. A second reason
+            // would outlive the established direct-member cutoff transfers.
+            let origin = super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                    ResolutionGapKind::UnsupportedHierarchyTraversal,
+                ),
+            );
+            let mut statement = connection.prepare_cached(
+                "SELECT gap.reason FROM main.resolution_semantic_sites site
+                 JOIN main.resolution_gap_reasons gap
+                   ON gap.blob_id=site.blob_id AND gap.site=site.source_site
+                 WHERE site.blob_id=?1 AND site.semantic_role='reference'
+                   AND site.semantic_key=?2 AND gap.origin=?3",
+            )?;
+            let gaps = statement.query_map(
+                rusqlite::params![
+                    source_record.blob_id(),
+                    reference
+                        .local_key()
+                        .expect("one source reference has a local key"),
+                    origin
+                ],
+                |row| row.get::<_, u32>(0),
+            )?;
+            for gap in gaps {
+                identities.record_jvm_supertype_name(
+                    SemanticId::local(source.ordinal().get(), gap?),
+                    &declared,
+                );
+            }
+            if self.model_declares_jvm_type(&declared)? {
+                register_model_declared_jvm_type_identity(
+                    reference,
+                    &declared,
+                    self.model_declared_jvm_owner(&declared)?.as_ref(),
+                    &identities,
+                    &self.ready.shared_names(),
+                );
+            }
+        }
         let mut root_bridges = Vec::new();
         let mut route_inventory_open = false;
         let mut scoped_gaps = Vec::new();
@@ -661,6 +751,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 &chained_wildcard_routes,
             );
             let mut resolved_lookup_route = None;
+            let mut resolved_wildcard_route = None;
             for lookup_route in &lookup_routes {
                 let mut matched_package_length = None;
                 // A relative reading finds the enclosing package itself for
@@ -737,6 +828,33 @@ impl SelectedResolutionOperation<'_, '_> {
                     }
                     candidate_prefix_found = true;
                     package_prefix_found |= !relative;
+                    if source_language == Language::Scala
+                        && anchor == ResolutionRootImportAnchor::Lexical
+                        && selector.as_ref().is_some_and(|selector| {
+                            selector.kind == ResolutionImportSelectorKind::Star
+                        })
+                        && prefix_length == lookup_route.len()
+                    {
+                        // Retain the selected package even when this particular
+                        // demand is not one of its members. A later import may
+                        // resolve its owner head through this wildcard.
+                        resolved_wildcard_route = Some(lookup_route.clone());
+                    }
+                    // A package member is imported by its package's whole path:
+                    // `import kyo.internal.*` binds the members of
+                    // `kyo.internal`, never those of its prefix `kyo`. Besides
+                    // the whole path, only the end of the leading segments that
+                    // an enclosing reading adds is a reading of its own: the
+                    // enclosing package, whose own members are visible without
+                    // an import. Any other shorter prefix only locates the
+                    // package of an owner type, which the member continuation
+                    // below reads.
+                    let leading_segments = lookup_route.len().saturating_sub(recipes.len());
+                    if prefix_length != lookup_route.len()
+                        && (leading_segments == 0 || prefix_length != leading_segments)
+                    {
+                        continue;
+                    }
                     let relation = JvmPackageRelation::between(source_package.as_deref(), &package);
                     let mut package_bridges = Vec::new();
                     for (target_ordinal, target_version) in targets {
@@ -943,14 +1061,38 @@ impl SelectedResolutionOperation<'_, '_> {
                     else {
                         return Ok(JvmImportContext::Cancelled);
                     };
-                    // A direct miss is open only when the selected owner has
-                    // a possibly inherited member route that is not modeled,
-                    // or when the language cannot prove absence from this
-                    // namespace's rows (see `language_direct_member_miss_stays_open`).
-                    member_owner_open |= owner_found
-                        && (inventory.inherited_route_open
-                            || (inventory.members.is_empty()
-                                && language_direct_member_miss_stays_open(source_language)));
+                    if owner_found
+                        && source_language == Language::Scala
+                        && anchor == ResolutionRootImportAnchor::Lexical
+                        && selector.as_ref().is_some_and(|selector| {
+                            selector.kind == ResolutionImportSelectorKind::Star
+                        })
+                    {
+                        resolved_wildcard_route = Some(lookup_route.clone());
+                    }
+                    // A member the selected owner does not declare may still be
+                    // inherited, and inherited routes are not modeled. The
+                    // route stays open when a terminal owner may inherit a
+                    // member of this name (an incomplete member inventory, or
+                    // a terminal owner without the member that has a
+                    // supertype row), and a complete direct miss stays open
+                    // unless the owner's declared members are its whole member
+                    // set (`jvm_import_owners_declare_every_member`: no
+                    // declared supertype, no unsupported export, and a name
+                    // outside the language's implicit root).
+                    member_owner_open |= owner_found && inventory.inherited_route_open;
+                    if owner_found && inventory.members.is_empty() {
+                        let Some(closed) = self.jvm_import_owners_declare_every_member(
+                            source_language,
+                            &inventory,
+                            source_name,
+                            cancellation,
+                        )?
+                        else {
+                            return Ok(JvmImportContext::Cancelled);
+                        };
+                        member_owner_open |= !closed;
+                    }
                     package_prefix_found |=
                         relative && (owner_found || !inventory.members.is_empty());
                     root_bridges.extend(inventory.members.into_iter().map(|member| member.bridge));
@@ -971,12 +1113,14 @@ impl SelectedResolutionOperation<'_, '_> {
                 && selector
                     .as_ref()
                     .is_some_and(|selector| selector.kind == ResolutionImportSelectorKind::Star)
-                && root_bridges.len() > bridges_before
             {
-                resolved_lookup_route.clone()
+                resolved_lookup_route
+                    .clone()
+                    .or(resolved_wildcard_route.clone())
             } else {
                 None
             };
+            package_prefix_found |= wildcard_route.is_some();
             if let Some(route) = wildcard_route {
                 earlier_scala_wildcards
                     .entry(source_scope_head)
@@ -1028,7 +1172,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         .collect::<Vec<_>>()
                         .join(".");
                     let declared = format!("{owner}.{}", source_demand.spelling());
-                    if self.model_declares_jvm_type(&declared) {
+                    if self.model_declares_jvm_type(&declared)? {
                         // The reviewed model declares this type, so the import
                         // closes with a model-declared identity instead of an
                         // open route. Member enumeration stays open through the
@@ -1036,6 +1180,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         model_declared_routes.push(ModelDeclaredJvmImportRoute {
                             source_token: token,
                             lookup: source_demand.clone(),
+                            owner: self.model_declared_jvm_owner(&declared)?,
                             declared_fqn: declared,
                         });
                     } else {
@@ -2839,17 +2984,52 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Whether the reviewed JVM semantic model declares the type `fqn`. The
     /// model is the analyzer's active overlay for this request; without an
     /// analyzer or an overlay nothing is declared.
-    fn model_declares_jvm_type(&self, fqn: &str) -> bool {
-        self.ready
+    fn model_declares_jvm_type(&self, fqn: &str) -> Result<bool> {
+        if self
+            .ready
             .analyzer
             .and_then(|analyzer| analyzer.semantic_model_overlay())
             .is_some_and(|overlay| {
                 crate::analyzer::jvm::external::model_declares_external_type(&overlay, fqn)
             })
+        {
+            return Ok(true);
+        }
+        Ok(self.model_declared_jvm_owner(fqn)?.is_some())
+    }
+
+    fn model_declared_jvm_owner(
+        &self,
+        fqn: &str,
+    ) -> Result<Option<crate::analyzer::resolution::ExternalOwnerIdentity>> {
+        let Some(analyzer) = self.ready.analyzer else {
+            return Ok(None);
+        };
+        if let Some(overlay) = analyzer.semantic_model_overlay()
+            && let Some(owner) =
+                crate::analyzer::jvm::external::model_declared_external_owner(&overlay, fqn)
+        {
+            return Ok(Some(owner));
+        }
+        let providers = crate::analyzer::languages::selected_external_inventory_providers(analyzer);
+        if providers.is_empty() {
+            return Ok(None);
+        }
+        let providers =
+            serde_json::to_string(&providers).expect("string provider identities serialize");
+        let provider: Option<String> = self.ready.inventory.connection().query_row(
+            "SELECT CASE WHEN count(*)=1 THEN min(provider_id) END FROM main.jvm_external_owners WHERE owner_fqn=?1 AND provider_id IN (SELECT value FROM json_each(?2))",
+            rusqlite::params![fqn, providers], |row| row.get(0))?;
+        Ok(provider.map(
+            |provider| crate::analyzer::resolution::ExternalOwnerIdentity {
+                provider_id: std::sync::Arc::from(provider),
+                owner_fqn: std::sync::Arc::from(fqn),
+            },
+        ))
     }
 
     /// A manifest-free JVM workspace is one implicit project when each exact
-    /// selected source file's package agrees with its path. Manifest-backed
+    /// selected JVM mount's package agrees with its path. Manifest-backed
     /// projects and paths without package evidence remain governed by the
     /// selected build model or an open source-access result.
     fn in_implicit_project(
@@ -2871,22 +3051,6 @@ impl SelectedResolutionOperation<'_, '_> {
         )?;
         if has_manifest {
             return Ok(false);
-        }
-        for (file_version, path) in [(caller, caller_path), (target, target_path)] {
-            let Some(file_version) = file_version else {
-                return Ok(false);
-            };
-            let is_selected_source_file: bool = connection.query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM main.jvm_selected_source_files
-                   WHERE context_id=?1 AND file_version_id=?2 AND rel_path=?3
-                 )",
-                rusqlite::params![context, file_version, path],
-                |row| row.get(0),
-            )?;
-            if !is_selected_source_file {
-                return Ok(false);
-            }
         }
         for (file_version, path) in [(caller, caller_path), (target, target_path)] {
             let mut statement = connection.prepare_cached(
@@ -3003,7 +3167,6 @@ fn jvm_import_lookup_routes(
             routes.push(earlier_route.to_vec());
         }
         routes.extend(enclosing_scope_routes.iter().cloned());
-        routes.extend(chained_wildcard_routes.iter().cloned());
     }
     if language == Language::Scala
         && anchor == ResolutionRootImportAnchor::Lexical
@@ -3017,6 +3180,13 @@ fn jvm_import_lookup_routes(
             .collect::<Vec<_>>();
         relative.extend(route.iter().cloned());
         routes.push(relative);
+    }
+    // A member supplied by the file's own package outranks a member imported
+    // from a wildcard. Keep chained wildcard routes after this package read;
+    // the shorter-prefix exception below still applies only while enumerating
+    // the prefixes of each individual route.
+    if language == Language::Scala && anchor == ResolutionRootImportAnchor::Lexical {
+        routes.extend(chained_wildcard_routes.iter().cloned());
     }
     routes.push(route.to_vec());
     routes
@@ -3310,6 +3480,7 @@ struct ModelDeclaredJvmImportRoute {
     source_token: SemanticId,
     lookup: ResolutionLookupSemanticRecipe,
     declared_fqn: String,
+    owner: Option<crate::analyzer::resolution::ExternalOwnerIdentity>,
 }
 
 fn model_declared_jvm_type_identity(
@@ -3330,32 +3501,48 @@ fn register_model_declared_jvm_type_identities(
 ) {
     for route in routes {
         let lookup = route.lookup.semantic(names);
-        let identity = model_declared_jvm_type_identity(&route.declared_fqn, names);
-        let mut hash = CanonicalHasher::new(b"bifrost-jvm-model-declared-type-boundary:v1");
-        hash.field("declared-type-fqn", route.declared_fqn.as_bytes());
-        let enumeration_boundary = identities.named_semantic(
-            hash.finish(),
-            "jvm-model-declared-type",
-            &format!(
-                "the reviewed JVM model declares `{}`; its members are enumerated from the model only",
-                route.declared_fqn
-            ),
-        );
         for reference in package_reference_occurrences {
             if reference.token == route.source_token
                 && reference.lookup == lookup
                 && reference.namespace == ResolutionNamespace::Type
                 && unqualified_type_references.contains(&reference.reference)
             {
-                identities.record_jvm_external_provider_type_identity(
+                register_model_declared_jvm_type_identity(
                     reference.reference,
-                    enumeration_boundary,
-                    identity,
-                    enumeration_boundary,
+                    &route.declared_fqn,
+                    route.owner.as_ref(),
+                    identities,
+                    names,
                 );
             }
         }
     }
+}
+
+fn register_model_declared_jvm_type_identity(
+    reference: SemanticId,
+    declared_fqn: &str,
+    owner: Option<&crate::analyzer::resolution::ExternalOwnerIdentity>,
+    identities: &SelectedContextIdentities,
+    names: &dyn SharedNameInterner,
+) {
+    let identity = owner.map_or_else(
+        || model_declared_jvm_type_identity(declared_fqn, names),
+        |owner| identities.external_owner_semantic(owner, names),
+    );
+    let mut hash = CanonicalHasher::new(b"bifrost-jvm-model-declared-type-boundary:v1");
+    hash.field("declared-type-fqn", declared_fqn.as_bytes());
+    let enumeration_boundary = identities.named_semantic(
+        hash.finish(),
+        "jvm-model-declared-type",
+        &format!("the reviewed JVM model declares `{declared_fqn}`; its members are enumerated from the model only"),
+    );
+    identities.record_jvm_external_provider_type_identity(
+        reference,
+        enumeration_boundary,
+        identity,
+        enumeration_boundary,
+    );
 }
 
 fn register_jvm_external_provider_type_identities(
@@ -3596,6 +3783,18 @@ impl SelectedResolutionOperation<'_, '_> {
                         )
                     })
                     .collect::<Vec<_>>();
+                let package_segments = identity
+                    .segments
+                    .iter()
+                    .take_while(|(kind, _)| {
+                        *kind == brokk_bifrost_core::analyzer::fq_name::SegmentKind::Package
+                    })
+                    .count();
+                if package_segments > 0 {
+                    let mut package_scope = owner_route[..package_segments].to_vec();
+                    package_scope.extend(route.iter().cloned());
+                    routes.insert(package_scope);
+                }
                 for (index, (kind, _)) in identity.segments.iter().enumerate() {
                     if !matches!(
                         kind,
@@ -3669,6 +3868,74 @@ impl SelectedResolutionOperation<'_, '_> {
         )))
     }
 
+    /// Whether an import owner that declares no member `name` has no such
+    /// member at all.
+    ///
+    /// The declared members are the whole member set when every declared member
+    /// row was read and named, no owner declares a supertype or an unsupported
+    /// export (the hierarchy gap the producers attach to a type whose member
+    /// set extends past its body), and `name` is not a member of the language's
+    /// implicit root. An owner's own edge to that implicit root (Java's
+    /// `Object` row) is not a declared supertype: the root's names are the
+    /// language hook's. The hierarchy walk is not run here; the import context
+    /// is built before any evaluation exists, so an owner with a supertype
+    /// keeps its route open.
+    fn jvm_import_owners_declare_every_member(
+        &self,
+        language: Language,
+        inventory: &JavaTypeMemberImportInventory,
+        name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<bool>> {
+        assert!(
+            !inventory.owners.is_empty(),
+            "a member-route decision is made only for a found owner"
+        );
+        if !inventory.declared_members_complete
+            || language_implicit_root_member_names(language).contains(&name)
+        {
+            return Ok(Some(false));
+        }
+        let typed = self.ready.typed_source();
+        let mut owners = inventory.owners.clone();
+        owners.sort_unstable();
+        owners.dedup();
+        let mut inherits = false;
+        for chunk in owners.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+            let outcome = typed.visit_supertype_pages_for_definitions(
+                TypedFactRequest::new(chunk),
+                cancellation,
+                &mut FactPageVisitor::new(&mut |page| {
+                    inherits |= page
+                        .iter()
+                        .any(|row| row.row().kind() != ResolutionSupertypeKind::ImplicitSuperclass);
+                    Ok(true)
+                }),
+            )?;
+            if outcome.is_cancelled() {
+                return Ok(None);
+            }
+            inherits |=
+                !(outcome.is_exhausted() && outcome.evidence() == &ResolutionCompletion::Complete);
+            let outcome = typed.visit_definition_property_gap_pages_for_definitions(
+                TypedFactRequest::new(chunk),
+                cancellation,
+                &mut FactPageVisitor::new(&mut |page| {
+                    inherits |= page.iter().any(|row| {
+                        row.row().kind() == ResolutionGapKind::UnsupportedHierarchyTraversal
+                    });
+                    Ok(true)
+                }),
+            )?;
+            if outcome.is_cancelled() {
+                return Ok(None);
+            }
+            inherits |=
+                !(outcome.is_exhausted() && outcome.evidence() == &ResolutionCompletion::Complete);
+        }
+        Ok(Some(!inherits))
+    }
+
     /// Query-owned direct member continuation. Package prefixes come from
     /// exact selected package rows; each remaining segment must name a member
     /// of the already-proven type. Inherited routes remain incomplete.
@@ -3689,10 +3956,14 @@ impl SelectedResolutionOperation<'_, '_> {
             import.import_kind,
             Some(ResolutionImportRouteKind::SingleType)
         );
+        // A def is a term, so a Value demand names it as well as a field.
+        let callables_in_value = language_callables_occupy_value_namespace(import.language);
         let mut bridges = Vec::new();
         let mut workspace_type_rows = Vec::new();
         let mut workspace_inventory_complete = true;
         let mut inherited_route_open = false;
+        let mut owners_found = Vec::new();
+        let mut declared_members_complete = true;
         // An imported type cannot be in the unnamed package. The final route
         // segment is an enclosing type here; ordinary package imports are
         // composed separately by the caller.
@@ -3800,6 +4071,9 @@ impl SelectedResolutionOperation<'_, '_> {
                         .ok_or_else(|| {
                             StoreError::corrupt("Java enclosing export lacks definition")
                         })?;
+                    if nested_route.is_empty() {
+                        owners_found.push(owner);
+                    }
                     let target_file = ProjectFile::new(
                         self.ready.project.root().to_path_buf(),
                         target_mount.persisted_relative_path(),
@@ -3886,13 +4160,18 @@ impl SelectedResolutionOperation<'_, '_> {
                                                         ResolutionNamespace::Callable,
                                                         ResolutionMemberKind::Method
                                                     )
-                                                ) || (import.language == Language::Scala
-                                                    && namespace == ResolutionNamespace::Callable
-                                                    && matches!(
-                                                        row.row().kind(),
-                                                        ResolutionMemberKind::Field
-                                                            | ResolutionMemberKind::NestedType
-                                                    ))
+                                                ) || (callables_in_value
+                                                    && namespace == ResolutionNamespace::Value
+                                                    && row.row().kind()
+                                                        == ResolutionMemberKind::Method)
+                                                    || (import.language == Language::Scala
+                                                        && namespace
+                                                            == ResolutionNamespace::Callable
+                                                        && matches!(
+                                                            row.row().kind(),
+                                                            ResolutionMemberKind::Field
+                                                                | ResolutionMemberKind::NestedType
+                                                        ))
                                             })
                                             .map(|row| {
                                                 (row.row().definition(), row.row().access())
@@ -3908,6 +4187,8 @@ impl SelectedResolutionOperation<'_, '_> {
                                 terminal_member_inventory_complete &= outcome.is_exhausted()
                                     && outcome.evidence() == &ResolutionCompletion::Complete;
                             }
+                            declared_members_complete &= outcome.is_exhausted()
+                                && outcome.evidence() == &ResolutionCompletion::Complete;
                             if version.is_some() && collect_workspace_type_rows {
                                 workspace_inventory_complete &= outcome.is_exhausted()
                                     && outcome.evidence() == &ResolutionCompletion::Complete;
@@ -3942,6 +4223,10 @@ impl SelectedResolutionOperation<'_, '_> {
                                 else {
                                     return Ok(None);
                                 };
+                                let named_keys =
+                                    rows.iter().map(|(_, key, _)| *key).collect::<BTreeSet<_>>();
+                                declared_members_complete &=
+                                    chunk.iter().all(|(_, key)| named_keys.contains(key));
                                 if version.is_some()
                                     && collect_workspace_type_rows
                                     && rows.len() != chunk.len()
@@ -3960,6 +4245,9 @@ impl SelectedResolutionOperation<'_, '_> {
                                         ResolutionNamespace::Value => {
                                             row.kind
                                                 == brokk_bifrost_core::analyzer::model::CodeUnitType::Field
+                                                || (callables_in_value
+                                                    && row.kind
+                                                        == brokk_bifrost_core::analyzer::model::CodeUnitType::Function)
                                         }
                                         ResolutionNamespace::Callable => {
                                             row.kind
@@ -3998,6 +4286,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                         if step == nested_route.len() {
                                             terminal_member_inventory_complete = false;
                                         }
+                                        declared_members_complete = false;
                                         if version.is_some() && collect_workspace_type_rows {
                                             workspace_inventory_complete = false;
                                         }
@@ -4021,6 +4310,11 @@ impl SelectedResolutionOperation<'_, '_> {
                                         u32::try_from(key.get())
                                             .expect("a catalog position fits u32"),
                                     );
+                                    if step + 1 == nested_route.len()
+                                        && namespace == ResolutionNamespace::Type
+                                    {
+                                        owners_found.push(member);
+                                    }
                                     let (fq, package_segments) =
                                         super::super::hydrate_unit_fq_with_anchor(
                                             Some(identity),
@@ -4098,7 +4392,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             TypedFactRequest::new(&missing_terminal_owners),
                             cancellation,
                             &mut FactPageVisitor::new(&mut |page| {
-                                supertypes.extend(page.iter().map(|row| *row.row()));
+                                supertypes.extend(page.iter().map(|row| row.row().clone()));
                                 Ok(true)
                             }),
                         )?;
@@ -4142,6 +4436,8 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(
             (!cancellation.is_cancelled()).then_some(JavaTypeMemberImportInventory {
                 members: bridges,
+                owners: owners_found,
+                declared_members_complete,
                 workspace_type_rows,
                 workspace_inventory_complete,
                 inherited_route_open,
@@ -4161,6 +4457,12 @@ struct JavaImportMemberCandidate {
 
 struct JavaTypeMemberImportInventory {
     members: Vec<JavaImportMemberCandidate>,
+    /// The definitions of the owners whose declared members were enumerated,
+    /// one per owner the route reached.
+    owners: Vec<SemanticId>,
+    /// Whether every declared member row of those owners was read and named by
+    /// a code unit, so that an absent name is absent from the declarations.
+    declared_members_complete: bool,
     workspace_type_rows: Vec<CodeUnit>,
     workspace_inventory_complete: bool,
     inherited_route_open: bool,

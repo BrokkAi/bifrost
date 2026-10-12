@@ -56,6 +56,7 @@ impl CallApplicabilityAdapter for KotlinCallApplicabilityAdapter {
                 bindings,
                 used_defaults,
                 used_vararg,
+                ..
             } => {
                 let Some(mut assessment) = evaluation.assess_kotlin_call_candidate(
                     candidate,

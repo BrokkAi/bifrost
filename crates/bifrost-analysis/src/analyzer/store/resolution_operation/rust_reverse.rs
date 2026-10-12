@@ -23,6 +23,18 @@ fn test_reverse_source_does_not_own_sql_reader() -> ! {
     unreachable!("test reverse source does not own a selected SQL reader")
 }
 
+/// One requested reference retains all of its selected root answers.
+pub(crate) enum ReferenceResolution {
+    Answered(Vec<FactResolutionAnswer>),
+    Omitted(ReferenceOmission),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ReferenceOmission {
+    ReceiverBudget(brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit),
+    TimeBudgetExceeded,
+}
+
 /// Values returned inside this callback are provisional. Only the enclosing
 /// selected operation can authorize publication after its final authority check.
 pub(crate) trait SelectedRustReverseQueries {
@@ -59,12 +71,12 @@ pub(crate) trait SelectedRustReverseQueries {
         )>,
     >;
 
-    /// Resolve requested canonical occurrences in this same selected session.
+    /// Resolve canonical occurrences in request order, one slot per reference.
     /// None stops publication; the enclosing operation retains its terminal.
     fn resolve_references(
         &mut self,
         references: &[SemanticId],
-    ) -> Result<Option<Vec<FactResolutionAnswer>>>;
+    ) -> Result<Option<Vec<ReferenceResolution>>>;
 
     #[cfg(test)]
     /// Actual persisted definition-map loads in this selected operation. This

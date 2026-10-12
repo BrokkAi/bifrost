@@ -3589,6 +3589,77 @@
         }
       ]
     },
+    "JvmNestedType": {
+      "type": "object",
+      "properties": {
+        "is_static": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "owner_fqn": {
+          "type": "string"
+        },
+        "visibility": {
+          "$ref": "#/$defs/Visibility"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "owner_fqn",
+        "visibility",
+        "is_static"
+      ]
+    },
+    "JvmOwnerInventory": {
+      "description": "Structured JVM inventory coverage. Missing coverage is deliberately open.",
+      "type": "object",
+      "properties": {
+        "additional_members": {
+          "description": "Members outside the public API projection, in producer order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MemberFact"
+          }
+        },
+        "callables_complete": {
+          "type": "boolean"
+        },
+        "nested_types": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JvmNestedType"
+          }
+        },
+        "supertypes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HierarchyFact"
+          }
+        },
+        "supertypes_complete": {
+          "type": "boolean"
+        },
+        "types_complete": {
+          "type": "boolean"
+        },
+        "values_complete": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "callables_complete",
+        "values_complete",
+        "types_complete",
+        "supertypes_complete",
+        "supertypes",
+        "nested_types",
+        "additional_members"
+      ]
+    },
     "KeyedReadBehavior": {
       "type": "object",
       "properties": {
@@ -7480,6 +7551,17 @@
         "is_sealed": {
           "type": "boolean",
           "default": false
+        },
+        "jvm_inventory": {
+          "description": "Per-namespace absence coverage asserted by an independently enumerated\nJVM provider. Older public-API shards do not imply this stronger claim.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JvmOwnerInventory"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "locator": {
           "$ref": "#/$defs/Locator"

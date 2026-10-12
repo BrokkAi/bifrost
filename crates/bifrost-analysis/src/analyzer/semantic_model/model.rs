@@ -2670,6 +2670,10 @@ pub struct TypeFact {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[schemars(extend("default" = false))]
     pub callable_surface_complete: bool,
+    /// Per-namespace absence coverage asserted by an independently enumerated
+    /// JVM provider. Older public-API shards do not imply this stronger claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jvm_inventory: Option<JvmOwnerInventory>,
     #[serde(default)]
     pub has_explicit_type_terms: bool,
     #[serde(default)]
@@ -2699,6 +2703,29 @@ pub struct TypeFact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<DeclarationGuard>,
     pub locator: Locator,
+}
+
+/// Structured JVM inventory coverage. Missing coverage is deliberately open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JvmOwnerInventory {
+    pub callables_complete: bool,
+    pub values_complete: bool,
+    pub types_complete: bool,
+    pub supertypes_complete: bool,
+    pub supertypes: Vec<HierarchyFact>,
+    pub nested_types: Vec<JvmNestedType>,
+    /// Members outside the public API projection, in producer order.
+    pub additional_members: Vec<MemberFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JvmNestedType {
+    pub name: String,
+    pub owner_fqn: String,
+    pub visibility: Visibility,
+    pub is_static: bool,
 }
 
 /// Reviewed value semantics for a declared type. Copy behavior and move

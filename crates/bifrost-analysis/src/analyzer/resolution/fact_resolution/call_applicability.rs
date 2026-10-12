@@ -14,7 +14,8 @@ use super::super::model::ResolutionAnswer;
 use super::super::model::ResolutionCompletion;
 use super::super::model::SemanticId;
 use super::super::typed_fact_lowering::{
-    LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty,
+    LoweredCallApplicabilityObligation, LoweredCallArgumentProperty,
+    LoweredCallableSignatureProperty,
 };
 use super::{
     AnswerMap, CallCandidateApplicability, FactEvaluation, InternedFactRow, StateMap, StoreResult,
@@ -33,6 +34,7 @@ pub(crate) enum MappingAssessment {
         bindings: Vec<ArgumentFormalBinding>,
         used_defaults: u32,
         used_vararg: bool,
+        result_application_lists: Vec<u32>,
     },
     Inapplicable(CallableRejectionReason),
     Unknown,
@@ -71,6 +73,19 @@ pub(crate) struct CandidateAssessment {
     pub conversions: Vec<ConversionEvidence>,
     pub used_vararg: bool,
     pub used_defaults: u32,
+}
+
+pub(super) enum ResultApplicationAssessment {
+    Applicable(Vec<ConversionEvidence>),
+    Inapplicable(CallableRejectionReason),
+    Unknown,
+}
+
+pub(super) struct ResultApplicationRequest<'a> {
+    pub(super) call: &'a LoweredCallApplicabilityObligation,
+    pub(super) lists: &'a [u32],
+    pub(super) member_names: &'a [&'a str],
+    pub(super) previous_states: &'a StateMap,
 }
 
 impl CandidateAssessment {
@@ -129,6 +144,10 @@ pub(crate) trait CallApplicabilityAdapter: Sync {
         signature: &LoweredCallableSignatureProperty,
     ) -> MappingAssessment;
 
+    fn result_application_member_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn assess_candidate(
         &self,
@@ -154,6 +173,7 @@ pub(crate) trait CallApplicabilityAdapter: Sync {
                 bindings,
                 used_defaults,
                 used_vararg,
+                result_application_lists,
             } => {
                 let Some(mut assessment) = self.assess_mapped_candidate(
                     evaluation,
@@ -169,6 +189,30 @@ pub(crate) trait CallApplicabilityAdapter: Sync {
                     return Ok(None);
                 };
                 assessment.used_defaults = used_defaults;
+                if !result_application_lists.is_empty() {
+                    match evaluation.assess_result_application_chain(
+                        self,
+                        signature,
+                        ResultApplicationRequest {
+                            call,
+                            lists: &result_application_lists,
+                            member_names: self.result_application_member_names(),
+                            previous_states,
+                        },
+                        completion,
+                    )? {
+                        Some(ResultApplicationAssessment::Applicable(conversions)) => {
+                            assessment.conversions.extend(conversions);
+                        }
+                        Some(ResultApplicationAssessment::Inapplicable(reason)) => {
+                            return Ok(Some(CandidateAssessment::inapplicable(candidate, reason)));
+                        }
+                        Some(ResultApplicationAssessment::Unknown) => {
+                            assessment.verdict = ApplicabilityVerdict::Unknown;
+                        }
+                        None => return Ok(None),
+                    }
+                }
                 Ok(Some(assessment))
             }
             MappingAssessment::Inapplicable(reason) => {
@@ -283,18 +327,59 @@ pub(crate) fn map_call_shape(
         return MappingAssessment::Unknown;
     }
     if call.argument_lists() != signature.parameter_lists() {
-        if call.argument_lists().len() < signature.parameter_lists().len()
-            && call
-                .argument_lists()
-                .iter()
-                .zip(signature.parameter_lists())
-                .all(|(call_list, parameter_list)| call_list == parameter_list)
-        {
-            return MappingAssessment::Unknown;
-        }
         return MappingAssessment::Inapplicable(CallableRejectionReason::ListShapeMismatch);
     }
 
+    map_matching_argument_lists(
+        call,
+        signature,
+        call.argument_lists(),
+        allow_defaults,
+        allow_labels,
+        missing_required_reason,
+        Vec::new(),
+    )
+}
+
+pub(crate) fn map_scala_call_shape(
+    call: &LoweredCallApplicabilityObligation,
+    signature: &LoweredCallableSignatureProperty,
+    allow_defaults: bool,
+    allow_labels: bool,
+    missing_required_reason: CallableRejectionReason,
+) -> MappingAssessment {
+    if call.argument_lists().is_empty() {
+        return MappingAssessment::Unknown;
+    }
+    let matched_count = call
+        .argument_lists()
+        .len()
+        .min(signature.parameter_lists().len());
+    let matched_lists = &call.argument_lists()[..matched_count];
+    if matched_lists != &signature.parameter_lists()[..matched_count] {
+        return MappingAssessment::Inapplicable(CallableRejectionReason::ListShapeMismatch);
+    }
+    let result_application_lists = call.argument_lists()[matched_count..].to_vec();
+    map_matching_argument_lists(
+        call,
+        signature,
+        matched_lists,
+        allow_defaults,
+        allow_labels,
+        missing_required_reason,
+        result_application_lists,
+    )
+}
+
+fn map_matching_argument_lists(
+    call: &LoweredCallApplicabilityObligation,
+    signature: &LoweredCallableSignatureProperty,
+    matched_lists: &[u32],
+    allow_defaults: bool,
+    allow_labels: bool,
+    missing_required_reason: CallableRejectionReason,
+    result_application_lists: Vec<u32>,
+) -> MappingAssessment {
     let arguments = call.arguments();
     let parameters = signature.parameters();
     let metadata = signature.parameter_applicability();
@@ -303,7 +388,7 @@ pub(crate) fn map_call_shape(
     let mut used_defaults = 0_u32;
     let mut used_vararg = false;
 
-    for &list_ordinal in call.argument_lists() {
+    for &list_ordinal in matched_lists {
         let list_arguments = arguments
             .iter()
             .enumerate()
@@ -416,11 +501,12 @@ pub(crate) fn map_call_shape(
         bindings,
         used_defaults,
         used_vararg,
+        result_application_lists,
     }
 }
 
-pub(super) fn select_candidate_indices(
-    adapter: &dyn CallApplicabilityAdapter,
+pub(super) fn select_candidate_indices<A: CallApplicabilityAdapter + ?Sized>(
+    adapter: &A,
     assessments: &[CandidateAssessment],
     subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
 ) -> Vec<usize> {
@@ -444,8 +530,253 @@ pub(super) fn select_candidate_indices(
         .collect()
 }
 
-fn dominates(
-    adapter: &dyn CallApplicabilityAdapter,
+impl FactEvaluation<'_, '_> {
+    pub(super) fn assess_result_application_chain<A: CallApplicabilityAdapter + ?Sized>(
+        &mut self,
+        adapter: &A,
+        signature: &LoweredCallableSignatureProperty,
+        request: ResultApplicationRequest<'_>,
+        completion: &mut ResolutionCompletion,
+    ) -> StoreResult<Option<ResultApplicationAssessment>> {
+        if request.member_names.is_empty() {
+            return Ok(Some(ResultApplicationAssessment::Unknown));
+        }
+        let [result_type] = signature.result_types() else {
+            return Ok(Some(ResultApplicationAssessment::Unknown));
+        };
+        self.assess_result_application_from_slot(adapter, result_type.slot(), request, completion)
+    }
+
+    pub(super) fn assess_result_application_from_slot<A: CallApplicabilityAdapter + ?Sized>(
+        &mut self,
+        adapter: &A,
+        mut result_slot: SemanticId,
+        request: ResultApplicationRequest<'_>,
+        completion: &mut ResolutionCompletion,
+    ) -> StoreResult<Option<ResultApplicationAssessment>> {
+        if request.member_names.is_empty() {
+            return Ok(Some(ResultApplicationAssessment::Unknown));
+        }
+        let mut conversions = Vec::new();
+
+        for &list_ordinal in request.lists {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            self.demand_slot(result_slot);
+            let Some(state) = request.previous_states.get(&result_slot) else {
+                return Ok(Some(ResultApplicationAssessment::Unknown));
+            };
+            if state.completion() != &ResolutionCompletion::Complete {
+                *completion = completion.combine(state.completion());
+            }
+            let mut result_types = state
+                .possible_values()
+                .iter()
+                .map(|value| value.ty())
+                .collect::<Vec<_>>();
+            result_types.sort_unstable();
+            result_types.dedup();
+            if result_types.is_empty()
+                || result_types
+                    .iter()
+                    .any(|result_type| result_type.indirection() != 0)
+            {
+                return Ok(Some(ResultApplicationAssessment::Unknown));
+            }
+            let owners = result_types
+                .iter()
+                .map(|result_type| result_type.identity())
+                .collect::<Vec<_>>();
+            let Some(members_by_owner) =
+                self.applied_type_members(&owners, request.member_names)?
+            else {
+                return Ok(None);
+            };
+            let has_open_owner = result_types
+                .iter()
+                .any(|result_type| !members_by_owner.contains_key(&result_type.identity()));
+            if has_open_owner {
+                return Ok(Some(ResultApplicationAssessment::Unknown));
+            }
+            if members_by_owner.values().any(Vec::is_empty) {
+                if result_types
+                    .iter()
+                    .all(|result_type| members_by_owner[&result_type.identity()].is_empty())
+                    && self.result_types_prove_non_callable(&owners)?
+                {
+                    return Ok(Some(ResultApplicationAssessment::Inapplicable(
+                        CallableRejectionReason::ListShapeMismatch,
+                    )));
+                }
+                return Ok(Some(ResultApplicationAssessment::Unknown));
+            }
+            let mut members = members_by_owner
+                .values()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
+            members.sort_unstable();
+            members.dedup();
+            if members.is_empty() {
+                if !self.result_types_prove_non_callable(&owners)? {
+                    return Ok(Some(ResultApplicationAssessment::Unknown));
+                }
+                return Ok(Some(ResultApplicationAssessment::Inapplicable(
+                    CallableRejectionReason::ListShapeMismatch,
+                )));
+            }
+
+            let signature_read = self.session.signatures_for_definitions(&members)?;
+            let Some(signature_rows) = self.accept_session_read(signature_read) else {
+                return Ok(None);
+            };
+            let signatures = signature_rows
+                .iter()
+                .map(|row| {
+                    let signature = row.get(self.session).row().clone();
+                    (signature.definition(), signature)
+                })
+                .collect::<HashMap<_, _>>();
+            let Some(invocation) = result_application_obligation(request.call, list_ordinal) else {
+                return Ok(Some(ResultApplicationAssessment::Unknown));
+            };
+            let mut assessments = Vec::with_capacity(members.len());
+            for &member in &members {
+                let Some(apply_signature) = signatures.get(&member) else {
+                    assessments.push(CandidateAssessment::unknown(member));
+                    continue;
+                };
+                let Some(assessment) = adapter.assess_candidate(
+                    self,
+                    member,
+                    &invocation,
+                    apply_signature,
+                    true,
+                    &AnswerMap::default(),
+                    request.previous_states,
+                    completion,
+                )?
+                else {
+                    return Ok(None);
+                };
+                assessments.push(assessment);
+            }
+            let selected = select_candidate_indices(adapter, &assessments, &HashMap::default());
+            if selected.is_empty() {
+                return Ok(Some(ResultApplicationAssessment::Inapplicable(
+                    CallableRejectionReason::ListShapeMismatch,
+                )));
+            }
+            let [selected_index] = selected.as_slice() else {
+                return Ok(Some(ResultApplicationAssessment::Unknown));
+            };
+            let selected = &assessments[*selected_index];
+            match selected.verdict {
+                ApplicabilityVerdict::Applicable => {
+                    conversions.extend(selected.conversions.iter().copied());
+                    let selected_signature = &signatures[&selected.candidate];
+                    let [result_type] = selected_signature.result_types() else {
+                        if list_ordinal != *request.lists.last().unwrap() {
+                            return Ok(Some(ResultApplicationAssessment::Unknown));
+                        }
+                        continue;
+                    };
+                    result_slot = result_type.slot();
+                }
+                ApplicabilityVerdict::Inapplicable => {
+                    if assessments
+                        .iter()
+                        .any(|assessment| assessment.verdict == ApplicabilityVerdict::Unknown)
+                    {
+                        return Ok(Some(ResultApplicationAssessment::Unknown));
+                    }
+                    return Ok(Some(ResultApplicationAssessment::Inapplicable(
+                        CallableRejectionReason::ListShapeMismatch,
+                    )));
+                }
+                ApplicabilityVerdict::Unknown => {
+                    return Ok(Some(ResultApplicationAssessment::Unknown));
+                }
+            }
+        }
+        Ok(Some(ResultApplicationAssessment::Applicable(conversions)))
+    }
+
+    fn result_types_prove_non_callable(&mut self, owners: &[SemanticId]) -> StoreResult<bool> {
+        let intrinsic_read = self.session.intrinsics_for_type_identities(owners)?;
+        let Some(intrinsics) = self.accept_session_read(intrinsic_read) else {
+            return Ok(false);
+        };
+        if intrinsics.iter().any(|intrinsic| {
+            intrinsic.get(self.session).row().kind() == super::IntrinsicTypeKind::Primitive
+        }) {
+            return Ok(true);
+        }
+        let Some(declarations) = self.session.java_declarations(owners)? else {
+            self.cancellation_observed = true;
+            return Ok(false);
+        };
+        if declarations.len() != owners.len()
+            || declarations.iter().any(|declaration| {
+                !matches!(
+                    declaration.kind,
+                    super::super::fact_source::JavaInheritanceDeclarationKind::Type { .. }
+                )
+            })
+        {
+            return Ok(false);
+        }
+        let supertype_read = self.session.supertypes_for_definitions(owners)?;
+        let Some(supertypes) = self.accept_session_read(supertype_read) else {
+            return Ok(false);
+        };
+        Ok(supertypes.is_empty())
+    }
+}
+
+fn result_application_obligation(
+    call: &LoweredCallApplicabilityObligation,
+    list_ordinal: u32,
+) -> Option<LoweredCallApplicabilityObligation> {
+    let arguments = call
+        .arguments()
+        .iter()
+        .filter(|argument| argument.list_ordinal() == list_ordinal)
+        .enumerate()
+        .map(|(ordinal, argument)| {
+            LoweredCallArgumentProperty::new(
+                0,
+                u32::try_from(ordinal).expect("result application argument count fits u32"),
+                argument.slot(),
+                argument
+                    .label()
+                    .map(|label| label.to_owned().into_boxed_str()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let slots = arguments
+        .iter()
+        .map(LoweredCallArgumentProperty::slot)
+        .collect::<Vec<_>>();
+    Some(
+        LoweredCallApplicabilityObligation::new(
+            call.call(),
+            call.callee_reference(),
+            None,
+            call.result_slot(),
+            slots,
+            Vec::new(),
+            0,
+            call.applicability_reason(),
+            call.completion().clone(),
+        )
+        .with_argument_shape(call.language(), arguments, vec![0]),
+    )
+}
+
+fn dominates<A: CallApplicabilityAdapter + ?Sized>(
+    adapter: &A,
     left: &CandidateAssessment,
     right: &CandidateAssessment,
     subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
@@ -695,6 +1026,7 @@ mod tests {
                 }],
                 used_defaults: 1,
                 used_vararg: true,
+                result_application_lists: vec![],
             }
         );
     }
@@ -777,6 +1109,7 @@ mod tests {
                 ],
                 used_defaults: 0,
                 used_vararg: false,
+                result_application_lists: vec![],
             }
         );
     }
@@ -843,6 +1176,7 @@ mod tests {
                 ],
                 used_defaults: 0,
                 used_vararg: true,
+                result_application_lists: vec![],
             }
         );
     }

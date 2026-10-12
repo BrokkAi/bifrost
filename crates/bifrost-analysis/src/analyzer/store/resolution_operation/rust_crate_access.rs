@@ -348,41 +348,74 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
     }
 }
 
-pub(super) const PLACEMENTS: &str = "WITH RECURSIVE graph(topology_id) AS (
- SELECT topology_id FROM selected_rust_crates WHERE crate_key=?1
- UNION SELECT target.topology_id FROM graph
- CROSS JOIN rust_crate_dependencies AS dependency USING(topology_id)
- CROSS JOIN selected_rust_crates AS target ON target.crate_key=dependency.dependency_crate_key
-) SELECT source.topology_id,source.container_path,json(topology.cfg_atoms)
-FROM source_rust_module_scopes AS scope
-CROSS JOIN rust_crate_container_sources AS source ON source.blob_id=scope.blob_id AND source.scope_ordinal=scope.ordinal
-CROSS JOIN rust_crate_topologies AS topology ON topology.topology_id=source.topology_id
-WHERE scope.blob_id=?2 AND scope.declaration_id IS ?3
-AND source.topology_id IN (SELECT topology_id FROM graph)";
+pub(super) const PLACEMENTS: &str = "WITH RECURSIVE graph(
+ workspace_id, generation, unit_key, summary_id, topology_id
+) AS (
+ SELECT workspace_id, generation, unit_key, summary_id, topology_id
+ FROM selected_rust_unit_summaries WHERE unit_key=?1
+ UNION
+ SELECT child.workspace_id, child.generation, child.unit_key,
+        child.summary_id, child.topology_id
+ FROM graph
+ JOIN main.resolution_unit_summary_dependencies AS dependency
+   ON dependency.summary_id=graph.summary_id AND dependency.boundary='workspace'
+ JOIN selected_rust_unit_summaries AS child
+   ON child.workspace_id=graph.workspace_id AND child.generation=graph.generation
+  AND child.unit_key=dependency.dependency_unit_key
+)
+SELECT placement.topology_id, placement.container_path, json(context.cfg_atoms)
+FROM graph
+CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
+  ON context.summary_id=graph.summary_id
+CROSS JOIN selected_rust_module_placements AS placement
+  ON placement.topology_id=graph.topology_id
+WHERE placement.placement_blob=?2 AND placement.module_declaration IS ?3";
 
 /// The module placements of a blob in the crate being resolved only, with the
 /// same columns as [`PLACEMENTS`]. See `reference_placements`.
-pub(super) const REFERENCE_PLACEMENTS: &str = "SELECT source.topology_id,source.container_path,json(topology.cfg_atoms)
-FROM source_rust_module_scopes AS scope
-CROSS JOIN rust_crate_container_sources AS source ON source.blob_id=scope.blob_id AND source.scope_ordinal=scope.ordinal
-CROSS JOIN rust_crate_topologies AS topology ON topology.topology_id=source.topology_id
-WHERE scope.blob_id=?2 AND scope.declaration_id IS ?3
-AND source.topology_id IN (SELECT topology_id FROM selected_rust_crates WHERE crate_key=?1)";
+pub(super) const REFERENCE_PLACEMENTS: &str = "SELECT placement.topology_id,
+ placement.container_path, json(context.cfg_atoms)
+FROM selected_rust_unit_summaries AS unit
+JOIN main.rust_resolution_unit_summary_contexts AS context
+  ON context.summary_id=unit.summary_id
+JOIN selected_rust_module_placements AS placement
+  ON placement.topology_id=unit.topology_id
+WHERE unit.unit_key=?1 AND placement.placement_blob=?2
+  AND placement.module_declaration IS ?3";
 
-pub(super) const MEMBERSHIPS: &str = "WITH RECURSIVE graph(topology_id) AS (
- SELECT topology_id FROM selected_rust_crates WHERE crate_key=?1
- UNION SELECT target.topology_id FROM graph
- CROSS JOIN rust_crate_dependencies AS dependency USING(topology_id)
- CROSS JOIN selected_rust_crates AS target ON target.crate_key=dependency.dependency_crate_key
-) SELECT DISTINCT source.topology_id,json(topology.cfg_atoms),topology.target_kind
-FROM rust_crate_container_sources AS source
-CROSS JOIN rust_crate_topologies AS topology ON topology.topology_id=source.topology_id
-WHERE source.blob_id=?2 AND source.topology_id IN (SELECT topology_id FROM graph)";
+pub(super) const MEMBERSHIPS: &str = "WITH RECURSIVE graph(
+ workspace_id, generation, unit_key, summary_id, topology_id
+) AS (
+ SELECT workspace_id, generation, unit_key, summary_id, topology_id
+ FROM selected_rust_unit_summaries WHERE unit_key=?1
+ UNION
+ SELECT child.workspace_id, child.generation, child.unit_key,
+        child.summary_id, child.topology_id
+ FROM graph
+ JOIN main.resolution_unit_summary_dependencies AS dependency
+   ON dependency.summary_id=graph.summary_id AND dependency.boundary='workspace'
+ JOIN selected_rust_unit_summaries AS child
+   ON child.workspace_id=graph.workspace_id AND child.generation=graph.generation
+  AND child.unit_key=dependency.dependency_unit_key
+)
+SELECT graph.topology_id, json(context.cfg_atoms), context.target_kind
+FROM graph
+CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
+  ON context.summary_id=graph.summary_id
+WHERE EXISTS (
+ SELECT 1 FROM main.resolution_unit_summary_members AS member
+  INDEXED BY resolution_unit_summary_members_blob
+ WHERE member.summary_id=graph.summary_id AND member.blob_id=?2
+)";
 
 pub(super) const VISIBILITY: &str = "SELECT CASE WHEN ?5='public' THEN 1
  WHEN ?1<>?3 THEN 0 WHEN ?5='crate' THEN 1
  WHEN ?5 IN ('private','self') THEN (?2=?4 OR substr(?2,1,length(?4)+2)=?4 || '::')
- ELSE (?2=cr_restriction(?5,?4,?6) OR substr(?2,1,length(cr_restriction(?5,?4,?6))+2)=cr_restriction(?5,?4,?6) || '::') END FROM rust_crate_containers WHERE topology_id=?3 AND container_path=?4";
+ ELSE (?2=cr_restriction(?5,?4,?6) OR substr(?2,1,length(cr_restriction(?5,?4,?6))+2)=cr_restriction(?5,?4,?6) || '::') END
+ FROM selected_rust_unit_summaries AS unit
+ CROSS JOIN main.rust_resolution_unit_summary_containers AS container
+  ON container.summary_id=unit.summary_id
+ WHERE unit.topology_id=?3 AND container.module_path=?4";
 
 // Visibility and activation use persisted crate placement even when the
 // selected canonical artifact is a content-mounted overlay. Its native facts
@@ -410,8 +443,9 @@ type PlacementMemo = HashMap<([u8; 32], i64, Option<u32>), Vec<CratePlacement>>;
 /// Both statements rebuild the dependency closure of the stage's crate before
 /// they look up one blob. On the whole tract graph they ran 757,326 times for
 /// 24 s, asking the same few blobs of the crate again for every access
-/// decision. The rows they read (crate rows, the selection's crates and the
-/// blobs' module scopes) do not change while a stage runs.
+/// decision. The rows they read (selected unit summaries, shared dependency
+/// rows, Rust placements and contexts, and the blob's module scopes) do not
+/// change while a stage runs.
 ///
 /// Only a crate stage holds one, with the export memo beside it: see
 /// `rust_crate_rows::CrateStageMemos`. Outside a crate stage the decisions run

@@ -217,7 +217,6 @@ fn leaked_generic(value: T) {}
         )), "{:?}", report.outcomes());
         assert!(report.into_diagnostics().is_empty());
         assert!(scope.store_error().is_some());
-        assert!(!analyzer.cargo_routes_ready_for_test());
     }
 
     #[test]

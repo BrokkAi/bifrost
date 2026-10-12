@@ -1335,7 +1335,9 @@ fn macro_walk_statements(project: &crate::inline_project::BuiltInlineTestProject
     assert_eq!(measured.results[0].status, warm.results[0].status);
     cost.statements
         .iter()
-        .filter(|sql| sql.contains("rust_crate_container_sources"))
+        // The summary placement rows are the crate-placement reads now; the
+        // legacy `rust_crate_container_sources` table is no longer read here.
+        .filter(|sql| sql.contains("rust_resolution_unit_summary_placements"))
         .count()
 }
 
@@ -1378,7 +1380,7 @@ fn macro_host_project(
 /// A point request's crate-placement reads are a function of its own file.
 ///
 /// `prepare_selected_macro_reference_overlay` prepares the files a request
-/// names, and the walk under it reads `rust_crate_container_sources` by path.
+/// names, and the walk under it reads the summary placement rows by member.
 /// Neither may become a function of how many other files in the crate host a
 /// macro: those files are not what the request asked about, and on a crate
 /// with hundreds of macro hosts that difference is the request's whole cost.

@@ -2265,7 +2265,14 @@ pub(super) fn call_binding_expansions(
                 });
             }
             ModelCallBinding::Empty | ModelCallBinding::Unavailable => {
-                target = CallBindingTarget::Unresolved;
+                target = if resolver_owned_external_dispatch.is_some() {
+                    semantic_target_id = dispatch_answer.as_ref().and_then(|answer| {
+                        (answer.arms.len() == 1).then(|| answer.arms[0].target_id.clone())
+                    });
+                    CallBindingTarget::FormalsUnrecordedExternal
+                } else {
+                    CallBindingTarget::Unresolved
+                };
             }
         }
     }

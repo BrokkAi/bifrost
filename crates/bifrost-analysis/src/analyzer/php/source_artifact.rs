@@ -491,6 +491,7 @@ fn project_type<'tree>(
     };
     record_namespace(&work.namespace, namespaces);
     types.push(TypeFact {
+        jvm_inventory: None,
         ambient_use: None,
         id: id.clone(),
         name: qualified.clone(),
@@ -894,6 +895,7 @@ fn namespace_fact(
     entry_path: &str,
 ) -> TypeFact {
     TypeFact {
+        jvm_inventory: None,
         ambient_use: None,
         id: type_declaration_id(TypeIdentity {
             ecosystem: origin.ecosystem,

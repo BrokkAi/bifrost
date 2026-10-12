@@ -4,7 +4,9 @@
 //! [`super::declarations`]. It records source syntax only; selected JVM roots,
 //! imports, and cross-file targets belong to the query-time context.
 
-use super::declarations::{kotlin_has_modifier, kotlin_identifier_text};
+use super::declarations::{
+    kotlin_class_like_kind, kotlin_has_modifier, kotlin_identifier_text, kotlin_is_data_class,
+};
 use super::syntax::{
     KOTLIN_TYPE_NODE_KINDS, KotlinScalarType, kotlin_call_with_callee, kotlin_callee,
     kotlin_declared_scalar_type, kotlin_enclosing_import_header, kotlin_import_header_segments,
@@ -12,6 +14,7 @@ use super::syntax::{
     kotlin_named_argument_label, kotlin_navigation_member, kotlin_navigation_receiver,
     kotlin_owner_label_matches, kotlin_parameter_default, kotlin_user_type_segments,
 };
+use crate::constructor_site::ConstructorSite;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, DeclarationKind, ProjectFile};
 use brokk_bifrost_core::analyzer::resolution_facts::*;
 use brokk_bifrost_core::analyzer::source_facts::{
@@ -35,6 +38,13 @@ struct WalkContext {
     callable: Option<ResolutionSiteId>,
     declaration: Option<ResolutionSiteId>,
     singleton_owner: bool,
+}
+
+struct SyntheticParameter<'source> {
+    name: &'source str,
+    source: Option<Node<'source>>,
+    intrinsic_type: Option<&'source str>,
+    optional: bool,
 }
 
 #[derive(Default)]
@@ -392,6 +402,7 @@ impl<'source, 'collector, 'declarations>
             stack.extend(children.into_iter().map(|child| (child, context)));
         }
 
+        self.finish_synthetic_members(root);
         self.finish_type_body_scopes();
         self.finish_constructor_properties();
         self.finish_constructors();
@@ -873,6 +884,365 @@ impl<'source, 'collector, 'declarations>
         Some(site)
     }
 
+    /// Publish the source-backed members Kotlin synthesizes for enum and data
+    /// classes. They share the class declaration's source identity, while
+    /// their member owner and callable shape let native lookup see them as
+    /// ordinary declarations.
+    fn finish_synthetic_members(&mut self, root: Node<'source>) {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            stack.extend(named_children(node));
+            if node.kind() != "class_declaration" {
+                continue;
+            }
+            let Some(&owner) = self.type_sites.get(&node.id()) else {
+                continue;
+            };
+            let scope = self.ensure_type_body_scope(owner);
+            if kotlin_class_like_kind(node) == Some(super::declarations::KotlinClassLikeKind::Enum)
+            {
+                self.add_synthetic_callable(node, owner, scope, "values", &[]);
+                self.add_synthetic_callable(
+                    node,
+                    owner,
+                    scope,
+                    "valueOf",
+                    &[SyntheticParameter {
+                        name: "value",
+                        source: None,
+                        intrinsic_type: Some("kotlin.String"),
+                        optional: false,
+                    }],
+                );
+                self.add_synthetic_property(node, owner, scope, "entries");
+            }
+            if kotlin_is_data_class(node, self.source) {
+                let parameters = first_named_child_of_kind(node, "primary_constructor")
+                    .map(named_children)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|parameter| parameter.kind() == "class_parameter")
+                    .collect::<Vec<_>>();
+                let generated = parameters
+                    .iter()
+                    .filter_map(|parameter| {
+                        let name = first_named_child_of_kind(*parameter, "simple_identifier")?;
+                        Some(SyntheticParameter {
+                            name: kotlin_identifier_text(name, self.source),
+                            source: Some(*parameter),
+                            intrinsic_type: None,
+                            optional: true,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                self.add_synthetic_callable(node, owner, scope, "copy", &generated);
+                for (ordinal, parameter) in parameters.iter().enumerate() {
+                    let component = format!("component{}", ordinal + 1);
+                    if let Some(site) =
+                        self.add_synthetic_callable(node, owner, scope, &component, &[])
+                        && let Some(type_node) = super::syntax::kotlin_binding_type_node(*parameter)
+                    {
+                        let value_type = self.add_declared_type(
+                            site,
+                            type_node,
+                            scope,
+                            ResolutionTypeSlotRole::DeclaredValue,
+                            DeclarationTypeRole::Return,
+                            Some(owner),
+                        );
+                        self.facts
+                            .callable_signatures
+                            .iter_mut()
+                            .find(|signature| signature.callable == site)
+                            .expect("synthetic component has a callable signature")
+                            .result_types
+                            .push(ResolutionCallableResultTypeFact {
+                                ordinal: 0,
+                                value_type,
+                            });
+                    }
+                }
+            }
+        }
+    }
+
+    fn synthetic_member_site(
+        &mut self,
+        class: Node<'source>,
+        owner: ResolutionSiteId,
+        scope: ResolutionScopeId,
+        name: &str,
+    ) -> ResolutionSiteId {
+        let anchor = first_named_child_of_kind(class, "type_identifier")
+            .expect("a synthetic member owner has a name");
+        let name_id = self.intern_name(name);
+        let site = self.add_site(anchor, ResolutionSiteKind::CallableDeclaration, scope);
+        self.facts.identifiers.push(PositionedIdentifierFact {
+            site,
+            name: name_id,
+            role: ResolutionIdentifierRole::Declaration,
+            namespace: ResolutionNamespace::Callable,
+            qualifier: None,
+        });
+        self.add_declaration_source(class, Some(anchor), site);
+        self.add_binder(site, scope, ResolutionBinderKind::Callable, true);
+        self.facts.member_owners.push(ResolutionMemberOwnerFact {
+            member: site,
+            owner,
+            kind: ResolutionMemberKind::Method,
+            access: if name == "values" || name == "valueOf" {
+                ResolutionMemberAccess::Type
+            } else {
+                ResolutionMemberAccess::Instance
+            },
+            qualifier_compatibility: if name == "values" || name == "valueOf" {
+                ResolutionMemberQualifierCompatibility::TypeOnly
+            } else {
+                ResolutionMemberQualifierCompatibility::RuntimeOnly
+            },
+        });
+        self.facts
+            .callable_signatures
+            .push(ResolutionCallableSignatureFact {
+                callable: site,
+                type_parameter_count: 0,
+                result_types: Vec::new(),
+            });
+        self.facts
+            .callable_parameter_lists
+            .push(ResolutionCallableParameterListFact {
+                callable: site,
+                list_ordinal: 0,
+            });
+        site
+    }
+
+    fn add_synthetic_callable(
+        &mut self,
+        class: Node<'source>,
+        owner: ResolutionSiteId,
+        scope: ResolutionScopeId,
+        name: &str,
+        parameters: &[SyntheticParameter<'source>],
+    ) -> Option<ResolutionSiteId> {
+        let name_id = self.intern_name(name);
+        if crate::synthetic_members::declares_callable(
+            &self.facts,
+            scope,
+            name_id,
+            Some(parameters.len()),
+        ) {
+            return None;
+        }
+        let site = self.synthetic_member_site(class, owner, scope, name);
+        let param_scope = self.add_scope(
+            first_named_child_of_kind(class, "type_identifier")
+                .expect("a synthetic member owner has a name"),
+            scope,
+            Some(site),
+            ResolutionScopeKind::Executable,
+        );
+        for (ordinal, parameter) in parameters.iter().enumerate() {
+            let anchor = first_named_child_of_kind(class, "type_identifier")
+                .expect("a synthetic member owner has a name");
+            let parameter_site =
+                self.add_site(anchor, ResolutionSiteKind::ValueDeclaration, param_scope);
+            let label = self.intern_name(parameter.name);
+            self.facts.identifiers.push(PositionedIdentifierFact {
+                site: parameter_site,
+                name: label,
+                role: ResolutionIdentifierRole::Declaration,
+                namespace: ResolutionNamespace::Value,
+                qualifier: None,
+            });
+            self.add_binder(
+                parameter_site,
+                param_scope,
+                ResolutionBinderKind::Parameter,
+                true,
+            );
+            let value_type = if let Some(source) = parameter.source {
+                if let Some(name_node) = first_named_child_of_kind(source, "simple_identifier") {
+                    self.add_declaration_source(source, Some(name_node), parameter_site);
+                }
+                if let Some(type_node) = super::syntax::kotlin_binding_type_node(source) {
+                    self.add_declared_type(
+                        parameter_site,
+                        type_node,
+                        scope,
+                        ResolutionTypeSlotRole::DeclaredValue,
+                        DeclarationTypeRole::Parameter,
+                        Some(site),
+                    )
+                } else {
+                    let value_type =
+                        self.add_slot(parameter_site, ResolutionTypeSlotRole::DeclaredValue);
+                    self.facts
+                        .declaration_type_slots
+                        .push(DeclarationTypeSlotFact {
+                            declaration: parameter_site,
+                            slot: value_type,
+                            role: DeclarationTypeRole::Parameter,
+                        });
+                    value_type
+                }
+            } else {
+                let value_type =
+                    self.add_slot(parameter_site, ResolutionTypeSlotRole::DeclaredValue);
+                self.facts
+                    .declaration_type_slots
+                    .push(DeclarationTypeSlotFact {
+                        declaration: parameter_site,
+                        slot: value_type,
+                        role: DeclarationTypeRole::Parameter,
+                    });
+                if let Some(type_name) = parameter.intrinsic_type {
+                    let name = self.intern_name(type_name);
+                    let input =
+                        self.add_slot(parameter_site, ResolutionTypeSlotRole::TargetTypeIdentity);
+                    self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
+                        output: input,
+                        name,
+                        kind: IntrinsicTypeKind::LanguageBuiltin,
+                        indirection: 0,
+                    });
+                    crate::call_arguments::publish_jvm_declared_type_transfer(
+                        &mut self.facts,
+                        input,
+                        value_type,
+                        ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+                    );
+                }
+                value_type
+            };
+            let ordinal =
+                u32::try_from(ordinal).expect("Kotlin synthetic parameter count fits u32");
+            self.facts
+                .callable_parameters
+                .push(ResolutionCallableParameterFact {
+                    callable: site,
+                    list_ordinal: 0,
+                    ordinal,
+                    parameter: parameter_site,
+                    value_type,
+                    repeated: false,
+                });
+            self.facts.callable_parameter_semantics.push(
+                ResolutionCallableParameterSemanticsFact {
+                    callable: site,
+                    parameter: parameter_site,
+                    list_ordinal: 0,
+                    ordinal,
+                    label,
+                    has_default: parameter.optional,
+                },
+            );
+        }
+        if name == "copy" || name == "valueOf" {
+            let input = self.synthetic_class_type_slot(class, owner, site);
+            let value_type = self.add_slot(site, ResolutionTypeSlotRole::DeclaredValue);
+            self.facts
+                .declaration_type_slots
+                .push(DeclarationTypeSlotFact {
+                    declaration: site,
+                    slot: value_type,
+                    role: DeclarationTypeRole::Return,
+                });
+            crate::call_arguments::publish_jvm_declared_type_transfer(
+                &mut self.facts,
+                input,
+                value_type,
+                ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+            );
+            self.facts
+                .callable_signatures
+                .iter_mut()
+                .find(|signature| signature.callable == site)
+                .expect("synthetic callable has a signature")
+                .result_types
+                .push(ResolutionCallableResultTypeFact {
+                    ordinal: 0,
+                    value_type,
+                });
+        }
+        Some(site)
+    }
+
+    fn synthetic_class_type_slot(
+        &mut self,
+        class: Node<'source>,
+        class_site: ResolutionSiteId,
+        callable: ResolutionSiteId,
+    ) -> ResolutionTypeSlotId {
+        let anchor = first_named_child_of_kind(class, "type_identifier")
+            .expect("a synthetic member owner has a name");
+        let scope = *self
+            .type_scope_parents
+            .get(&class_site)
+            .expect("a synthetic member owner has a declaring scope");
+        let reference = self.add_site(anchor, ResolutionSiteKind::SyntheticReference, scope);
+        let name = *self
+            .type_names
+            .get(&class_site)
+            .expect("a synthetic member owner has a type name");
+        self.facts.identifiers.push(PositionedIdentifierFact {
+            site: reference,
+            name,
+            role: ResolutionIdentifierRole::Reference,
+            namespace: ResolutionNamespace::Type,
+            qualifier: None,
+        });
+        self.facts
+            .reference_owners
+            .push(ResolutionReferenceOwnerFact {
+                reference,
+                owner: Some(callable),
+            });
+        let slot = self.add_slot(reference, ResolutionTypeSlotRole::TargetTypeIdentity);
+        self.facts.binding_projections.push(BindingProjectionFact {
+            reference,
+            output: slot,
+            kind: BindingProjectionKind::TargetTypeIdentity,
+        });
+        slot
+    }
+
+    fn add_synthetic_property(
+        &mut self,
+        class: Node<'source>,
+        owner: ResolutionSiteId,
+        scope: ResolutionScopeId,
+        name: &str,
+    ) {
+        let name_id = self.intern_name(name);
+        if self.facts.identifiers.iter().any(|identifier| {
+            identifier.role == ResolutionIdentifierRole::Declaration
+                && identifier.name == name_id
+                && self.facts.sites[identifier.site.index()].scope == scope
+        }) {
+            return;
+        }
+        let anchor = first_named_child_of_kind(class, "type_identifier")
+            .expect("a synthetic member owner has a name");
+        let site = self.add_site(anchor, ResolutionSiteKind::ValueDeclaration, scope);
+        self.facts.identifiers.push(PositionedIdentifierFact {
+            site,
+            name: name_id,
+            role: ResolutionIdentifierRole::Declaration,
+            namespace: ResolutionNamespace::Value,
+            qualifier: None,
+        });
+        self.add_declaration_source(class, Some(anchor), site);
+        self.add_binder(site, scope, ResolutionBinderKind::Field, true);
+        self.facts.member_owners.push(ResolutionMemberOwnerFact {
+            member: site,
+            owner,
+            kind: ResolutionMemberKind::Field,
+            access: ResolutionMemberAccess::Type,
+            qualifier_compatibility: ResolutionMemberQualifierCompatibility::TypeOnly,
+        });
+    }
+
     fn record_type_alias(
         &mut self,
         node: Node<'source>,
@@ -1085,18 +1455,6 @@ impl<'source, 'collector, 'declarations>
             ResolutionSiteKind::ConstructorDeclaration,
             context.scope,
         );
-        if let Some(name) = context
-            .owner_type
-            .and_then(|owner| self.type_names.get(&owner).copied())
-        {
-            self.facts.identifiers.push(PositionedIdentifierFact {
-                site,
-                name,
-                role: ResolutionIdentifierRole::Declaration,
-                namespace: ResolutionNamespace::Constructor,
-                qualifier: None,
-            });
-        }
         self.add_declaration_source(declaration, declaration_name, site);
         if let Some(owner) = context.owner_type {
             self.pending_constructors.push((site, owner));
@@ -2911,17 +3269,19 @@ impl<'source, 'collector, 'declarations>
     }
 
     fn finish_constructors(&mut self) {
-        for (member, owner) in std::mem::take(&mut self.pending_constructors) {
+        for (site, owner) in std::mem::take(&mut self.pending_constructors) {
             let scope = self.ensure_type_body_scope(owner);
-            self.facts.sites[member.index()].scope = scope;
-            self.add_binder(member, scope, ResolutionBinderKind::Constructor, true);
-            self.facts.member_owners.push(ResolutionMemberOwnerFact {
-                member,
+            self.facts.sites[site.index()].scope = scope;
+            ConstructorSite {
+                site,
                 owner,
-                kind: ResolutionMemberKind::Constructor,
-                access: ResolutionMemberAccess::Type,
-                qualifier_compatibility: ResolutionMemberQualifierCompatibility::TypeOnly,
-            });
+                owner_name: *self
+                    .type_names
+                    .get(&owner)
+                    .expect("a Kotlin type declaration site has a name"),
+                scope,
+            }
+            .publish(&mut self.facts);
         }
     }
 

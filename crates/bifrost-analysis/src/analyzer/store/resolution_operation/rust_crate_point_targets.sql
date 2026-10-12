@@ -16,45 +16,68 @@ WITH RECURSIVE targets(topology_id, module_path, name, followed) AS (
  UNION
  SELECT dependency.topology_id, route.target_module_path, route.target_name, 1
  FROM targets
- CROSS JOIN rust_crate_reexport_routes AS route ON route.topology_id=targets.topology_id AND route.module_path=targets.module_path AND route.bound_name=targets.name
- CROSS JOIN selected_rust_crates AS dependency ON dependency.crate_key=route.target_crate_key
+ CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=targets.topology_id
+ CROSS JOIN main.rust_resolution_unit_summary_reexport_routes AS route
+  ON route.summary_id=owner.summary_id AND route.module_path=targets.module_path
+ AND route.bound_name=targets.name
+ CROSS JOIN selected_rust_unit_summaries AS dependency
+  ON dependency.unit_key=route.target_unit_key
  WHERE (route.visibility='public' OR (targets.topology_id=?5 AND (route.visibility='crate' OR (route.visibility='private' AND (?6=route.module_path OR substr(?6,1,length(route.module_path)+2)=route.module_path || '::')) OR (route.visibility='restricted' AND (?6=route.restricted_module_path OR substr(?6,1,length(route.restricted_module_path)+2)=route.restricted_module_path || '::')))))
  UNION
  SELECT dependency.topology_id, route.target_module_path, targets.name, 1
  FROM targets
- CROSS JOIN rust_crate_glob_reexport_routes AS route ON route.topology_id=targets.topology_id AND route.module_path=targets.module_path
- CROSS JOIN selected_rust_crates AS dependency ON dependency.crate_key=route.target_crate_key
+ CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=targets.topology_id
+ CROSS JOIN main.rust_resolution_unit_summary_glob_reexport_routes AS route
+  ON route.summary_id=owner.summary_id AND route.module_path=targets.module_path
+ CROSS JOIN selected_rust_unit_summaries AS dependency
+  ON dependency.unit_key=route.target_unit_key
  WHERE (route.visibility='public' OR (targets.topology_id=?5 AND (route.visibility='crate' OR (route.visibility='private' AND (?6=route.module_path OR substr(?6,1,length(route.module_path)+2)=route.module_path || '::')) OR (route.visibility='restricted' AND (?6=route.restricted_module_path OR substr(?6,1,length(route.restricted_module_path)+2)=route.restricted_module_path || '::')))))
   -- Re-exported globs have the same precedence as private glob imports:
   -- a declaration or spelled module-level import in this module wins.
   -- Test the module traversed here, not the requesting descendant; otherwise
   -- `use super::execution::...` can pick up the requester's child module
   -- through its parent's `pub use search::*`.
-  AND NOT EXISTS(SELECT 1 FROM rust_crate_exports AS declared
-                 WHERE declared.topology_id=targets.topology_id
+  AND NOT EXISTS(SELECT 1 FROM main.rust_resolution_unit_summary_exports AS declared
+                 WHERE declared.summary_id=owner.summary_id
                    AND declared.module_path=targets.module_path
                    AND declared.namespace=?3 AND declared.name=targets.name
                    AND declared.origin IN ('declaration','reexport'))
   AND NOT EXISTS(
-       SELECT 1 FROM rust_crate_container_sources AS source
+       SELECT 1 FROM main.rust_resolution_unit_summary_placements AS source
+       CROSS JOIN main.resolution_unit_summary_members AS member
+         ON member.summary_id=source.summary_id
+        AND member.member_ordinal=source.member_ordinal
        CROSS JOIN source_rust_module_scopes AS scope
-         ON scope.blob_id=source.blob_id AND scope.ordinal=source.scope_ordinal
-       CROSS JOIN rust_crate_imports AS spelled
-         ON spelled.topology_id=source.topology_id
-         AND spelled.module_path=source.container_path
-         AND spelled.blob_id=source.blob_id
-         AND spelled.binder_scope=scope.resolution_scope
-         AND spelled.namespace=?3 AND spelled.bound_name=targets.name
-       WHERE source.topology_id=targets.topology_id
-         AND source.container_path=targets.module_path)
+         ON scope.blob_id=member.blob_id AND scope.ordinal=source.scope_ordinal
+       CROSS JOIN main.rust_resolution_unit_summary_import_routes AS spelled
+        INDEXED BY rust_resolution_unit_summary_import_routes_binder
+         ON spelled.summary_id=source.summary_id
+        AND spelled.member_ordinal=source.member_ordinal
+        AND spelled.module_path=source.module_path
+        AND spelled.binder_scope=scope.resolution_scope
+        AND spelled.namespace=?3 AND spelled.bound_name=targets.name
+       WHERE source.summary_id=owner.summary_id
+         AND source.module_path=targets.module_path
+         AND source.scope_ordinal IS NOT NULL)
  UNION
  SELECT dependency.topology_id, route.target_module_path, route.target_name, 1
  FROM targets
- CROSS JOIN rust_crate_container_sources AS source ON source.topology_id=targets.topology_id AND source.container_path=targets.module_path
- CROSS JOIN source_rust_module_scopes AS scope ON scope.blob_id=source.blob_id AND scope.ordinal=source.scope_ordinal
- CROSS JOIN rust_crate_imports AS route ON route.topology_id=source.topology_id AND route.module_path=source.container_path
-  AND route.blob_id=source.blob_id AND route.binder_scope=scope.resolution_scope AND route.namespace=?3 AND route.bound_name=targets.name
- CROSS JOIN selected_rust_crates AS dependency ON dependency.crate_key=route.target_crate_key
+ CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=targets.topology_id
+ CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+  ON source.summary_id=owner.summary_id AND source.module_path=targets.module_path
+ AND source.scope_ordinal IS NOT NULL
+ CROSS JOIN main.resolution_unit_summary_members AS member
+  ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
+ CROSS JOIN source_rust_module_scopes AS scope
+  ON scope.blob_id=member.blob_id AND scope.ordinal=source.scope_ordinal
+ CROSS JOIN main.rust_resolution_unit_summary_import_routes AS route
+  INDEXED BY rust_resolution_unit_summary_import_routes_binder
+  ON route.summary_id=source.summary_id AND route.member_ordinal=source.member_ordinal
+ AND route.module_path=source.module_path
+ AND route.binder_scope=scope.resolution_scope AND route.namespace=?3
+ AND route.bound_name=targets.name
+ CROSS JOIN selected_rust_unit_summaries AS dependency
+  ON dependency.unit_key=route.target_unit_key
  -- A row that binds a crate's root (`use dep as alias;`, target `crate`/`self`,
  -- `rust_crate_import_bindings.sql`) ends the walk with no export row to
  -- check visibility against, so the requester must see the import itself: a
@@ -68,18 +91,26 @@ WITH RECURSIVE targets(topology_id, module_path, name, followed) AS (
  -- a missing name in a closed target module remains a proved absence.
  SELECT dependency.topology_id, route.target_module_path, route.target_name, 1
  FROM targets
- CROSS JOIN rust_crate_gaps AS gap ON gap.topology_id=targets.topology_id
+ CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=targets.topology_id
+ CROSS JOIN main.rust_resolution_unit_summary_gaps AS gap ON gap.summary_id=owner.summary_id
   AND gap.gap_kind='unresolved_import' AND gap.subject=targets.module_path || '::' || targets.name
- CROSS JOIN rust_crate_container_sources AS source ON source.topology_id=targets.topology_id AND source.container_path=targets.module_path
- CROSS JOIN source_rust_module_scopes AS scope ON scope.blob_id=source.blob_id AND scope.ordinal=source.scope_ordinal
- CROSS JOIN source_rust_import_targets AS imported ON imported.blob_id=source.blob_id
+ CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+  ON source.summary_id=owner.summary_id AND source.module_path=targets.module_path
+ AND source.scope_ordinal IS NOT NULL
+ CROSS JOIN main.resolution_unit_summary_members AS member
+  ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
+ CROSS JOIN source_rust_module_scopes AS scope
+  ON scope.blob_id=member.blob_id AND scope.ordinal=source.scope_ordinal
+ CROSS JOIN source_rust_import_targets AS imported ON imported.blob_id=member.blob_id
   AND imported.native_scope=scope.resolution_scope AND imported.bound_name=targets.name AND imported.is_glob=0
- CROSS JOIN rust_crate_root_references AS route ON route.topology_id=targets.topology_id
-  AND route.module_path=targets.module_path AND route.blob_id=source.blob_id
- CROSS JOIN resolution_semantic_sites AS bridge ON bridge.blob_id=route.blob_id AND bridge.source_site=route.reference_source_site
+ CROSS JOIN main.rust_resolution_unit_summary_root_routes AS route
+  INDEXED BY rust_resolution_unit_summary_root_routes_owner
+  ON route.summary_id=owner.summary_id AND route.module_path=targets.module_path
+ AND route.member_ordinal=source.member_ordinal
+ CROSS JOIN resolution_semantic_sites AS bridge ON bridge.blob_id=member.blob_id AND bridge.source_site=route.reference_source_site
  CROSS JOIN resolution_rust_reference_contexts AS reference ON reference.blob_id=bridge.blob_id
   AND reference.semantic_key=bridge.semantic_key AND reference.source_occurrence=imported.target_occurrence_id
- CROSS JOIN selected_rust_crates AS dependency ON dependency.crate_key=route.target_crate_key
+ CROSS JOIN selected_rust_unit_summaries AS dependency ON dependency.unit_key=route.target_unit_key
  WHERE (targets.followed=1 OR (targets.topology_id=?5 AND (?6=targets.module_path OR substr(?6,1,length(targets.module_path)+2)=targets.module_path || '::')))
  UNION
  -- A module's own glob imports bind names in that module and in the modules
@@ -95,11 +126,20 @@ WITH RECURSIVE targets(topology_id, module_path, name, followed) AS (
  -- into still contributes nothing.
  SELECT dependency.topology_id, glob.target_module_path, targets.name, 1
  FROM targets
- CROSS JOIN rust_crate_container_sources AS source ON source.topology_id=targets.topology_id AND source.container_path=targets.module_path
- CROSS JOIN source_rust_module_scopes AS scope ON scope.blob_id=source.blob_id AND scope.ordinal=source.scope_ordinal
- CROSS JOIN rust_crate_glob_imports AS glob ON glob.topology_id=source.topology_id AND glob.module_path=source.container_path
-  AND glob.blob_id=source.blob_id AND glob.binder_scope=scope.resolution_scope
- CROSS JOIN selected_rust_crates AS dependency ON dependency.crate_key=glob.target_crate_key
+ CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=targets.topology_id
+ CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+  ON source.summary_id=owner.summary_id AND source.module_path=targets.module_path
+ AND source.scope_ordinal IS NOT NULL
+ CROSS JOIN main.resolution_unit_summary_members AS member
+  ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
+ CROSS JOIN source_rust_module_scopes AS scope
+  ON scope.blob_id=member.blob_id AND scope.ordinal=source.scope_ordinal
+ CROSS JOIN main.rust_resolution_unit_summary_glob_imports AS glob
+  ON glob.summary_id=source.summary_id AND glob.member_ordinal=source.member_ordinal
+ AND glob.module_path=source.module_path
+ AND glob.binder_scope=scope.resolution_scope
+ CROSS JOIN selected_rust_unit_summaries AS dependency
+  ON dependency.unit_key=glob.target_unit_key
  WHERE targets.topology_id=?5
   AND (?6=targets.module_path OR substr(?6,1,length(targets.module_path)+2)=targets.module_path || '::')
   -- A glob import is the weakest binder Rust has. An item the globbing
@@ -115,15 +155,16 @@ WITH RECURSIVE targets(topology_id, module_path, name, followed) AS (
   -- only within it, and does not match here. `data/src/dim/tree.rs` holds a
   -- function-local `use super::super::sym::SymbolValues;` while the module
   -- globs `sym::*`, and both the glob route and the local binding are right.
-  AND NOT EXISTS(SELECT 1 FROM rust_crate_exports AS declared
-                 WHERE declared.topology_id=targets.topology_id
+  AND NOT EXISTS(SELECT 1 FROM main.rust_resolution_unit_summary_exports AS declared
+                 WHERE declared.summary_id=owner.summary_id
                    AND declared.module_path=targets.module_path
                    AND declared.namespace=?3 AND declared.name=targets.name
                    AND declared.origin IN ('declaration','reexport'))
-  AND NOT EXISTS(SELECT 1 FROM rust_crate_imports AS spelled
-                 WHERE spelled.topology_id=source.topology_id
-                   AND spelled.module_path=source.container_path
-                   AND spelled.blob_id=source.blob_id
+  AND NOT EXISTS(SELECT 1 FROM main.rust_resolution_unit_summary_import_routes AS spelled
+                  INDEXED BY rust_resolution_unit_summary_import_routes_binder
+                 WHERE spelled.summary_id=source.summary_id
+                   AND spelled.member_ordinal=source.member_ordinal
+                   AND spelled.module_path=source.module_path
                    AND spelled.binder_scope=scope.resolution_scope
                    AND spelled.namespace=?3 AND spelled.bound_name=targets.name)
  UNION

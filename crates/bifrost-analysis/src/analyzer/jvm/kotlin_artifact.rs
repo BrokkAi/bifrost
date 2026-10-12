@@ -492,6 +492,7 @@ fn entry_facts(
             signature_limit_hit,
         );
         types.push(TypeFact {
+            jvm_inventory: None,
             ambient_use: None,
             id,
             name: name.clone(),
@@ -728,6 +729,7 @@ fn entry_facts(
 
 fn package_fact(entry: &str, name: &str) -> TypeFact {
     TypeFact {
+        jvm_inventory: None,
         ambient_use: None,
         id: type_declaration_id(TypeIdentity {
             ecosystem: "jvm",

@@ -418,6 +418,7 @@ fn project_constant(
     };
     if owner_name == "Object" && !types.iter().any(|fact| fact.id == owner_id) {
         types.push(TypeFact {
+            jvm_inventory: None,
             ambient_use: None,
             id: owner_id.clone(),
             name: owner_name.clone(),
@@ -760,6 +761,7 @@ fn project_type(
         }
     }
     types.push(TypeFact {
+        jvm_inventory: None,
         ambient_use: None,
         id: owner_id,
         name,

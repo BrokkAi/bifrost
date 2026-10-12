@@ -71,8 +71,8 @@ use crate::analyzer::usages::get_type::TypeLookupOutcome;
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    CodeUnitType, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo,
-    Project, ProjectFile, Range, SignatureMetadata, StructuredImportPath, TestAssertionSmell,
+    CodeUnitType, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language, Project,
+    ProjectFile, Range, SignatureMetadata, StructuredImportPath, TestAssertionSmell,
     TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
     TypeHierarchyProvider, resolve_analyzer,
 };
@@ -81,9 +81,9 @@ use crate::hash::{HashMap, HashSet};
 use external_calls::rust_import_binder_external_callee;
 use moka::sync::Cache;
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 
 use super::weighted_cache::{
     build_weighted_cache, weight_code_unit_set, weight_export_index, weight_project_file_set,
@@ -117,6 +117,16 @@ fn rust_source_fact_cache_budget(memo_budget: u64) -> u64 {
     memo_budget / RUST_SOURCE_FACT_CACHE_BUDGET_DIVISOR
 }
 
+/// The route and package-file indexes built from the live summary rows, held
+/// for one query. They scale with the workspace, so they live in the query
+/// scope's request memos and are dropped with the outermost scope; no analyzer
+/// field holds them.
+#[derive(Default)]
+struct RustRouteRequestMemo {
+    routes: brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo<RustCargoRouteIndex>,
+    package_files: brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo<RustPackageFileIndex>,
+}
+
 /// Query occurrences and their immutable fact product share one selected blob.
 #[cfg(test)]
 pub(crate) struct RustPrimarySourceAt {
@@ -128,7 +138,9 @@ fn weight_rust_hierarchy_source_facts<K>(_key: &K, value: &Arc<RustHierarchySour
     let bytes = value.estimated_retained_bytes();
     bytes.clamp(1, u32::MAX as usize) as u32
 }
-use brokk_bifrost_rust::cargo_routes::RustCargoRouteIndex;
+use brokk_bifrost_rust::cargo_routes::{
+    RustCargoDependencyKind, RustCargoRouteIndex, RustCargoRouteSummaryRow,
+};
 use brokk_bifrost_rust::crate_naming;
 #[cfg(test)]
 pub(crate) use brokk_bifrost_rust::declarations::rust_package_name;
@@ -149,7 +161,7 @@ pub use brokk_bifrost_rust::graph_support::RustReferenceContext;
 use brokk_bifrost_rust::graph_support::is_rust_enum_variant_declaration;
 pub(crate) use brokk_bifrost_rust::graph_support::is_rust_public_like_declaration;
 use brokk_bifrost_rust::graph_support::{
-    ReferenceContextError, ReferenceContextResult, RustPackageFileIndex,
+    ReferenceContextError, ReferenceContextResult, RustPackageFileIndex, RustPackageFileRow,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use brokk_bifrost_rust::lexical_scope::{
@@ -190,12 +202,6 @@ pub struct RustAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     export_indexes: Cache<ProjectFile, Arc<crate::analyzer::usages::ExportIndex>>,
-    reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    // The current builder reads persisted rows and composes routes serially.
-    // PoolSafeMemo's pool-independent path lets Rayon callers share that work
-    // with cancellable waits, without duplicating the build on each worker.
-    cargo_routes: Arc<PoolSafeMemo<RustCargoRouteIndex>>,
-    package_file_index: Arc<OnceLock<Arc<RustPackageFileIndex>>>,
     /// `resolve_module_files` calls. A use-path's module files are invariant in
     /// the export name being resolved, so this count is what proves the
     /// per-export-name recomputation is gone (#1230 item 4).
@@ -266,9 +272,6 @@ impl RustAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            cargo_routes: Arc::new(PoolSafeMemo::new()),
-            package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
@@ -637,9 +640,6 @@ impl RustAnalyzer {
         clone.referencing_files =
             build_weighted_cache(self.memo_budget / 8, weight_project_file_set);
         clone.export_indexes = build_weighted_cache(self.memo_budget / 8, weight_export_index);
-        clone.reverse_import_index = Arc::new(PoolSafeMemo::new());
-        clone.cargo_routes = Arc::new(PoolSafeMemo::new());
-        clone.package_file_index = Arc::new(OnceLock::new());
         clone.declaration_facts =
             build_weighted_cache(self.memo_budget / 8, weight_declaration_facts);
         clone.rust_hierarchy_source_facts = build_weighted_cache(
@@ -668,25 +668,35 @@ impl RustAnalyzer {
     }
 
     /// [`Self::cargo_routes`], abandoning the build once `keep_going` stops
-    /// permitting it. A stopped build is not published, so the cell stays empty
-    /// for the next complete build.
+    /// permitting it.
+    ///
+    /// Inside an open query scope the index is memoized for that query only:
+    /// one request asks for it dozens of times (once per import resolution),
+    /// and each build reads every live member and route row. The memo lives in
+    /// the scope's request memos and is dropped with the outermost scope, so
+    /// it never outlives a query. A memoized index is returned without polling
+    /// `keep_going`; a cancelled or failed build publishes nothing, and outside
+    /// a scope every call builds afresh.
     fn cargo_routes_while(
         &self,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<Arc<RustCargoRouteIndex>, RustCargoRouteError> {
-        // This build only reads frozen mounts, SQL, and Cargo manifests; it
-        // cannot enter parser preparation or require a rayon worker. Failures
-        // and cancelled builds publish nothing to the memo.
-        let routes = self
-            .cargo_routes
-            .get_or_try_build_pool_independent_while(&|| keep_going(), || {
-                match self.build_cargo_routes_while(keep_going) {
-                    Ok(routes) => Ok(Some(routes)),
-                    Err(RustCargoRouteError::Cancelled) => Ok(None),
-                    Err(error) => Err(error),
-                }
-            })?
-            .ok_or(RustCargoRouteError::Cancelled)?;
+        let routes = match self
+            .inner
+            .active_query_request_memo::<RustRouteRequestMemo>()
+        {
+            Some(memo) => memo
+                .routes
+                .get_or_try_build_pool_independent_while(&|| keep_going(), || {
+                    match self.build_cargo_routes_while(keep_going) {
+                        Ok(routes) => Ok(Some(routes)),
+                        Err(RustCargoRouteError::Cancelled) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                })?
+                .ok_or(RustCargoRouteError::Cancelled)?,
+            None => Arc::new(self.build_cargo_routes_while(keep_going)?),
+        };
         self.note_rust_publication_verified();
         Ok(routes)
     }
@@ -699,20 +709,179 @@ impl RustAnalyzer {
         if !keep_going() {
             return Err(RustCargoRouteError::Cancelled);
         }
-        let mut mounts = self
-            .inner
-            .live_file_mounts_for_fact_publication_while(&|| keep_going())
-            .ok_or(RustCargoRouteError::Cancelled)?;
-        mounts.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let snapshots = self.inner.selected_workspace_snapshots();
+        let package_rows = self
+            .analyzer_store()
+            .rust_summary_package_rows(snapshots.as_ref())
+            .map_err(|error| {
+                self.inner.record_store_error(
+                    error.context("reading live Rust summary members for Cargo routes"),
+                );
+                RustCargoRouteError::Unavailable
+            })?;
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        let stored_route_rows = self
+            .analyzer_store()
+            .rust_summary_cargo_route_rows(snapshots.as_ref())
+            .map_err(|error| {
+                self.inner
+                    .record_store_error(error.context("reading live Rust summary Cargo routes"));
+                RustCargoRouteError::Unavailable
+            })?;
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        let root = self.inner.project().root().to_path_buf();
+        let mut mounts = package_rows
+            .iter()
+            .map(|row| {
+                (
+                    ProjectFile::new(root.clone(), row.rel_path.clone()),
+                    git2::Oid::from_str(&row.blob_oid)
+                        .expect("summary member blob oid is a checked content identity"),
+                )
+            })
+            .collect::<Vec<_>>();
+        mounts.sort_unstable_by(|(left_file, _), (right_file, _)| left_file.cmp(right_file));
+        let mut unique_mounts = Vec::with_capacity(mounts.len());
+        for mount in mounts {
+            if let Some((last_file, last_oid)) = unique_mounts.last()
+                && last_file == &mount.0
+            {
+                assert_eq!(last_oid, &mount.1, "one live Rust member path has one blob");
+                continue;
+            }
+            unique_mounts.push(mount);
+        }
+        let mounts = unique_mounts;
         let facts = self.rust_module_route_facts(&mounts, keep_going)?;
-        // Unsafe sources were marked incomplete during the fact read; only
-        // files with canonical published facts belong in this index input.
         let files: Vec<_> = mounts
             .into_iter()
             .filter_map(|(file, _)| facts.contains_key(&file).then_some(file))
             .collect();
-        RustCargoRouteIndex::build_while(&files, &facts, &|| keep_going())
-            .ok_or(RustCargoRouteError::Cancelled)
+        let summary_rows = stored_route_rows
+            .into_iter()
+            .map(|row| {
+                let root_file = row
+                    .root_rel_path
+                    .map(|path| ProjectFile::new(root.clone(), path));
+                let dependency_root_file = row
+                    .dependency_root_rel_path
+                    .map(|path| ProjectFile::new(root.clone(), path));
+                let manifest_directory = row.manifest_rel_path.map(|path| {
+                    PathBuf::from(path)
+                        .parent()
+                        .unwrap_or(std::path::Path::new(""))
+                        .to_path_buf()
+                });
+                let dependency_manifest_directory = row.dependency_manifest_rel_path.map(|path| {
+                    PathBuf::from(path)
+                        .parent()
+                        .unwrap_or(std::path::Path::new(""))
+                        .to_path_buf()
+                });
+                let root_package = row
+                    .root_package_components
+                    .map(|components| components.join("."));
+                let dependency_root_package = row
+                    .dependency_root_package_components
+                    .map(|components| components.join("."));
+                let dependency_kind = row.dependency_kind.map(|kind| match kind.as_str() {
+                    "normal" => RustCargoDependencyKind::Normal,
+                    "dev" => RustCargoDependencyKind::Development,
+                    "build" => RustCargoDependencyKind::Build,
+                    _ => panic!("unknown Rust dependency kind {kind:?}"),
+                });
+                RustCargoRouteSummaryRow {
+                    unit_key: row.unit_key,
+                    manifest_directory,
+                    target_kind: row.target_kind,
+                    crate_name: row.crate_name,
+                    edition: row.edition,
+                    development_capable: row.development_capable,
+                    root_file,
+                    root_package,
+                    dependency_extern_name: row.dependency_extern_name,
+                    dependency_kind,
+                    dependency_boundary: row.dependency_boundary,
+                    dependency_unit_key: row.dependency_unit_key,
+                    dependency_target_kind: row.dependency_target_kind,
+                    dependency_root_file,
+                    dependency_root_package,
+                    dependency_manifest_directory,
+                }
+            })
+            .collect::<Vec<_>>();
+        RustCargoRouteIndex::build_from_summary_rows_while(
+            &files,
+            &facts,
+            &summary_rows,
+            keep_going,
+        )
+        .ok_or(RustCargoRouteError::Cancelled)
+    }
+
+    /// The package and member file index, memoized for the open query scope
+    /// exactly as [`Self::cargo_routes_while`] memoizes the route index.
+    pub(crate) fn package_file_index_while(
+        &self,
+        _token: QueryToken<'_>,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustPackageFileIndex>, RustCargoRouteError> {
+        match self
+            .inner
+            .active_query_request_memo::<RustRouteRequestMemo>()
+        {
+            Some(memo) => memo
+                .package_files
+                .get_or_try_build_pool_independent_while(&|| keep_going(), || {
+                    match self.build_package_file_index_while(keep_going) {
+                        Ok(index) => Ok(Some(index)),
+                        Err(RustCargoRouteError::Cancelled) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                })?
+                .ok_or(RustCargoRouteError::Cancelled),
+            None => self
+                .build_package_file_index_while(keep_going)
+                .map(Arc::new),
+        }
+    }
+
+    fn build_package_file_index_while(
+        &self,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<RustPackageFileIndex, RustCargoRouteError> {
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        let snapshots = self.inner.selected_workspace_snapshots();
+        let rows = self
+            .analyzer_store()
+            .rust_summary_package_rows(snapshots.as_ref())
+            .map_err(|error| {
+                self.inner.record_store_error(
+                    error.context("reading live Rust summary package and member rows"),
+                );
+                RustCargoRouteError::Unavailable
+            })?;
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        let root = self.inner.project().root().to_path_buf();
+        let rows = rows
+            .into_iter()
+            .map(|row| RustPackageFileRow {
+                file: ProjectFile::new(root.clone(), row.rel_path),
+                package_components: row.package_components,
+                crate_name: row.crate_name,
+                target_kind: row.target_kind,
+                is_root_member: row.is_root_member,
+            })
+            .collect();
+        Ok(RustPackageFileIndex::from_summary_rows(rows))
     }
 
     /// The persisted module-route facts of every analyzed Rust file, in one
@@ -773,11 +942,6 @@ impl RustAnalyzer {
             return Err(RustCargoRouteError::Unavailable);
         }
         Ok(by_file)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn cargo_routes_ready_for_test(&self) -> bool {
-        self.cargo_routes.is_ready()
     }
 
     #[cfg(test)]
@@ -981,8 +1145,12 @@ impl brokk_bifrost_rust::graph_support::RustSource for RustAnalyzer {
         self.cargo_routes_while(keep_going)
     }
 
-    fn package_file_index(&self) -> Arc<RustPackageFileIndex> {
-        self.package_file_index()
+    fn package_file_index_while(
+        &self,
+        token: QueryToken<'_>,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustPackageFileIndex>, RustCargoRouteError> {
+        self.package_file_index_while(token, keep_going)
     }
 
     fn import_binder_of(&self, file: &ProjectFile) -> crate::analyzer::usages::ImportBinder {
@@ -1177,8 +1345,9 @@ impl RustFactSource for RustAnalyzer {
             .oid_for_path(file)
             .ok_or(RustCargoRouteError::Unavailable)?;
         let rel_path = crate::path_utils::rel_path_string(file);
+        let snapshots = self.inner.selected_workspace_snapshots();
         self.analyzer_store()
-            .rust_item_macro_decisions(blob, &rel_path)
+            .rust_item_macro_decisions(snapshots.as_ref(), blob, &rel_path)
             .map(|rows| {
                 rows.into_iter()
                     .map(

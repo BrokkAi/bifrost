@@ -684,17 +684,6 @@ pub(super) fn execute_configuration_facts_seed(
             };
         }
     };
-    if files.is_empty() && !seed.where_globs.is_empty() {
-        diagnostics.push(CodeQueryDiagnostic {
-            code: CodeQueryDiagnosticCode::PathDerivationIncomplete,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: "workspace",
-            message: "configuration seed did not route to any workspace document for the requested path scope; absence is not provable".to_owned(),
-            exhausted_roots: Vec::new(),
-        });
-    }
-
     let mut rows: Vec<PipelineRow> = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut truncated = false;

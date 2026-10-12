@@ -514,6 +514,20 @@ pub(super) fn apply_plan_step(
             pipeline_halted: false,
         };
     }
+    if rows.is_empty() && matches!(step, QueryStep::ConfigurationAbsence(_)) {
+        diagnostics.push(incomplete_diagnostic(
+            CodeQueryDiagnosticCode::PathDerivationIncomplete,
+            "workspace",
+            "configuration seed did not route to any workspace document for the requested path scope; absence is not provable".to_owned(),
+            Vec::new(),
+        ));
+        return PlanExecution {
+            rows: Vec::new(),
+            truncated: false,
+            cancelled: false,
+            pipeline_halted: false,
+        };
+    }
     let mut use_snapshot_imports = false;
     let mut use_persisted_imports = false;
     let mut snapshot_lifecycle = None;

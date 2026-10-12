@@ -24,6 +24,17 @@ use tree_sitter::Parser;
 const PROVIDER: &str = "provider/item.go";
 const CALLER: &str = "consumer/use.go";
 
+/// The live Go oracles in this file spawn the host Go toolchain, either
+/// directly or through Go dependency discovery. The GitHub-hosted macOS
+/// runners do not put `go` on PATH (#4953), so a test that needs an oracle
+/// returns early instead of failing at the spawn.
+fn go_toolchain_available() -> bool {
+    std::process::Command::new("go")
+        .arg("version")
+        .output()
+        .is_ok()
+}
+
 fn assert_go_discovery_completed(outcome: &DependencyPackActivationOutcome) {
     let Some(go) = outcome
         .ecosystems
@@ -595,11 +606,7 @@ fn go_native_point_request_reuses_operation_and_path_context_per_file() {
 fn go_native_point_binds_standard_package_and_external_member_identity() {
     // The standard library comes from the host Go toolchain. Without one the
     // qualifier is correctly incomplete, so this test needs `go` on PATH.
-    if std::process::Command::new("go")
-        .arg("version")
-        .output()
-        .is_err()
-    {
+    if !go_toolchain_available() {
         return;
     }
     let source =
@@ -1007,6 +1014,11 @@ func caller(file *os.File) {
 #[test]
 #[hardwon("#3790: live Go discovery failures must surface as setup failures")]
 fn go_native_external_receiver_calls_use_typed_imported_models() {
+    // The imported standard-library models come from live Go dependency
+    // discovery, which spawns the host Go toolchain.
+    if !go_toolchain_available() {
+        return;
+    }
     let source = r#"package consumer
 
 import (
@@ -2661,6 +2673,10 @@ fn go_native_type_preserves_pointer_depth_and_nominal_identity() {
 
 #[test]
 fn go_native_generic_type_answers_match_go_types_with_argument_inference() {
+    // Every expected type answer comes from the host `go/types` oracle.
+    if !go_toolchain_available() {
+        return;
+    }
     let source = r#"package consumer
 
 type Number struct{}
@@ -2903,6 +2919,10 @@ func use() { Identity(Result{}).Maybe() }
 
 #[test]
 fn go_native_generic_inference_uses_fixed_arguments_on_variadic_signatures() {
+    // The `go test` oracle below compiles the fixture with the host compiler.
+    if !go_toolchain_available() {
+        return;
+    }
     let source = r#"package consumer
 
 type Number struct{}
@@ -2986,6 +3006,10 @@ func use() {
 
 #[test]
 fn go_native_propagates_options_result_to_loader_method_value() {
+    // The `go test` oracle below compiles the fixture with the host compiler.
+    if !go_toolchain_available() {
+        return;
+    }
     let source = r#"package consumer
 
 type Loader[K comparable, V any] interface {

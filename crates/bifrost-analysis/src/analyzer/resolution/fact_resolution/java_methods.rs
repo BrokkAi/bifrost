@@ -3,23 +3,30 @@
 
 use super::super::fact_source::{
     JavaInheritanceDeclaration, JavaInheritanceDeclarationKind,
-    language_can_close_interface_object_frontier,
+    language_can_close_interface_object_frontier, language_implicit_root_member_names,
 };
 use super::*;
 use crate::analyzer::usages::call_conversion::JavaPrimitive;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 
-const JAVA_OBJECT_METHOD_NAMES: [&str; 9] = [
-    "clone",
-    "equals",
-    "finalize",
-    "getClass",
-    "hashCode",
-    "notify",
-    "notifyAll",
-    "toString",
-    "wait",
-];
+/// The lookup identities of the methods `java.lang.Object` declares, as the
+/// shared-name digests the lowering interns for a callable lookup. A qualified
+/// route names its callee only by that identity, so an absent member is
+/// compared with the Object method names through their digests.
+static JAVA_OBJECT_METHOD_LOOKUP_DIGESTS: std::sync::LazyLock<HashSet<[u8; 32]>> =
+    std::sync::LazyLock::new(|| {
+        language_implicit_root_member_names(Language::Java)
+            .iter()
+            .map(|name| {
+                super::super::local_identity::ResolutionLookupSemanticRecipe::new(
+                    Language::Java,
+                    ResolutionNamespace::Callable,
+                    name,
+                )
+                .name_digest()
+            })
+            .collect()
+    });
 
 impl FactReadSession<'_> {
     pub(super) fn java_declarations(
@@ -118,32 +125,64 @@ impl FactEvaluation<'_, '_> {
         Ok(Some(Some(reasons)))
     }
 
-    /// The call's receiver hierarchy contributes only unindexed `java.lang.Object`
-    /// methods, and none of the selected source methods can collide with an
-    /// Object method. In that case the missing methods cannot add a same-name
-    /// overload, so their exact traversal reasons do not keep this call's
-    /// candidate set open.
+    /// The traversal reasons of this call that only an unindexed
+    /// `java.lang.Object` can answer, when no candidate or called name can be
+    /// an Object method.
+    ///
+    /// An implicit Object superclass edge (a class with no `extends`) adds only
+    /// the Object methods to a lookup, so for any other name its traversal
+    /// reason does not keep the candidate set open. The edge is identified by
+    /// its supertype row, not by an owner path: a bare call walks the
+    /// hierarchy of every enclosing class and records no owner path at all.
+    /// The called name is the name of the candidates; a call with no candidate
+    /// names no declaration, so its qualified route names the callee through
+    /// its lookup identity instead. An interface with no superinterface
+    /// implicitly declares the Object methods (JLS 9.2), which closes the
+    /// reason on the interface declaration the same way.
     pub(super) fn java_call_implicit_object_gap_reasons(
         &mut self,
-        language: Language,
+        obligation: &LoweredCallApplicabilityObligation,
         answer: &ResolutionAnswer,
         completion: &ResolutionCompletion,
+        previous_states: &StateMap,
     ) -> StoreResult<Option<BTreeSet<SemanticId>>> {
+        let language = obligation.language();
         let mut reasons = BTreeSet::new();
-        if answer.targets().is_empty() || !self.session.typed_source.selection_has_jvm_semantics() {
+        if !self.session.typed_source.selection_has_jvm_semantics() {
             return Ok(Some(reasons));
         }
         let mut owners = BTreeSet::new();
         let mut member_owners = BTreeSet::new();
+        if answer.targets().is_empty() {
+            if language != Language::Java {
+                return Ok(Some(reasons));
+            }
+            let Some(receivers) =
+                self.java_absent_member_receiver_owners(obligation, previous_states)?
+            else {
+                return Ok(None);
+            };
+            if receivers.is_empty() {
+                return Ok(Some(reasons));
+            }
+            member_owners.extend(receivers.iter().copied());
+            owners = receivers;
+        }
         for &target in answer.targets() {
-            let Some(Some(owner)) = self.member_owner_by_target.get(&target) else {
-                return Ok(Some(reasons));
-            };
-            let Some(root) = owner.owner_path.first().copied() else {
-                return Ok(Some(reasons));
-            };
-            owners.insert(root);
-            member_owners.insert(owner.owner());
+            match self.member_owner_by_target.get(&target) {
+                Some(Some(owner)) => {
+                    let Some(root) = owner.owner_path.first().copied() else {
+                        return Ok(Some(reasons));
+                    };
+                    owners.insert(root);
+                    member_owners.insert(owner.owner());
+                }
+                // A member that Java's lexical lookup of a bare call reached
+                // records no owner path. It has no receiver type to test for
+                // the interface rule, and the edge rule below needs none.
+                None if language == Language::Java => {}
+                Some(None) | None => return Ok(Some(reasons)),
+            }
         }
         let mut requested = answer.targets().iter().copied().collect::<BTreeSet<_>>();
         requested.extend(owners.iter().copied());
@@ -173,7 +212,8 @@ impl FactEvaluation<'_, '_> {
             // inventory is name-based, and static/instance kind cannot make a
             // differently named method applicable.
             if !matches!(&method.kind, JavaInheritanceDeclarationKind::Method { .. })
-                || JAVA_OBJECT_METHOD_NAMES.contains(&method.name.as_str())
+                || language_implicit_root_member_names(Language::Java)
+                    .contains(&method.name.as_str())
                 || call_name.is_some_and(|name| name != method.name.as_str())
             {
                 return Ok(Some(reasons));
@@ -214,25 +254,6 @@ impl FactEvaluation<'_, '_> {
             }
         }
 
-        let mut implicit_object_references = BTreeSet::new();
-        for owner in owners {
-            if self.poll_cancelled() {
-                return Ok(None);
-            }
-            if interface_object_gaps.contains(&owner) {
-                continue;
-            }
-            let Some(Some(references)) =
-                self.java_hierarchy_implicit_object_gap_references(owner)?
-            else {
-                return Ok(Some(reasons));
-            };
-            implicit_object_references.extend(references);
-        }
-        if implicit_object_references.is_empty() && interface_object_gaps.is_empty() {
-            return Ok(Some(reasons));
-        }
-
         let ResolutionCompletion::Incomplete(incomplete) = completion else {
             return Ok(Some(reasons));
         };
@@ -243,6 +264,10 @@ impl FactEvaluation<'_, '_> {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        // A traversal reason is about the supertype edge at its source site.
+        // The edge is the implicit Object superclass of some class when its
+        // supertype row says so, whichever class's hierarchy the lookup walked.
+        let mut edge_reasons = Vec::new();
         for chunk in candidates.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
             if self.poll_cancelled() {
                 return Ok(None);
@@ -257,23 +282,118 @@ impl FactEvaluation<'_, '_> {
                 }
                 let provenance = provenance.get(self.session);
                 if provenance.origin()
-                    == LoweringGapOrigin::Extracted(
+                    != LoweringGapOrigin::Extracted(
                         ResolutionGapKind::UnsupportedHierarchyTraversal,
                     )
-                    && {
-                        let source_site = super::super::fact_lowering::site_semantic(
-                            provenance.fragment(),
-                            provenance.source_site(),
-                        );
-                        implicit_object_references.contains(&source_site)
-                            || interface_object_gaps.contains(&source_site)
-                    }
                 {
+                    continue;
+                }
+                let source_site = super::super::fact_lowering::site_semantic(
+                    provenance.fragment(),
+                    provenance.source_site(),
+                );
+                if interface_object_gaps.contains(&source_site) {
                     reasons.insert(provenance.reason());
+                } else {
+                    edge_reasons.push((source_site, provenance.reason()));
                 }
             }
         }
+        let edge_references = edge_reasons
+            .iter()
+            .map(|&(reference, _)| reference)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut implicit_object_references = HashSet::default();
+        for chunk in edge_references.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            let read = self.session.supertypes_for_references(chunk)?;
+            let Some(supertypes) = self.accept_session_read(read) else {
+                return Ok(None);
+            };
+            implicit_object_references.extend(
+                supertypes
+                    .iter()
+                    .map(|row| row.get(self.session).row())
+                    .filter(|row| row.kind() == ResolutionSupertypeKind::ImplicitSuperclass)
+                    .map(|row| row.reference()),
+            );
+        }
+        reasons.extend(
+            edge_reasons
+                .into_iter()
+                .filter(|(reference, _)| implicit_object_references.contains(reference))
+                .map(|(_, reason)| reason),
+        );
         Ok(Some(reasons))
+    }
+
+    /// The static types of the receiver of a qualified Java call that found no
+    /// member, when the receiver is exact and the called name is not a method of
+    /// `java.lang.Object`. Empty means no claim: an unqualified call, an open
+    /// member surface, a receiver that is not one complete value, or a name
+    /// that an implicit Object edge could still supply. `None` reports
+    /// cancellation.
+    fn java_absent_member_receiver_owners(
+        &mut self,
+        obligation: &LoweredCallApplicabilityObligation,
+        previous_states: &StateMap,
+    ) -> StoreResult<Option<BTreeSet<SemanticId>>> {
+        let read = self
+            .session
+            .routes_for_references(&[obligation.callee_reference()])?;
+        let Some(routes) = self.accept_session_read(read) else {
+            return Ok(None);
+        };
+        let mut owners = BTreeSet::new();
+        for route in routes {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            let (namespace, open_member_surface, qualifier_slot, lookup) = {
+                let route = route.get(self.session).row();
+                (
+                    route.namespace(),
+                    route.open_member_surface(),
+                    route.qualifier_slot(),
+                    route.lookup(),
+                )
+            };
+            let Some(qualifier) = previous_states.get(&qualifier_slot) else {
+                return Ok(Some(BTreeSet::new()));
+            };
+            if namespace != ResolutionNamespace::Callable
+                || open_member_surface
+                || qualifier.completion() != &ResolutionCompletion::Complete
+                || qualifier.possible_values().is_empty()
+                || qualifier
+                    .possible_values()
+                    .iter()
+                    .any(|value| value.ty().indirection() != 0)
+            {
+                return Ok(Some(BTreeSet::new()));
+            }
+            let digest = self
+                .session
+                .lexical_source
+                .shared_name_digest_for_identity(lookup, self.cancellation)?;
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            if digest.is_none_or(|digest| JAVA_OBJECT_METHOD_LOOKUP_DIGESTS.contains(&digest)) {
+                return Ok(Some(BTreeSet::new()));
+            }
+            owners.extend(
+                qualifier
+                    .possible_values()
+                    .iter()
+                    .map(|value| value.ty().identity()),
+            );
+        }
+        Ok(Some(owners))
     }
 
     pub(super) fn java_method_origin_owners(
@@ -1353,7 +1473,7 @@ impl FactEvaluation<'_, '_> {
     /// including `root`. The outer `None` reports cancellation; the inner
     /// `None` reports an unresolved authored edge or a frontier not yet
     /// evaluated (it is demanded for the next round).
-    fn java_supertype_closure(
+    pub(super) fn java_supertype_closure(
         &mut self,
         root: SemanticId,
         states: &StateMap,

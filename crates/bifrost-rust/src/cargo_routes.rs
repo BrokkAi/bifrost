@@ -113,6 +113,8 @@ pub struct RustCargoRouteIndex {
     routes_by_manifest_and_name: HashMap<(PathBuf, String), Vec<RustCargoRoute>>,
     declared_dependencies_by_manifest_and_name:
         HashMap<(PathBuf, String), Vec<RustCargoDependencyKind>>,
+    declared_dependencies_by_unit_and_name:
+        HashMap<([u8; 32], String), Vec<RustCargoDependencyKind>>,
     target_roots_by_file: HashMap<ProjectFile, HashSet<ProjectFile>>,
     targets_by_root: HashMap<ProjectFile, HashSet<RustCargoTarget>>,
     files_by_reachable_root: HashMap<ProjectFile, Vec<ProjectFile>>,
@@ -166,6 +168,7 @@ pub(crate) enum RustCargoTargetKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RustCargoTarget {
     manifest: PathBuf,
+    summary_unit_key: Option<[u8; 32]>,
     kind: RustCargoTargetKind,
     development_capable: bool,
     edition: String,
@@ -191,6 +194,30 @@ struct RustCargoRoute {
     kind: RustCargoRouteKind,
     dependency_kind: Option<RustCargoDependencyKind>,
     target_predicate: Option<String>,
+    target_unit_key: Option<[u8; 32]>,
+}
+
+/// One row from the live Rust summary route query. Dependency columns are
+/// NULL when the unit has no dependencies; a workspace dependency carries its
+/// live library root when that unit is published.
+#[derive(Debug, Clone)]
+pub struct RustCargoRouteSummaryRow {
+    pub unit_key: [u8; 32],
+    pub manifest_directory: Option<PathBuf>,
+    pub target_kind: String,
+    pub crate_name: String,
+    pub edition: String,
+    pub development_capable: bool,
+    pub root_file: Option<ProjectFile>,
+    pub root_package: Option<String>,
+    pub dependency_extern_name: Option<String>,
+    pub dependency_kind: Option<RustCargoDependencyKind>,
+    pub dependency_boundary: Option<String>,
+    pub dependency_unit_key: Option<[u8; 32]>,
+    pub dependency_target_kind: Option<String>,
+    pub dependency_root_file: Option<ProjectFile>,
+    pub dependency_root_package: Option<String>,
+    pub dependency_manifest_directory: Option<PathBuf>,
 }
 
 struct CargoCrate {
@@ -273,6 +300,165 @@ impl RustCargoRouteIndex {
             &configuration,
             keep_going,
         )?;
+        Self::finish_build_from_topology_while(module_route_facts, topology, &keep_going)
+    }
+
+    /// Compose Cargo and module routes from normalized live unit-summary rows.
+    /// The summaries already record each target root and the dependencies
+    /// available to that target, so this path does not revisit Cargo manifests.
+    pub fn build_from_summary_rows_while(
+        files: &[ProjectFile],
+        module_route_facts: &HashMap<ProjectFile, RustModuleRouteFacts>,
+        rows: &[RustCargoRouteSummaryRow],
+        keep_going_fn: &dyn Fn() -> bool,
+    ) -> Option<Self> {
+        let keep_going = || keep_going_fn();
+        keep_going().then_some(())?;
+        let analyzed = files.iter().cloned().collect::<HashSet<_>>();
+        let mut topology = CargoManifestTopology {
+            routes_by_manifest_and_name: HashMap::default(),
+            declared_dependencies_by_manifest_and_name: HashMap::default(),
+            declared_dependencies_by_unit_and_name: HashMap::default(),
+            targets_by_root: HashMap::default(),
+            target_roots: Vec::new(),
+            analyzed,
+        };
+        let mut indexed_units = HashSet::default();
+        for row in rows {
+            keep_going().then_some(())?;
+            let manifest = row.manifest_directory.as_ref();
+            let target_kind = summary_target_kind(&row.target_kind);
+            if target_kind.is_none() {
+                assert!(
+                    manifest.is_none(),
+                    "detached Rust summary has no Cargo manifest: {row:?}"
+                );
+            }
+            if target_kind.is_some()
+                && let (Some(manifest), Some(root_file)) = (manifest, row.root_file.as_ref())
+            {
+                let kind = target_kind.expect("checked summary target kind");
+                topology
+                    .targets_by_root
+                    .entry(root_file.clone())
+                    .or_default()
+                    .insert(RustCargoTarget {
+                        manifest: manifest.clone(),
+                        summary_unit_key: Some(row.unit_key),
+                        kind,
+                        development_capable: row.development_capable,
+                        edition: row.edition.clone(),
+                    });
+                // Every Cargo target root comes from its live summary member.
+            } else if target_kind.is_some() && manifest.is_some() {
+                assert!(
+                    row.root_file.is_some(),
+                    "Cargo summary has a root member: {row:?}"
+                );
+            }
+
+            if row.target_kind == "lib" && manifest.is_some() {
+                assert!(
+                    row.root_file.is_some(),
+                    "library summary has a root member: {row:?}"
+                );
+                assert!(
+                    row.root_package.is_some(),
+                    "library summary has root naming: {row:?}"
+                );
+            }
+            if indexed_units.insert(row.unit_key)
+                && row.target_kind == "lib"
+                && let (Some(manifest), Some(root_file), Some(package)) =
+                    (manifest, row.root_file.as_ref(), row.root_package.as_ref())
+            {
+                topology
+                    .routes_by_manifest_and_name
+                    .entry((manifest.clone(), normalize_crate_name(&row.crate_name)))
+                    .or_default()
+                    .push(RustCargoRoute {
+                        package: package.clone(),
+                        root_file: root_file.clone(),
+                        kind: RustCargoRouteKind::CurrentLibrary,
+                        dependency_kind: None,
+                        target_predicate: None,
+                        target_unit_key: None,
+                    });
+            }
+
+            let Some(extern_name) = row.dependency_extern_name.as_ref() else {
+                assert!(row.dependency_kind.is_none());
+                assert!(row.dependency_boundary.is_none());
+                continue;
+            };
+            let dependency_kind = row
+                .dependency_kind
+                .expect("named Rust summary dependency has a kind");
+            if row.dependency_boundary.as_deref() == Some("workspace") {
+                assert!(row.dependency_unit_key.is_some());
+            }
+            let (Some(manifest), Some(_target_root)) = (manifest, row.root_file.as_ref()) else {
+                continue;
+            };
+            let normalized_name = normalize_crate_name(extern_name);
+            topology
+                .declared_dependencies_by_unit_and_name
+                .entry((row.unit_key, normalized_name.clone()))
+                .or_default()
+                .push(dependency_kind);
+            if row.dependency_boundary.as_deref() != Some("workspace")
+                || row.dependency_target_kind.as_deref() != Some("lib")
+            {
+                continue;
+            }
+            let (Some(root_file), Some(package), Some(dependency_manifest)) = (
+                row.dependency_root_file.as_ref(),
+                row.dependency_root_package.as_ref(),
+                row.dependency_manifest_directory.as_ref(),
+            ) else {
+                continue;
+            };
+            let route = RustCargoRoute {
+                package: package.clone(),
+                root_file: root_file.clone(),
+                kind: if dependency_manifest == manifest {
+                    RustCargoRouteKind::CurrentLibrary
+                } else {
+                    RustCargoRouteKind::Dependency
+                },
+                dependency_kind: Some(dependency_kind),
+                target_predicate: None,
+                target_unit_key: Some(row.unit_key),
+            };
+            topology
+                .routes_by_manifest_and_name
+                .entry((manifest.clone(), normalized_name))
+                .or_default()
+                .push(route);
+        }
+        topology.target_roots = topology.targets_by_root.keys().cloned().collect();
+        topology.target_roots.sort();
+        for routes in topology.routes_by_manifest_and_name.values_mut() {
+            routes.sort_by(|left, right| {
+                left.root_file
+                    .cmp(&right.root_file)
+                    .then_with(|| left.package.cmp(&right.package))
+                    .then_with(|| left.target_unit_key.cmp(&right.target_unit_key))
+            });
+            routes.dedup();
+        }
+        for dependencies in topology.declared_dependencies_by_unit_and_name.values_mut() {
+            dependencies.sort_by_key(|kind| *kind as u8);
+            dependencies.dedup();
+        }
+        Self::finish_build_from_topology_while(module_route_facts, topology, &keep_going)
+    }
+
+    fn finish_build_from_topology_while(
+        module_route_facts: &HashMap<ProjectFile, RustModuleRouteFacts>,
+        topology: CargoManifestTopology,
+        keep_going: &impl Fn() -> bool,
+    ) -> Option<Self> {
         let mut edges = ModuleEdgeCache::default();
 
         // Stage 1: which target roots reach which file, before any item macro
@@ -593,22 +779,29 @@ impl RustCargoRouteIndex {
 
     pub fn has_available_declared_dependency(&self, file: &ProjectFile, route_name: &str) -> bool {
         let normalized = normalize_crate_name(route_name);
-        self.target_roots_by_file
-            .get(file)
-            .into_iter()
-            .flatten()
-            .filter_map(|root| self.targets_by_root.get(root))
-            .flatten()
-            .any(|target| {
-                self.declared_dependencies_by_manifest_and_name
-                    .get(&(target.manifest.clone(), normalized.clone()))
-                    .is_some_and(|kinds| {
-                        kinds
-                            .iter()
-                            .copied()
-                            .any(|kind| cargo_dependency_available_to_target(kind, target))
+        self.target_roots_by_file.get(file).is_some_and(|roots| {
+            roots.iter().any(|root| {
+                self.targets_by_root
+                    .get(root)
+                    .into_iter()
+                    .flatten()
+                    .any(|target| {
+                        let dependency_kinds = if let Some(unit_key) = target.summary_unit_key {
+                            self.declared_dependencies_by_unit_and_name
+                                .get(&(unit_key, normalized.clone()))
+                        } else {
+                            self.declared_dependencies_by_manifest_and_name
+                                .get(&(target.manifest.clone(), normalized.clone()))
+                        };
+                        dependency_kinds.is_some_and(|kinds| {
+                            kinds
+                                .iter()
+                                .copied()
+                                .any(|kind| cargo_dependency_available_to_target(kind, target))
+                        })
                     })
             })
+        })
     }
 
     pub fn external_module_declarations(&self) -> &[RustCargoModuleDeclaration] {
@@ -758,7 +951,12 @@ impl RustCargoRouteIndex {
                         .get(target.manifest.as_path())
                         .into_iter()
                         .flatten()
-                        .filter(|route| cargo_route_available_to_target(route, target))
+                        .filter(|route| {
+                            route
+                                .target_unit_key
+                                .is_none_or(|unit_key| Some(unit_key) == target.summary_unit_key)
+                                && cargo_route_available_to_target(route, target)
+                        })
                         .map(|route| &route.root_file),
                 );
             }
@@ -902,19 +1100,27 @@ impl RustCargoRouteIndex {
         let Some(target_roots) = self.target_roots_by_file.get(file) else {
             return self.resolve_unique_unscoped_library_route(&normalized);
         };
-        let mut resolved = target_roots
-            .iter()
-            .filter_map(|root| self.targets_by_root.get(root))
-            .flatten()
-            .flat_map(|target| {
-                self.routes_by_manifest_and_name
-                    .get(&(target.manifest.clone(), normalized.clone()))
-                    .into_iter()
-                    .flatten()
-                    .filter(move |route| cargo_route_available_to_target(route, target))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut resolved = Vec::new();
+        for root in target_roots {
+            let Some(targets) = self.targets_by_root.get(root) else {
+                continue;
+            };
+            for target in targets {
+                resolved.extend(
+                    self.routes_by_manifest_and_name
+                        .get(&(target.manifest.clone(), normalized.clone()))
+                        .into_iter()
+                        .flatten()
+                        .filter(|route| {
+                            route
+                                .target_unit_key
+                                .is_none_or(|unit_key| Some(unit_key) == target.summary_unit_key)
+                                && cargo_route_available_to_target(route, target)
+                        })
+                        .cloned(),
+                );
+            }
+        }
         resolved.sort_by(|left, right| {
             left.root_file
                 .cmp(&right.root_file)
@@ -989,6 +1195,19 @@ fn cargo_route_available_to_target(route: &RustCargoRoute, target: &RustCargoTar
     }
 }
 
+fn summary_target_kind(target_kind: &str) -> Option<RustCargoTargetKind> {
+    match target_kind {
+        "lib" => Some(RustCargoTargetKind::Library),
+        "bin" => Some(RustCargoTargetKind::Binary),
+        "example" => Some(RustCargoTargetKind::Example),
+        "test" => Some(RustCargoTargetKind::Test),
+        "bench" => Some(RustCargoTargetKind::Bench),
+        "build" => Some(RustCargoTargetKind::Build),
+        "detached" => None,
+        _ => panic!("unknown Rust summary target kind {target_kind:?}"),
+    }
+}
+
 fn cargo_dependency_available_to_target(
     kind: RustCargoDependencyKind,
     target: &RustCargoTarget,
@@ -1012,6 +1231,8 @@ struct CargoManifestTopology {
     routes_by_manifest_and_name: HashMap<(PathBuf, String), Vec<RustCargoRoute>>,
     declared_dependencies_by_manifest_and_name:
         HashMap<(PathBuf, String), Vec<RustCargoDependencyKind>>,
+    declared_dependencies_by_unit_and_name:
+        HashMap<([u8; 32], String), Vec<RustCargoDependencyKind>>,
     targets_by_root: HashMap<ProjectFile, HashSet<RustCargoTarget>>,
     /// Every target root in the workspace, sorted. One membership walk is
     /// seeded from all of them at once: a walk frontier carries the target it
@@ -1078,6 +1299,7 @@ impl CargoManifestTopology {
                     .or_default()
                     .extend(kinds.iter().copied().map(|kind| RustCargoTarget {
                         manifest: cargo_crate.directory.clone(),
+                        summary_unit_key: None,
                         kind: kind.kind,
                         development_capable: kind.development_capable,
                         edition: cargo_crate.edition.clone(),
@@ -1094,6 +1316,7 @@ impl CargoManifestTopology {
                         kind: RustCargoRouteKind::CurrentLibrary,
                         dependency_kind: None,
                         target_predicate: None,
+                        target_unit_key: None,
                     });
             }
             for (dependency_kind, target_predicate, dependencies) in
@@ -1148,6 +1371,7 @@ impl CargoManifestTopology {
                                 kind: RustCargoRouteKind::Dependency,
                                 dependency_kind: Some(dependency_kind),
                                 target_predicate: target_predicate.map(str::to_string),
+                                target_unit_key: None,
                             });
                     }
                 }
@@ -1167,6 +1391,7 @@ impl CargoManifestTopology {
         Some(Self {
             routes_by_manifest_and_name,
             declared_dependencies_by_manifest_and_name,
+            declared_dependencies_by_unit_and_name: HashMap::default(),
             targets_by_root,
             target_roots,
             analyzed,
@@ -1195,6 +1420,7 @@ impl CargoManifestTopology {
             routes_by_manifest_and_name: self.routes_by_manifest_and_name,
             declared_dependencies_by_manifest_and_name: self
                 .declared_dependencies_by_manifest_and_name,
+            declared_dependencies_by_unit_and_name: self.declared_dependencies_by_unit_and_name,
             target_roots_by_file,
             targets_by_root: self.targets_by_root,
             files_by_reachable_root: HashMap::default(),
@@ -3043,6 +3269,7 @@ mod frozen_orchestration {
                     .or_default()
                     .extend(kinds.iter().copied().map(|kind| RustCargoTarget {
                         manifest: cargo_crate.directory.clone(),
+                        summary_unit_key: None,
                         kind: kind.kind,
                         development_capable: kind.development_capable,
                         edition: cargo_crate.edition.clone(),
@@ -3069,6 +3296,7 @@ mod frozen_orchestration {
                         kind: RustCargoRouteKind::CurrentLibrary,
                         dependency_kind: None,
                         target_predicate: None,
+                        target_unit_key: None,
                     });
             }
             for (dependency_kind, target_predicate, dependencies) in
@@ -3123,6 +3351,7 @@ mod frozen_orchestration {
                                 kind: RustCargoRouteKind::Dependency,
                                 dependency_kind: Some(dependency_kind),
                                 target_predicate: target_predicate.map(str::to_string),
+                                target_unit_key: None,
                             });
                     }
                 }
@@ -3140,6 +3369,9 @@ mod frozen_orchestration {
         let mut index = RustCargoRouteIndex {
             routes_by_manifest_and_name,
             declared_dependencies_by_manifest_and_name,
+            // The reference targets carry no summary unit key, so the
+            // unit-keyed map is never consulted on this path.
+            declared_dependencies_by_unit_and_name: HashMap::default(),
             target_roots_by_file,
             targets_by_root,
             files_by_reachable_root: HashMap::default(),

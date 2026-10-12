@@ -1540,6 +1540,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         }
         let guard = self.guard_of(guard).cloned();
         self.types.push(TypeFact {
+            jvm_inventory: None,
             ambient_use: None,
             id: type_declaration_id(TypeIdentity {
                 ecosystem: "python",

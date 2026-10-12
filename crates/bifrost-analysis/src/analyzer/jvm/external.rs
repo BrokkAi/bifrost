@@ -96,6 +96,7 @@ const JDK_DISCOVERY_HOME_ID_DOMAIN: &[u8] = b"bifrost-jvm.jdk-discovery-home-id/
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JvmExternalDeclarationIndex {
+    inventory_providers: Vec<String>,
     types_by_fqn: HashMap<String, JvmExternalType>,
     /// The member surface of every indexed owner whose own artifact entry this
     /// index read to the end, keyed by the owner's fully-qualified name
@@ -115,10 +116,55 @@ pub(crate) fn get_or_build_external_declaration_index<'a>(
     index: &'a OnceLock<Arc<JvmExternalDeclarationIndex>>,
     config: &JvmAnalyzerConfig,
     project: &dyn Project,
+    store: &crate::analyzer::store::AnalyzerStore,
 ) -> &'a JvmExternalDeclarationIndex {
     index
-        .get_or_init(|| JvmExternalDeclarationIndex::build_for_project(config, project))
+        .get_or_init(|| {
+            JvmExternalDeclarationIndex::build_for_project_with_inventory(config, project, store)
+                .unwrap_or_else(|error| {
+                    eprintln!("JVM external inventory publication failed: {error}");
+                    JvmExternalDeclarationIndex::build_for_project(config, project)
+                })
+        })
         .as_ref()
+}
+
+pub(crate) fn java_inventory_providers(analyzer: &dyn crate::analyzer::IAnalyzer) -> Vec<String> {
+    crate::analyzer::multi_analyzer::resolve_analyzer::<crate::analyzer::java::JavaAnalyzer>(
+        analyzer,
+    )
+    .map(|java| {
+        java.external_declaration_index()
+            .inventory_providers
+            .clone()
+    })
+    .unwrap_or_default()
+}
+
+pub(crate) fn kotlin_inventory_providers(analyzer: &dyn crate::analyzer::IAnalyzer) -> Vec<String> {
+    crate::analyzer::multi_analyzer::resolve_analyzer::<crate::analyzer::kotlin::KotlinAnalyzer>(
+        analyzer,
+    )
+    .map(|kotlin| {
+        kotlin
+            .external_declaration_index()
+            .inventory_providers
+            .clone()
+    })
+    .unwrap_or_default()
+}
+
+pub(crate) fn scala_inventory_providers(analyzer: &dyn crate::analyzer::IAnalyzer) -> Vec<String> {
+    crate::analyzer::multi_analyzer::resolve_analyzer::<crate::analyzer::scala::ScalaAnalyzer>(
+        analyzer,
+    )
+    .map(|scala| {
+        scala
+            .external_declaration_index()
+            .inventory_providers
+            .clone()
+    })
+    .unwrap_or_default()
 }
 
 /// Whether the retained external index resolves a name from `access_package`.
@@ -1843,6 +1889,148 @@ impl JvmExternalDeclarationIndex {
         )
     }
 
+    /// Direct artifact indexing publishes the same relational inventory before
+    /// the name-grouped dispatch surface discards overload coordinates. Only
+    /// bounded provider identities survive publication in the existing index.
+    pub(crate) fn build_for_project_with_inventory(
+        config: &JvmAnalyzerConfig,
+        project: &dyn Project,
+        store: &crate::analyzer::store::AnalyzerStore,
+    ) -> crate::analyzer::store::Result<Arc<Self>> {
+        let discovery = resolve_jvm_semantic_pack_dependencies(
+            config,
+            project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        let limits = ArtifactProducerLimits::default();
+        let mut providers = Vec::new();
+        for artifact in discovery
+            .dependencies
+            .iter()
+            .filter_map(jvm_artifact_from_dependency)
+            .take(MAX_INDEX_ARTIFACTS)
+        {
+            for path in std::iter::once(artifact.artifact_path.as_path())
+                .chain(artifact.source_artifact_path.as_deref())
+            {
+                // Scala source-only indexes do not assert a Java member inventory.
+                let kind = if is_source_jar(path) {
+                    ExternalArtifactKind::JavaSourceJar
+                } else {
+                    ExternalArtifactKind::JavaClassJar
+                };
+                let exact =
+                    match crate::analyzer::semantic_model::read_exact_artifact(path, &limits) {
+                        Ok(exact) => exact,
+                        Err(_) => continue, // Existing index diagnostics describe unread artifacts.
+                    };
+                let provider = exact.sha256().to_owned();
+                let exists: bool = store.read_conn()?.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM jvm_external_owners WHERE provider_id=?1)",
+                    [&provider],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    let request = ArtifactProductionRequest {
+                        path: path.to_path_buf(),
+                        artifact_kind: kind,
+                        pack_id: "bifrost.external.java".to_owned(),
+                        pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+                        ecosystem: "maven".to_owned(),
+                        compatibility: Compatibility {
+                            bifrost: None,
+                            toolchains: Vec::new(),
+                        },
+                        activation: Vec::new(),
+                        provenance: Provenance {
+                            source: "local dependency artifact".to_owned(),
+                            revision: None,
+                        },
+                        license: "NOASSERTION".to_owned(),
+                        safety: Safety {
+                            generated_code_only: false,
+                            review_required: false,
+                        },
+                    };
+                    let production = JavaJarPackProducer
+                        .produce_loaded_artifact(&request, &limits, None, &exact);
+                    if let Some(pack) = production.pack {
+                        for shard in pack.shards {
+                            if let AuthoredPayload::DeclarationFacts { types, members, .. } =
+                                shard.payload
+                            {
+                                store.publish_jvm_external_inventory_facts(
+                                    provider.clone(),
+                                    &types,
+                                    &members,
+                                    production.completeness
+                                        == crate::analyzer::semantic_model::Completeness::Complete,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                providers.push(provider);
+            }
+        }
+        providers.sort_unstable();
+        providers.dedup();
+        let mut index = (*Self::build_for_project(config, project)).clone();
+        index.inventory_providers = providers;
+        let providers = serde_json::to_string(&index.inventory_providers)
+            .expect("string provider identities serialize");
+        let conn = store.read_conn()?;
+        let mut statement = conn.prepare("SELECT provider_id, owner_fqn, ordinal, member_name, is_static, json(parameters_jsonb) FROM jvm_external_owner_members member WHERE provider_id IN (SELECT value FROM json_each(?1)) AND member_kind IN ('method', 'constructor') AND (SELECT count(*) FROM jvm_external_owners owner WHERE owner.owner_fqn=member.owner_fqn AND owner.provider_id IN (SELECT value FROM json_each(?1)))=1 ORDER BY provider_id,owner_fqn,ordinal")?;
+        let mut rows = statement.query([providers])?;
+        while let Some(row) = rows.next()? {
+            let owner: String = row.get(1)?;
+            let member: String = row.get(3)?;
+            let Some(family) = index
+                .members_by_owner
+                .get_mut(&owner)
+                .and_then(|surface| surface.members.get_mut(&member))
+            else {
+                continue;
+            };
+            let parameters: Vec<crate::analyzer::semantic_model::Parameter> =
+                serde_json::from_str(&row.get::<_, String>(5)?)
+                    .map_err(|error| crate::analyzer::store::StoreError::new(error.to_string()))?;
+            let is_static: bool = row.get(4)?;
+            for shape in &mut family.call_shapes {
+                if shape.is_static == is_static
+                    && shape.parameters.len() == parameters.len()
+                    && shape
+                        .parameters
+                        .iter()
+                        .zip(&parameters)
+                        .all(|(selected, formal)| *selected == formal.r#type)
+                    && shape.variadic == parameters.iter().any(|formal| formal.variadic)
+                {
+                    let identity = crate::analyzer::resolution::ExternalMemberIdentity {
+                        owner: crate::analyzer::resolution::ExternalOwnerIdentity {
+                            provider_id: std::sync::Arc::from(row.get::<_, String>(0)?),
+                            owner_fqn: std::sync::Arc::from(owner.as_str()),
+                        },
+                        ordinal: row.get(2)?,
+                    };
+                    // Conflicting provider coordinates cannot certify one
+                    // selected member. The existing dispatch shape still works.
+                    if shape
+                        .inventory_identity
+                        .as_ref()
+                        .is_none_or(|old| *old == identity)
+                    {
+                        shape.inventory_identity = Some(identity);
+                    } else {
+                        shape.inventory_identity = None;
+                    }
+                }
+            }
+        }
+        Ok(Arc::new(index))
+    }
+
     fn build_from_artifacts(artifacts: Vec<ResolvedJvmArtifact>) -> Self {
         let mut index = Self::default();
         let mut remaining_index_bytes = MAX_TOTAL_INDEX_BYTES;
@@ -2324,6 +2512,14 @@ impl JvmExternalDeclarationIndex {
             // same class file declares are a surface that may answer (#1900).
             let mut members = HashMap::default();
             for member in surface.members {
+                // The durable inventory owns all declarations. Preserve this
+                // legacy public dispatch projection before grouping overloads.
+                if !matches!(
+                    member.visibility,
+                    Visibility::Public | Visibility::Protected
+                ) {
+                    continue;
+                }
                 if !member_budget.take() {
                     break;
                 }
@@ -2935,6 +3131,7 @@ impl<'a> JvmExternalDeclarations<'a> {
                         continue;
                     };
                     call_shapes.push(JvmExternalCallShape {
+                        inventory_identity: None,
                         non_overridable: symbol.non_overridable,
                         parameter_count,
                         parameters: signature
@@ -3003,6 +3200,32 @@ pub(crate) fn model_declares_external_type(
     qualified_model_symbols(overlay, fqn)
         .iter()
         .any(|symbol| pack_type_kind(symbol.kind).is_some())
+}
+
+/// One unambiguous model provider for a declared type, independently of
+/// whether that provider has a complete durable owner inventory.
+pub(crate) fn model_declared_external_owner(
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    fqn: &str,
+) -> Option<crate::analyzer::resolution::ExternalOwnerIdentity> {
+    let symbols = qualified_model_symbols(overlay, fqn);
+    let mut types = symbols
+        .into_iter()
+        .filter(|symbol| pack_type_kind(symbol.kind).is_some());
+    let first = types.next()?;
+    if first.provenance.ambiguous
+        || types.any(|symbol| {
+            symbol.provenance.ambiguous
+                || symbol.provenance.pack_digest != first.provenance.pack_digest
+                || symbol.qualified_name != first.qualified_name
+        })
+    {
+        return None;
+    }
+    Some(crate::analyzer::resolution::ExternalOwnerIdentity {
+        provider_id: first.provenance.pack_digest.as_str().into(),
+        owner_fqn: first.qualified_name.as_str().into(),
+    })
 }
 
 pub(crate) fn qualified_model_symbols<'a>(
@@ -3088,6 +3311,7 @@ pub(crate) struct JvmExternalMember {
 /// One callable overload retained beside the collapsed member name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct JvmExternalCallShape {
+    inventory_identity: Option<crate::analyzer::resolution::ExternalMemberIdentity>,
     non_overridable: Option<crate::analyzer::semantic_model::NonOverridableEvidence>,
     parameter_count: u32,
     parameters: Vec<TypeRef>,
@@ -3204,6 +3428,78 @@ impl JvmExternalMember {
         self.applicable_shape_for_argument_types(instance_receiver, actuals)?
             .non_overridable
             .as_ref()
+    }
+
+    /// Reuse the writer's owner-member order for the overload selected by the
+    /// structured argument conversion proof. This borrows the active shard;
+    /// it does not materialize another payload or invent a source locator.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn direct_inventory_identity_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+    ) -> Option<crate::analyzer::resolution::ExternalMemberIdentity> {
+        self.applicable_shape_for_argument_types(instance_receiver, actuals)?
+            .inventory_identity
+            .clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn inventory_identity_for_argument_types(
+        &self,
+        active: &crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+    ) -> Option<crate::analyzer::resolution::ExternalMemberIdentity> {
+        use crate::analyzer::resolution::{ExternalMemberIdentity, ExternalOwnerIdentity};
+        let shape = self.applicable_shape_for_argument_types(instance_receiver, actuals)?;
+        let (owner_fqn, member_name) = self.fqn.rsplit_once('.')?;
+        let mut selected = None;
+        for owner in active.types_named(owner_fqn).records {
+            if !owner.shard.independently_enumerates_jvm_owner(owner.record) {
+                continue;
+            }
+            let (_, members, _) = owner.shard.shard.payload().declaration_facts()?;
+            for (ordinal, member) in members
+                .iter()
+                .filter(|member| member.owner == owner.record.id && member.guard.is_none())
+                .enumerate()
+            {
+                if member.name != member_name || member.is_static != shape.is_static {
+                    continue;
+                }
+                let Some(signature) = &member.signature else {
+                    continue;
+                };
+                if signature.parameters.len() != shape.parameters.len()
+                    || !signature
+                        .parameters
+                        .iter()
+                        .zip(&shape.parameters)
+                        .all(|(formal, selected)| formal.r#type == *selected)
+                    || signature.parameters.iter().any(|formal| formal.variadic) != shape.variadic
+                {
+                    continue;
+                }
+                let identity = ExternalMemberIdentity {
+                    owner: ExternalOwnerIdentity {
+                        provider_id: std::sync::Arc::from(
+                            owner.shard.manifest.semantic_sha256.as_str(),
+                        ),
+                        owner_fqn: std::sync::Arc::from(owner_fqn),
+                    },
+                    ordinal: u32::try_from(ordinal).expect("bounded provider member ordinal"),
+                };
+                if selected
+                    .as_ref()
+                    .is_some_and(|previous| previous != &identity)
+                {
+                    return None;
+                }
+                selected = Some(identity);
+            }
+        }
+        selected
     }
 
     /// The declared return type of the same one overload
@@ -3400,6 +3696,9 @@ fn java_external_conversion(actual: &TypeRef, formal: &TypeRef) -> JavaExternalC
                 JavaExternalConversion::Inapplicable
             };
         }
+        (Some(_), None) if matches!(formal, TypeRef::Array { .. }) => {
+            return JavaExternalConversion::Inapplicable;
+        }
         (Some(actual), None) => {
             let Some(formal_name) = java_external_reference_name(formal) else {
                 return JavaExternalConversion::Unknown;
@@ -3434,6 +3733,13 @@ fn java_external_conversion(actual: &TypeRef, formal: &TypeRef) -> JavaExternalC
     }
     if actual == formal || matches!(actual, TypeRef::Named { name, .. } if name == "<null>") {
         return JavaExternalConversion::Strict;
+    }
+    // Widening a nominal reference cannot produce an array. A competing
+    // array overload is inapplicable, rather than an unknown conversion.
+    if matches!(formal, TypeRef::Array { .. })
+        && matches!(actual, TypeRef::Named { .. } | TypeRef::Declared { .. })
+    {
+        return JavaExternalConversion::Inapplicable;
     }
     if java_external_reference_name(formal) == Some("java.lang.Object")
         && java_external_reference_name(actual).is_some()
@@ -3575,6 +3881,7 @@ fn external_call_shape(
     let signature = signature?;
     let parameter_count = u32::try_from(signature.parameters.len()).ok()?;
     Some(JvmExternalCallShape {
+        inventory_identity: None,
         non_overridable,
         parameter_count,
         parameters: signature
@@ -4744,6 +5051,7 @@ mod tests {
             is_constant: false,
             jdk_artifact_sha256: None,
             call_shapes: vec![JvmExternalCallShape {
+                inventory_identity: None,
                 non_overridable: None,
                 parameter_count: 0,
                 parameters: Vec::new(),
@@ -4865,6 +5173,48 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let jar = root.path().join("probe.jar");
         probe_class_jar(&jar);
+        let store = crate::analyzer::store::AnalyzerStore::open_ephemeral().unwrap();
+        let config = JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                artifact_paths: vec![JvmExternalArtifact {
+                    artifact_path: jar.clone(),
+                    source_artifact_path: None,
+                    coordinate: None,
+                    origin: JvmExternalArtifactOrigin::Explicit,
+                }],
+                ..JvmExternalDependencies::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let project = TestProject::new(root.path(), Language::Java);
+        let stored = JvmExternalDeclarationIndex::build_for_project_with_inventory(
+            &config, &project, &store,
+        )
+        .unwrap();
+        let provider = stored
+            .inventory_providers
+            .first()
+            .expect("indexed artifact content identity");
+        let conn = store.read_conn().unwrap();
+        let coverage: (bool, bool, bool, bool) = conn.query_row(
+            "SELECT callables_complete,values_complete,types_complete,supertypes_complete FROM jvm_external_owners WHERE provider_id=?1 AND owner_fqn='com.example.probe.Registry'",
+            [provider], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(coverage, (true, true, true, true));
+        let declared = JvmExternalDeclarations::new(&stored, None)
+            .resolve_member_spelling("com.example.probe.Registry.register", "app", |owner| {
+                stored.get(owner).cloned()
+            })
+            .unwrap();
+        let identity = declared
+            .direct_inventory_identity_for_argument_types(
+                false,
+                &[TypeRef::named("java.lang.String")],
+            )
+            .expect("direct overload has its durable member coordinate");
+        assert_eq!(identity.owner.provider_id.as_ref(), provider);
+        let persisted: String = conn.query_row("SELECT member_name FROM jvm_external_owner_members WHERE provider_id=?1 AND owner_fqn=?2 AND ordinal=?3", rusqlite::params![identity.owner.provider_id.as_ref(),identity.owner.owner_fqn.as_ref(),identity.ordinal], |row| row.get(0)).unwrap();
+        assert_eq!(persisted, "register");
+        drop(conn);
         let index = probe_index(&jar);
         let surface = JvmExternalDeclarations::new(&index, None);
 
@@ -5055,7 +5405,7 @@ mod tests {
                 ),
                 (
                     "java.base/java/lang/Object.java",
-                    b"package java.lang; public class Object {}",
+                    b"package java.lang; public class Object { public final String echo(String value) { return value; } public final String echo(int value) { return null; } public String echo(String value, int count) { return value; } }",
                 ),
             ],
         );
@@ -5130,6 +5480,123 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(reused.profile.artifacts_read, 0);
         assert_eq!(reused.packs[0].evidence, prepared.packs[0].evidence);
+
+        // Cross the generated source-archive, compiler, activation, and SQLite
+        // inventory boundary, including overloads and repeat publication.
+        let request = crate::analyzer::semantic_model::SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            evidence: vec![reused.packs[0].evidence.clone()],
+            controls: Vec::new(),
+            limits: Default::default(),
+        };
+        let crate::analyzer::semantic_model::SemanticModelResolutionOutcome::Ready(active) =
+            crate::analyzer::semantic_model::resolve_active_semantic_models(
+                &catalog,
+                &request,
+                &CancellationToken::default(),
+            )
+        else {
+            panic!("exact generated source inventory activates");
+        };
+        let store = crate::analyzer::store::AnalyzerStore::open_ephemeral().unwrap();
+        for shard in active.shards() {
+            store.publish_jvm_external_owner_inventory(shard).unwrap();
+            store.publish_jvm_external_owner_inventory(shard).unwrap();
+        }
+        let conn = store.read_conn().unwrap();
+        let complete: bool = conn
+            .query_row(
+                "SELECT callables_complete FROM jvm_external_owners WHERE owner_fqn='java.lang.Object'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !complete,
+            "source API inventory makes no whole-namespace absence claim"
+        );
+        let shapes = conn
+            .prepare(
+                "SELECT json_array_length(parameters_jsonb), non_overridable,
+                    json_extract(return_type_jsonb, '$.name')
+             FROM jvm_external_owner_members WHERE member_name='echo'
+             ORDER BY json_array_length(parameters_jsonb)",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            shapes,
+            vec![
+                (
+                    1,
+                    Some("java_final_method".to_owned()),
+                    "java.lang.String".to_owned()
+                ),
+                (
+                    1,
+                    Some("java_final_method".to_owned()),
+                    "java.lang.String".to_owned()
+                ),
+                (2, None, "java.lang.String".to_owned()),
+            ]
+        );
+        let analyzer = JavaAnalyzer::from_project(project);
+        let overlay = Arc::new(
+            crate::analyzer::semantic_model::SemanticModelOverlay::build(
+                &analyzer,
+                &active,
+                &CancellationToken::default(),
+                128 * 1024 * 1024,
+            )
+            .unwrap(),
+        );
+        let index = JvmExternalDeclarationIndex::default();
+        let declarations = JvmExternalDeclarations::new(&index, Some(overlay));
+        let member = declarations
+            .resolve_member_spelling("java.lang.Object.echo", "app", |owner| {
+                declarations.resolve_qualified_name(owner, "app")
+            })
+            .unwrap();
+        let string = TypeRef::Named {
+            name: "java.lang.String".into(),
+            arguments: Vec::new(),
+            nullable: false,
+        };
+        let integer = TypeRef::Named {
+            name: "int".into(),
+            arguments: Vec::new(),
+            nullable: false,
+        };
+        let string_identity = member
+            .inventory_identity_for_argument_types(&active, true, &[string])
+            .unwrap();
+        let integer_identity = member
+            .inventory_identity_for_argument_types(&active, true, &[integer])
+            .unwrap();
+        assert_eq!(string_identity.owner, integer_identity.owner);
+        assert_ne!(
+            string_identity.ordinal, integer_identity.ordinal,
+            "same-arity overloads have separate inventory identities"
+        );
+        for (identity, parameter) in [
+            (string_identity, "java.lang.String"),
+            (integer_identity, "int"),
+        ] {
+            let stored: String = conn.query_row(
+                "SELECT json_extract(parameters_jsonb,'$[0].type.name') FROM jvm_external_owner_members WHERE provider_id=?1 AND owner_fqn=?2 AND ordinal=?3",
+                rusqlite::params![identity.owner.provider_id.as_ref(), identity.owner.owner_fqn.as_ref(), identity.ordinal],
+                |row| row.get(0)).unwrap();
+            assert_eq!(stored, parameter);
+        }
     }
 
     #[cfg(unix)]

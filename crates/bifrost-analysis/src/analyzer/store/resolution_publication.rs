@@ -355,10 +355,11 @@ impl AnalyzerStore {
         prepared: PreparedParsedBlob,
         cancellation: &CancellationToken,
     ) -> Result<ResolutionContentPublicationOutcome> {
+        let reconcile_owner = owner.clone();
         let owner = owner.clone();
         let path = persisted_relative_path.to_owned();
         let cancellation = cancellation.clone();
-        self.conn.execute(move |conn| {
+        let outcome = self.conn.execute(move |conn| {
             let result =
                 super::resolution::with_resolution_progress_handler(conn, &cancellation, |conn| {
                     if cancellation.is_cancelled() {
@@ -436,7 +437,18 @@ impl AnalyzerStore {
                 }
                 result => result,
             }
-        })
+        })?;
+        // The publish withdrew every Rust summary version that listed the
+        // replaced blob (`write_prepared_blob_rows_tx`). Derive those units
+        // again now that the transaction has committed: a reconcile opens its
+        // own writer transactions, so it cannot run inside the closure above.
+        // Only a Ready publish wrote, so only it can have withdrawn anything.
+        if let ResolutionContentPublicationOutcome::Ready(_) = &outcome
+            && reconcile_owner.lang == "rust"
+        {
+            self.reconcile_rust_crates_unless_current(&reconcile_owner)?;
+        }
+        Ok(outcome)
     }
 
     pub(crate) fn admit_cached_selected_content(

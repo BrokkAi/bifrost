@@ -636,7 +636,38 @@ fn adapt_definition_answer_with_import_model(
             message: format!("selected native binding is incomplete: {completion:?}"),
         });
     }
-    let status = if ambiguous {
+    let external_family = answer.external_members.first().filter(|first| {
+        answer.external_members.len() == target_count
+            && lexical_definition.is_none()
+            && definitions.is_empty()
+            && answer.external_members.iter().all(|member| {
+                member.identity.owner == first.identity.owner
+                    && member.member_name == first.member_name
+            })
+    });
+    if let Some(first) = external_family {
+        diagnostics.push(DefinitionLookupDiagnostic {
+            claim: Some(
+                crate::analyzer::usages::get_definition::UnindexedClaim::external_boundary(
+                    format!("{}.{}", first.identity.owner.owner_fqn, first.member_name),
+                    crate::analyzer::usages::get_definition::ClaimSubjectRole::Member,
+                ),
+            ),
+            kind: "native_external_member_inventory".into(),
+            message: format!(
+                "indexed external member rows {:?}; static={}",
+                answer
+                    .external_members
+                    .iter()
+                    .map(|member| &member.identity)
+                    .collect::<Vec<_>>(),
+                first.is_static
+            ),
+        });
+    }
+    let status = if external_family.is_some() && !ambiguous && !is_incomplete {
+        DefinitionLookupStatus::UnresolvableImportBoundary
+    } else if ambiguous {
         // Exact Go selector ties and multiple semantic targets establish
         // ambiguity even when another open inventory limits completeness.
         DefinitionLookupStatus::Ambiguous
@@ -662,7 +693,14 @@ fn adapt_definition_answer_with_import_model(
     let outcome = DefinitionLookupOutcome {
         modeled_definitions,
         status,
-        reference: Some(site.clone()),
+        reference: Some({
+            let mut reference = site.clone();
+            if let Some(member) = external_family {
+                reference.text =
+                    format!("{}.{}", member.identity.owner.owner_fqn, member.member_name);
+            }
+            reference
+        }),
         definitions,
         lexical_definition,
         diagnostics,

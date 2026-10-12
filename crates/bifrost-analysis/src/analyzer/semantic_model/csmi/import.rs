@@ -454,6 +454,7 @@ fn import_semantic_document(
             .cloned()
             .unwrap_or_else(|| symbol.id.clone());
         types.push(TypeFact {
+            jvm_inventory: None,
             ambient_use: None,
             id: id.clone(),
             name: name.clone(),

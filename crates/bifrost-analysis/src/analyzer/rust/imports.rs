@@ -5,9 +5,10 @@
 //! method below fetches or fills a cache slot and hands the actual resolution to
 //! the Rust crate through the [`RustSource`] the analyzer implements.
 
+use crate::analyzer::store::rust_unit_summaries::RustSummaryBindingSurfaceRow;
 use crate::analyzer::{
-    CodeUnit, ImportAnalysisProvider, ImportGraphBindingSurface, ImportGraphInputDigests,
-    ImportInfo, ImportedFileEdgeFacts, ProjectFile,
+    CodeUnit, CodeUnitIndex, ImportAnalysisProvider, ImportGraphBindingSurface,
+    ImportGraphInputDigests, ImportInfo, ImportedFileEdgeFacts, ProjectFile,
 };
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
@@ -16,14 +17,19 @@ use brokk_bifrost_core::analyzer::rust_facts::{RustCfgInstruction, RustVisibilit
 use brokk_bifrost_rust::declarations::rust_package_name;
 use brokk_bifrost_rust::imports::RustImportBindingName;
 use brokk_bifrost_rust::imports::{
-    resolve_rust_import_fq_name, rust_could_import_file, rust_crate_root_package,
+    resolve_rust_import_fq_name, resolve_rust_module_path_with_crate,
+    resolve_rust_module_segments_with_crate, rust_could_import_file, rust_crate_root_package,
     rust_imported_code_units,
 };
 use brokk_bifrost_rust::lexical_scope::RustCfgCondition;
-use brokk_bifrost_rust::usage::{Domain, ModuleKey, RustSymbolNamespace};
+use brokk_bifrost_rust::usage::{
+    Domain, ModuleKey, RustOriginRoute, RustRouteProvenance, RustSymbolIdentity,
+    RustSymbolNamespace,
+};
 use brokk_bifrost_rust::usage_queries::{
     RustDeclarationFacts, RustImportBinding, RustUsageQueries,
 };
+#[cfg(test)]
 use brokk_bifrost_rust::usage_walks::RustUsageWalks;
 use std::sync::Arc;
 
@@ -75,47 +81,86 @@ impl ImportAnalysisProvider for RustAnalyzer {
         files: &[ProjectFile],
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> Option<crate::hash::HashMap<ProjectFile, Vec<ImportGraphBindingSurface>>> {
-        let scope = cancellation.map_or_else(
-            || AnalyzerQueryScope::new(self),
-            |cancellation| AnalyzerQueryScope::with_cancellation(self, cancellation),
-        );
         let keep_going = || cancellation.is_none_or(|token| !token.is_cancelled());
-        let walks = match RustUsageWalks::new_while(self, scope.token(), &keep_going) {
-            Ok(walks) => walks,
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable)
-            | Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
-                return None;
-            }
-        };
+        if files.is_empty() {
+            return Some(crate::hash::HashMap::default());
+        }
+        if !keep_going() {
+            return None;
+        }
+        let rows = persisted_binding_surface_rows_for_files(self, files, &keep_going)?;
         let mut surfaces = crate::hash::HashMap::default();
-        for file in files {
-            if !keep_going() {
-                return None;
-            }
-            let mut surface = Vec::new();
-            for module in walks.binding_modules_of(file).ok()? {
-                if !keep_going() {
-                    return None;
+        let mut grouped: crate::hash::HashMap<
+            (String, i64, i64),
+            (ImportGraphBindingSurface, HashSet<ProjectFile>),
+        > = crate::hash::HashMap::default();
+        for row in rows {
+            let file = files
+                .iter()
+                .find(|file| crate::path_utils::rel_path_string(file) == row.rel_path)?;
+            let file_root = file.root().to_path_buf();
+            let root_components: Vec<String> = serde_json::from_str(&row.root_components).ok()?;
+            let crate_root = root_components.join(".");
+            let module_package =
+                resolve_rust_module_path_with_crate(&crate_root, &crate_root, &row.module_path)?;
+            let module = ModuleKey::with_crate_root(&crate_root, &module_package);
+            let origin_root_components: Vec<String> =
+                serde_json::from_str(&row.origin_root_components).ok()?;
+            let origin_crate_root = origin_root_components.join(".");
+            let origin_package = resolve_rust_module_path_with_crate(
+                &origin_crate_root,
+                &origin_crate_root,
+                &row.origin_module_path,
+            )?;
+            let origin_module = ModuleKey::with_crate_root(&origin_crate_root, &origin_package);
+            let visibility_scope = match row.visibility_kind.as_str() {
+                "public" => String::new(),
+                "crate" => row.visibility_crate_root.clone()?,
+                "module" => {
+                    let visibility_path = row.visibility_module_path.as_deref()?;
+                    let package = resolve_rust_module_path_with_crate(
+                        &crate_root,
+                        &crate_root,
+                        visibility_path,
+                    )?;
+                    rust_module_surface_key(&ModuleKey::with_crate_root(&crate_root, &package))
                 }
-                for binding in walks.bindings_at(file, &module).ok()?.iter() {
-                    let (visibility_kind, visibility_scope) = match &binding.domain {
-                        Domain::Public => ("public", String::new()),
-                        Domain::Crate(crate_root) => ("crate", crate_root.clone()),
-                        Domain::Module(module) => ("module", rust_module_surface_key(module)),
-                    };
-                    surface.push(ImportGraphBindingSurface {
+                _ => return None,
+            };
+            let key = (row.rel_path.clone(), row.member_ordinal, row.route_ordinal);
+            let entry = grouped.entry(key).or_insert_with(|| {
+                (
+                    ImportGraphBindingSurface {
                         module_path: rust_module_surface_key(&module),
-                        name: binding.name.clone(),
-                        namespace: rust_symbol_namespace_key(binding.namespace).to_owned(),
-                        visibility_kind: visibility_kind.to_owned(),
+                        name: row.name.clone(),
+                        namespace: row.namespace.clone(),
+                        visibility_kind: row.visibility_kind.clone(),
                         visibility_scope,
-                        origin_file: binding.origin.file.clone(),
-                        origin_module_path: rust_module_surface_key(&binding.origin.module),
-                        origin_name: binding.origin.name.clone(),
-                        route_files: binding.route_files.clone(),
-                    });
-                }
-            }
+                        origin_file: ProjectFile::new(file_root.clone(), row.origin_file.clone()),
+                        origin_module_path: rust_module_surface_key(&origin_module),
+                        origin_name: row.origin_name.clone(),
+                        route_files: Vec::new(),
+                    },
+                    HashSet::default(),
+                )
+            });
+            entry
+                .1
+                .insert(ProjectFile::new(file_root, row.route_file.clone()));
+        }
+        for ((rel_path, _, _), (mut surface, route_files)) in grouped {
+            let file = files
+                .iter()
+                .find(|file| crate::path_utils::rel_path_string(file) == rel_path)?;
+            surface.route_files = route_files.into_iter().collect();
+            surface.route_files.sort();
+            surfaces
+                .entry(file.clone())
+                .or_insert_with(Vec::new)
+                .push(surface);
+        }
+        for file in files {
+            let surface = surfaces.entry(file.clone()).or_insert_with(Vec::new);
             surface.sort_by(|left, right| {
                 left.module_path
                     .cmp(&right.module_path)
@@ -129,7 +174,6 @@ impl ImportAnalysisProvider for RustAnalyzer {
                     .then_with(|| left.route_files.cmp(&right.route_files))
             });
             surface.dedup();
-            surfaces.insert(file.clone(), surface);
         }
         Some(surfaces)
     }
@@ -179,32 +223,400 @@ impl ImportAnalysisProvider for RustAnalyzer {
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> Option<crate::hash::HashMap<ProjectFile, crate::analyzer::ImportResolutionDependencies>>
     {
-        let scope = cancellation.map_or_else(
+        if files.is_empty() {
+            return Some(crate::hash::HashMap::default());
+        }
+        let _scope = cancellation.map_or_else(
             || AnalyzerQueryScope::new(self),
             |cancellation| AnalyzerQueryScope::with_cancellation(self, cancellation),
         );
         let keep_going = || cancellation.is_none_or(|token| !token.is_cancelled());
-        let walks = match RustUsageWalks::new_while(self, scope.token(), &keep_going) {
-            Ok(walks) => walks,
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable)
-            | Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
+        let cargo_routes = self.cargo_routes_while(&keep_going).ok()?;
+        if !keep_going() {
+            return None;
+        }
+        let store = self.inner.analyzer_store();
+        let snapshots = self.inner.selected_workspace_snapshots();
+        let rel_paths = files
+            .iter()
+            .map(crate::path_utils::rel_path_string)
+            .collect::<Vec<_>>();
+        let completeness =
+            match store.rust_summary_binding_completeness_rows(&snapshots, &rel_paths) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    self.inner.record_store_error(error.context(
+                        "reading live Rust summary binding completeness for import graph",
+                    ));
+                    return None;
+                }
+            };
+        if !keep_going() {
+            return None;
+        }
+        let requested_files: crate::hash::HashMap<_, _> = files
+            .iter()
+            .cloned()
+            .map(|file| (crate::path_utils::rel_path_string(&file), file))
+            .collect();
+        let mut completeness_by_path = crate::hash::HashMap::default();
+        for row in completeness {
+            assert_eq!(
+                row.complete,
+                row.gap_kind == "complete" && row.gap_subject.is_empty(),
+                "Rust summary completeness row has a canonical typed gap: {row:?}"
+            );
+            if !row.complete {
+                return None;
+            }
+            assert!(
+                completeness_by_path
+                    .insert(row.rel_path.clone(), row)
+                    .is_none(),
+                "one live Rust summary completeness row exists per member"
+            );
+        }
+        if completeness_by_path.len() != requested_files.len()
+            || requested_files
+                .keys()
+                .any(|path| !completeness_by_path.contains_key(path))
+        {
+            return None;
+        }
+
+        let queries = RustUsageQueries::new(self);
+        let surface_rows = match store.rust_summary_binding_surface_rows(&snapshots, &rel_paths) {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.inner.record_store_error(
+                    error.context("reading live Rust summary routes for import graph dependencies"),
+                );
                 return None;
             }
         };
-        let mut dependencies = crate::hash::HashMap::default();
+        if !keep_going() {
+            return None;
+        }
+        let mut context_paths = surface_rows
+            .iter()
+            .map(|row| row.route_file.clone())
+            .chain(rel_paths.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let project_root = files[0].root();
+        let mut foreign_roots = Vec::new();
+        for path in &context_paths {
+            if !keep_going() {
+                return None;
+            }
+            let file = ProjectFile::new(project_root.to_path_buf(), path);
+            let facts = queries.facts_of(&file).ok()??;
+            for target in &facts.import_targets {
+                let Some(first) = target.module_path.first() else {
+                    continue;
+                };
+                if let Some((root, _)) = cargo_routes
+                    .resolve_crate_root_file_segments_with_kind(&file, std::slice::from_ref(first))
+                {
+                    foreign_roots.push(crate::path_utils::rel_path_string(&root));
+                }
+            }
+        }
+        context_paths.extend(foreign_roots);
+        let route_paths = context_paths
+            .into_iter()
+            .filter(|path| !completeness_by_path.contains_key(path))
+            .collect::<Vec<_>>();
+        if !route_paths.is_empty() {
+            let route_completeness =
+                match store.rust_summary_binding_completeness_rows(&snapshots, &route_paths) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        self.inner.record_store_error(error.context(
+                            "reading live Rust route-member completeness for import graph",
+                        ));
+                        return None;
+                    }
+                };
+            for row in route_completeness {
+                assert_eq!(
+                    row.complete,
+                    row.gap_kind == "complete" && row.gap_subject.is_empty(),
+                    "Rust route-member completeness row has a canonical typed gap: {row:?}"
+                );
+                if !row.complete {
+                    return None;
+                }
+                assert!(
+                    !completeness_by_path.contains_key(&row.rel_path),
+                    "one live Rust summary completeness row exists per member path: new={row:?}, previous={:?}",
+                    completeness_by_path.get(&row.rel_path)
+                );
+                completeness_by_path.insert(row.rel_path.clone(), row);
+            }
+        }
+        let mut module_candidates = Vec::new();
+        let mut seen_module_candidates = HashSet::default();
         for file in files {
             if !keep_going() {
                 return None;
             }
-            let selected = selected_ordinals
-                .get(file)
-                .map(|ordinals| ordinals.as_slice());
-            dependencies.insert(
-                file.clone(),
-                walks
-                    .import_resolution_dependencies_for_ordinals(file, selected)
-                    .ok()?,
+            let rel_path = crate::path_utils::rel_path_string(file);
+            let member = completeness_by_path.get(&rel_path)?;
+            let package_components: Vec<String> =
+                serde_json::from_str(&member.package_components).ok()?;
+            let root_components: Vec<String> =
+                serde_json::from_str(&member.root_components).ok()?;
+            let facts = queries.facts_of(file).ok()??;
+            for (ordinal, target) in facts.import_targets.iter().enumerate() {
+                let import_ordinal =
+                    u32::try_from(ordinal).expect("Rust source import ordinal fits u32");
+                if selected_ordinals
+                    .get(file)
+                    .is_some_and(|ordinals| !ordinals.contains(&import_ordinal))
+                {
+                    continue;
+                }
+                let root_lookup_names = target.imported_name.iter().cloned().collect::<Vec<_>>();
+                append_rust_summary_import_module_candidates(
+                    &mut module_candidates,
+                    &mut seen_module_candidates,
+                    file,
+                    member.summary_id,
+                    import_ordinal,
+                    target,
+                    &package_components,
+                    &root_components,
+                    &root_lookup_names,
+                    target.module_path.first().and_then(|first| {
+                        let (root, _) = cargo_routes.resolve_crate_root_file_segments_with_kind(
+                            file,
+                            std::slice::from_ref(first),
+                        )?;
+                        completeness_by_path.get(&crate::path_utils::rel_path_string(&root))
+                    }),
+                );
+            }
+        }
+        for row in &surface_rows {
+            if !keep_going() {
+                return None;
+            }
+            let Some(root_import_ordinal) = row.source_import_ordinal else {
+                continue;
+            };
+            let Some(route_import_id) = row.route_source_import_id else {
+                assert!(
+                    row.route_source_import_ordinal.is_none(),
+                    "Rust route source import id and ordinal are both present or absent"
+                );
+                continue;
+            };
+            let Some(route_import_ordinal) = row.route_source_import_ordinal else {
+                assert!(
+                    row.route_source_import_id.is_none(),
+                    "Rust route source import id and ordinal are both present or absent"
+                );
+                continue;
+            };
+            if row.route_file == row.rel_path {
+                continue;
+            }
+            let Some(owner_file) = requested_files.get(&row.rel_path) else {
+                continue;
+            };
+            let root_import_ordinal = u32::try_from(root_import_ordinal)
+                .expect("Rust source import ordinal is nonnegative and fits u32");
+            if selected_ordinals
+                .get(owner_file)
+                .is_some_and(|ordinals| !ordinals.contains(&root_import_ordinal))
+            {
+                continue;
+            }
+            let route_member = completeness_by_path.get(&row.route_file)?;
+            let route_file = ProjectFile::new(owner_file.root().to_path_buf(), &row.route_file);
+            let route_facts = queries.facts_of(&route_file).ok()??;
+            let route_import_ordinal = usize::try_from(route_import_ordinal)
+                .expect("Rust route source import ordinal is nonnegative");
+            let target = route_facts.import_targets.get(route_import_ordinal)?;
+            let decoded_import_id = target.source_import_id.map(|id| i64::from(id.get()));
+            assert_eq!(
+                decoded_import_id,
+                Some(route_import_id),
+                "Rust route source import ordinal identifies its source import id"
             );
+            let package_components: Vec<String> =
+                serde_json::from_str(&route_member.package_components).ok()?;
+            let root_components: Vec<String> =
+                serde_json::from_str(&route_member.root_components).ok()?;
+            append_rust_summary_import_module_candidates(
+                &mut module_candidates,
+                &mut seen_module_candidates,
+                owner_file,
+                route_member.summary_id,
+                root_import_ordinal,
+                target,
+                &package_components,
+                &root_components,
+                &[row.route_name.clone(), row.origin_name.clone()],
+                target.module_path.first().and_then(|first| {
+                    let (root, _) = cargo_routes.resolve_crate_root_file_segments_with_kind(
+                        &route_file,
+                        std::slice::from_ref(first),
+                    )?;
+                    completeness_by_path.get(&crate::path_utils::rel_path_string(&root))
+                }),
+            );
+        }
+        let candidates = module_candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.summary_id,
+                    rust_summary_module_path(&candidate.module),
+                )
+            })
+            .collect::<Vec<_>>();
+        let candidate_rows = match store.rust_summary_module_candidate_rows(&snapshots, &candidates)
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.inner.record_store_error(
+                    error.context("reading Rust summary module candidates for import graph"),
+                );
+                return None;
+            }
+        };
+        if !keep_going() {
+            return None;
+        }
+        let mut dependencies = requested_files
+            .values()
+            .cloned()
+            .map(|file| {
+                (
+                    file,
+                    crate::analyzer::ImportResolutionDependencies::default(),
+                )
+            })
+            .collect::<crate::hash::HashMap<_, _>>();
+        let mut seen_lookups: HashSet<(ProjectFile, u32, String, String)> = HashSet::default();
+        let mut seen_missing: HashSet<(ProjectFile, u32, String)> = HashSet::default();
+        let mut candidate_present = vec![false; module_candidates.len()];
+        for row in candidate_rows {
+            let candidate = module_candidates
+                .get(row.candidate_ordinal)
+                .expect("module candidate row refers to its requested candidate");
+            candidate_present[row.candidate_ordinal] |= row.present;
+            let Some(consulted_path) = row.rel_path else {
+                continue;
+            };
+            let names = candidate
+                .lookup_name
+                .iter()
+                .chain(&candidate.additional_lookup_names);
+            for name in names {
+                let key = (
+                    candidate.owner_file.clone(),
+                    candidate.import_ordinal,
+                    consulted_path.clone(),
+                    name.clone(),
+                );
+                if seen_lookups.insert(key) {
+                    dependencies
+                        .get_mut(&candidate.owner_file)
+                        .expect("requested Rust member has dependency facts")
+                        .lookups
+                        .push(crate::analyzer::ImportLookupDependency {
+                            import_ordinal: candidate.import_ordinal,
+                            consulted_file: ProjectFile::new(
+                                candidate.owner_file.root().to_path_buf(),
+                                consulted_path.clone(),
+                            ),
+                            name: name.clone(),
+                        });
+                }
+            }
+        }
+        for (index, candidate) in module_candidates.iter().enumerate() {
+            if candidate.record_missing && !candidate_present[index] {
+                let path_key = format!(
+                    "{}::{}",
+                    candidate.module.crate_root,
+                    candidate.module.components.join("::")
+                );
+                if seen_missing.insert((
+                    candidate.owner_file.clone(),
+                    candidate.import_ordinal,
+                    path_key.clone(),
+                )) {
+                    dependencies
+                        .get_mut(&candidate.owner_file)
+                        .expect("requested Rust member has dependency facts")
+                        .missing_module_path_keys
+                        .push((candidate.import_ordinal, path_key));
+                }
+            }
+        }
+        for row in surface_rows {
+            if !keep_going() {
+                return None;
+            }
+            let Some(import_ordinal) = row.source_import_ordinal else {
+                assert!(
+                    row.source_import_id.is_none(),
+                    "Rust summary route import id and ordinal are both present or absent"
+                );
+                continue;
+            };
+            assert!(
+                row.source_import_id.is_some(),
+                "Rust summary route import id and ordinal are both present or absent"
+            );
+            let import_ordinal = u32::try_from(import_ordinal)
+                .expect("Rust source import ordinal is nonnegative and fits u32");
+            let Some(file) = requested_files.get(&row.rel_path) else {
+                continue;
+            };
+            if selected_ordinals
+                .get(file)
+                .is_some_and(|ordinals| !ordinals.contains(&import_ordinal))
+            {
+                continue;
+            }
+            if row.route_file == row.rel_path {
+                continue;
+            }
+            let facts = dependencies
+                .get_mut(file)
+                .expect("selected Rust summary path maps to the request file");
+            for name in [row.name, row.origin_name] {
+                let key = (
+                    file.clone(),
+                    import_ordinal,
+                    row.route_file.clone(),
+                    name.clone(),
+                );
+                if seen_lookups.insert(key) {
+                    facts.lookups.push(crate::analyzer::ImportLookupDependency {
+                        import_ordinal,
+                        consulted_file: ProjectFile::new(
+                            file.root().to_path_buf(),
+                            row.route_file.clone(),
+                        ),
+                        name,
+                    });
+                }
+            }
+        }
+        for facts in dependencies.values_mut() {
+            facts.lookups.sort_by(|left, right| {
+                left.import_ordinal
+                    .cmp(&right.import_ordinal)
+                    .then_with(|| left.consulted_file.cmp(&right.consulted_file))
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+            facts.missing_module_path_keys.sort_unstable();
+            facts.missing_module_path_keys.dedup();
         }
         Some(dependencies)
     }
@@ -212,7 +624,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
     fn for_each_import_edge_facts_from_infos(
         &self,
         files: &[ProjectFile],
-        import_infos: Option<&crate::hash::HashMap<ProjectFile, Vec<ImportInfo>>>,
+        _import_infos: Option<&crate::hash::HashMap<ProjectFile, Vec<ImportInfo>>>,
         selected_ordinals: &crate::hash::HashMap<ProjectFile, Vec<u32>>,
         cancellation: Option<&crate::cancellation::CancellationToken>,
         visit: &mut dyn FnMut(&ProjectFile, Vec<ImportedFileEdgeFacts>) -> bool,
@@ -223,43 +635,50 @@ impl ImportAnalysisProvider for RustAnalyzer {
         );
         let token = scope.token();
         let keep_going = || cancellation.is_none_or(|token| !token.is_cancelled());
-        let walks = match RustUsageWalks::new_while(self, token, &keep_going) {
-            Ok(walks) => walks,
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
-                return None;
-            }
+        if files.is_empty() {
+            return Some(());
+        }
+        let package_files = match self.package_file_index_while(token, &keep_going) {
+            Ok(files) => files,
             Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
                 return Some(());
             }
+            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
+                return None;
+            }
         };
+        let Some(surface_rows) = persisted_binding_surface_rows_for_files(self, files, &keep_going)
+        else {
+            return cancellation
+                .is_some_and(crate::cancellation::CancellationToken::is_cancelled)
+                .then_some(());
+        };
+        let queries = RustUsageQueries::new(self);
         for file in files {
             if !keep_going() {
                 return Some(());
             }
-            let owned_imports;
-            let imports = if let Some(imports) = import_infos.and_then(|infos| infos.get(file)) {
-                imports.as_slice()
-            } else {
-                owned_imports = self.inner.import_info_of(token, file);
-                &owned_imports
-            };
-            let facts = match rust_import_edge_facts_for_file(
-                self,
-                &walks,
-                file,
-                selected_ordinals.get(file).map(Vec::as_slice),
-                &keep_going,
-            ) {
-                Ok(facts) => facts,
+            let bindings = match queries.import_bindings_of(file) {
+                Ok(bindings) => bindings,
                 Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
                     return Some(());
                 }
                 Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
-                    vec![ImportedFileEdgeFacts {
-                        import_ordinal: u32::MAX,
-                        edges: direct_import_file_edges(self, file, imports),
-                    }]
+                    return None;
                 }
+            };
+            let Some(facts) = rust_import_edge_facts_from_summary(
+                &package_files,
+                file,
+                &bindings,
+                &surface_rows,
+                selected_ordinals.get(file).map(Vec::as_slice),
+                &keep_going,
+            ) else {
+                if !keep_going() {
+                    return Some(());
+                }
+                return None;
             };
             if !visit(file, facts) {
                 break;
@@ -274,23 +693,34 @@ impl ImportAnalysisProvider for RustAnalyzer {
         imports: &[ImportInfo],
     ) -> Option<HashMap<ProjectFile, Vec<serde_json::Value>>> {
         let scope = AnalyzerQueryScope::new(self);
-        let walks = match RustUsageWalks::new(self, scope.token()) {
-            Ok(walks) => walks,
+        let keep_going = || true;
+        let package_files = self
+            .package_file_index_while(scope.token(), &keep_going)
+            .ok()?;
+        let Some(surface_rows) =
+            persisted_binding_surface_rows_for_files(self, std::slice::from_ref(file), &keep_going)
+        else {
+            return Some(direct_import_file_edges(&package_files, file, imports));
+        };
+        let queries = RustUsageQueries::new(self);
+        let bindings = match queries.import_bindings_of(file) {
+            Ok(bindings) => bindings,
             Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
-                return Some(direct_import_file_edges(self, file, imports));
+                return Some(direct_import_file_edges(&package_files, file, imports));
             }
             Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
-                unreachable!("uncancelled Rust import provenance lookup cannot be cancelled")
+                unreachable!("uncancelled Rust provenance query cannot be cancelled")
             }
         };
-        let facts = match rust_import_edge_facts_for_file(self, &walks, file, None, &|| true) {
-            Ok(facts) => facts,
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
-                return Some(direct_import_file_edges(self, file, imports));
-            }
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
-                unreachable!("uncancelled Rust import provenance lookup cannot be cancelled")
-            }
+        let Some(facts) = rust_import_edge_facts_from_summary(
+            &package_files,
+            file,
+            &bindings,
+            &surface_rows,
+            None,
+            &keep_going,
+        ) else {
+            return Some(direct_import_file_edges(&package_files, file, imports));
         };
         let mut edges = HashMap::default();
         for fact in facts {
@@ -327,15 +757,35 @@ impl ImportAnalysisProvider for RustAnalyzer {
             return (*cached).clone();
         }
 
-        let reverse_index = crate::analyzer::memoized_reverse_import_index(
-            &self.reverse_import_index,
-            || self.inner.all_files(),
-            |candidate| self.imported_code_units_of(candidate),
-        );
-        let referencing = reverse_index
-            .get(file)
-            .map(|files| (**files).clone())
-            .unwrap_or_default();
+        let referencing = match self.live_path_snapshot().oid_for_path(file) {
+            Some(oid) => self
+                .inner
+                .analyzer_store()
+                .rust_summary_importing_file_paths(
+                    self.inner.selected_workspace_snapshots().as_ref(),
+                    &oid.to_string(),
+                    &crate::path_utils::rel_path_string(file),
+                    &self
+                        .inner
+                        .declarations(file)
+                        .iter()
+                        .map(|unit| (unit.identifier().to_owned(), unit.fq_name()))
+                        .collect::<Vec<_>>(),
+                )
+                .map(|paths| {
+                    paths
+                        .into_iter()
+                        .map(|path| ProjectFile::new(file.root().to_path_buf(), path))
+                        .collect()
+                })
+                .unwrap_or_else(|error| {
+                    self.inner.record_store_error(
+                        error.context(format!("reading live Rust summary importers for {file:?}")),
+                    );
+                    HashSet::default()
+                }),
+            None => HashSet::default(),
+        };
         self.referencing_files
             .insert(file.clone(), Arc::new(referencing.clone()));
         referencing
@@ -350,31 +800,22 @@ impl ImportAnalysisProvider for RustAnalyzer {
         file: &ProjectFile,
         imports: &[ImportInfo],
     ) -> Option<HashSet<ProjectFile>> {
-        let mut imported_files = direct_imported_files(self, file, imports);
+        let scope = AnalyzerQueryScope::new(self);
+        let package_files = self
+            .package_file_index_while(scope.token(), &|| true)
+            .ok()?;
+        let mut imported_files = direct_imported_files(&package_files, file, imports);
         if imports.is_empty() {
             return Some(imported_files);
         }
-
-        let scope = AnalyzerQueryScope::new(self);
-        let walks = match RustUsageWalks::new(self, scope.token()) {
-            Ok(walks) => walks,
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
-                // Cargo route construction records its structured store
-                // failure on the active query. Keep the module-file edges
-                // already resolved; the query boundary reports that failure.
-                return Some(imported_files);
-            }
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
-                unreachable!("uncancelled Rust import-file resolution cannot be cancelled")
-            }
+        let Some(surface_rows) =
+            persisted_binding_surface_rows_for_files(self, std::slice::from_ref(file), &|| true)
+        else {
+            return Some(imported_files);
         };
-        match extend_origin_files(&walks, file, &mut imported_files) {
-            Ok(()) => {}
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
-                // Route reads record the store failure on the active query.
-            }
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
-                unreachable!("uncancelled Rust import-file resolution cannot be cancelled")
+        for row in surface_rows {
+            if row.source_import_ordinal.is_some() {
+                imported_files.insert(ProjectFile::new(file.root().to_path_buf(), row.origin_file));
             }
         }
         Some(imported_files)
@@ -412,8 +853,22 @@ impl ImportAnalysisProvider for RustAnalyzer {
         );
         let token = scope.token();
         let keep_going = || cancellation.is_none_or(|token| !token.is_cancelled());
-        let mut walks = None;
-        let mut walks_unavailable = false;
+        let package_files = match self.package_file_index_while(token, &keep_going) {
+            Ok(files) => files,
+            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
+                return Some(());
+            }
+            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
+                return None;
+            }
+        };
+        let surface_rows = match persisted_binding_surface_rows_for_files(self, files, &keep_going)
+        {
+            Some(rows) => rows,
+            None if !keep_going() => return Some(()),
+            None => Vec::new(),
+        };
+        let queries = RustUsageQueries::new(self);
         for file in files {
             if cancellation.is_some_and(crate::cancellation::CancellationToken::is_cancelled) {
                 return Some(());
@@ -425,42 +880,35 @@ impl ImportAnalysisProvider for RustAnalyzer {
                 owned_imports = self.inner.import_info_of(token, file);
                 &owned_imports
             };
-            let mut imported_edges = direct_import_file_edges(self, file, imports);
-            if !imports.is_empty() && !walks_unavailable {
-                if walks.is_none() {
-                    let walk = if cancellation.is_some() {
-                        RustUsageWalks::new_while(self, token, &keep_going)
-                    } else {
-                        RustUsageWalks::new(self, token)
-                    };
-                    match walk {
-                        Ok(resolved) => walks = Some(resolved),
-                        Err(
-                            brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable,
-                        ) => {
-                            walks_unavailable = true;
-                        }
-                        Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
-                            return Some(());
-                        }
+            let mut imported_edges = direct_import_file_edges(&package_files, file, imports);
+            if !imports.is_empty() && !surface_rows.is_empty() {
+                let bindings = match queries.import_bindings_of(file) {
+                    Ok(bindings) => bindings,
+                    Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
+                        return Some(());
                     }
-                }
-                if let Some(walks) = &walks {
-                    match walks.origin_routes_of(file) {
-                        Ok(routes) => {
-                            for route in routes.values().flatten() {
-                                imported_edges
-                                    .entry(route.origin.file.clone())
-                                    .or_default()
-                                    .push(rust_origin_route_provenance(route));
-                            }
+                    Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
+                        if !visit(file, imported_edges) {
+                            break;
                         }
-                        Err(
-                            brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable,
-                        ) => {}
-                        Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
-                            return Some(());
-                        }
+                        continue;
+                    }
+                };
+                let Some(route_facts) = rust_import_origin_route_facts_from_summary(
+                    file,
+                    &bindings,
+                    &surface_rows,
+                    None,
+                    &keep_going,
+                ) else {
+                    if !keep_going() {
+                        return Some(());
+                    }
+                    return None;
+                };
+                for route_edges in route_facts.into_values() {
+                    for (target, provenance) in route_edges {
+                        imported_edges.entry(target).or_default().extend(provenance);
                     }
                 }
             }
@@ -564,6 +1012,156 @@ fn rust_module_surface_key(module: &ModuleKey) -> String {
         .chain(module.components.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join("::")
+}
+
+#[derive(Debug)]
+struct RustSummaryImportModuleCandidate {
+    owner_file: ProjectFile,
+    summary_id: i64,
+    import_ordinal: u32,
+    module: ModuleKey,
+    lookup_name: Option<String>,
+    additional_lookup_names: Vec<String>,
+    record_missing: bool,
+}
+
+type ImportModuleCandidateKey = (
+    ProjectFile,
+    u32,
+    ModuleKey,
+    Option<String>,
+    bool,
+    Vec<String>,
+);
+
+#[allow(clippy::too_many_arguments)]
+fn append_rust_summary_import_module_candidates(
+    candidates: &mut Vec<RustSummaryImportModuleCandidate>,
+    seen: &mut HashSet<ImportModuleCandidateKey>,
+    owner_file: &ProjectFile,
+    summary_id: i64,
+    import_ordinal: u32,
+    target: &brokk_bifrost_core::analyzer::rust_facts::RustImportTargetFact,
+    package_components: &[String],
+    root_components: &[String],
+    additional_lookup_names: &[String],
+    external_root: Option<
+        &crate::analyzer::store::rust_unit_summaries::RustSummaryBindingCompletenessRow,
+    >,
+) {
+    let package = package_components.join(".");
+    let crate_root = root_components.join(".");
+    let owner_package =
+        brokk_bifrost_rust::usage_queries::compose_module(&package, &target.owner_module);
+    let importer_module = ModuleKey::with_crate_root(&crate_root, &owner_package);
+    let mut path = target.module_path.clone();
+    if let Some(imported_name) = &target.imported_name {
+        path.push(imported_name.clone());
+    }
+
+    let external_root = external_root.map(|root| {
+        let components: Vec<String> = serde_json::from_str(&root.root_components)
+            .expect("Rust summary root components were validated at publication");
+        (root.summary_id, components.join("."))
+    });
+    for prefix_len in 0..=path.len() {
+        let prefix = &path[..prefix_len];
+        if prefix_len == 0
+            && matches!(
+                path.first().map(String::as_str),
+                Some("crate" | "self" | "super")
+            )
+        {
+            continue;
+        }
+        let mut modules = Vec::new();
+        if prefix.is_empty()
+            || !matches!(
+                prefix.first().map(String::as_str),
+                Some("crate" | "self" | "super")
+            )
+        {
+            for depth in (0..=importer_module.components.len()).rev() {
+                let mut components = importer_module.components[..depth].to_vec();
+                components.extend(prefix.iter().cloned());
+                modules.push((
+                    summary_id,
+                    ModuleKey {
+                        crate_root: importer_module.crate_root.clone(),
+                        components,
+                    },
+                ));
+            }
+        } else if let Some(package) =
+            resolve_rust_module_segments_with_crate(&owner_package, &crate_root, prefix)
+        {
+            modules.push((
+                summary_id,
+                ModuleKey::with_crate_root(&crate_root, &package),
+            ));
+        }
+        if !prefix.is_empty()
+            && let Some((external_summary, root)) = &external_root
+        {
+            modules.push((
+                *external_summary,
+                ModuleKey {
+                    crate_root: root.clone(),
+                    components: prefix[1..].to_vec(),
+                },
+            ));
+        }
+        modules.sort_by_key(|(summary, module)| (*summary, module.package()));
+        modules.dedup();
+
+        let lookup_name = path
+            .get(prefix_len)
+            .cloned()
+            .or_else(|| target.is_glob.then(|| "*".to_owned()));
+        let additional_lookup_names = if prefix_len == 1
+            && (external_root.is_some()
+                || matches!(
+                    path.first().map(String::as_str),
+                    Some("crate" | "self" | "super")
+                )) {
+            let mut names = additional_lookup_names.to_vec();
+            names.sort_unstable();
+            names.dedup();
+            names
+        } else {
+            Vec::new()
+        };
+        for (summary_id, module) in modules {
+            let record_missing = !prefix.is_empty();
+            let key = (
+                owner_file.clone(),
+                import_ordinal,
+                module.clone(),
+                lookup_name.clone(),
+                record_missing,
+                additional_lookup_names.clone(),
+            );
+            if seen.insert(key) {
+                candidates.push(RustSummaryImportModuleCandidate {
+                    owner_file: owner_file.clone(),
+                    summary_id,
+                    import_ordinal,
+                    module,
+                    lookup_name: lookup_name.clone(),
+                    additional_lookup_names: additional_lookup_names.clone(),
+                    record_missing,
+                });
+            }
+        }
+    }
+}
+
+fn rust_summary_module_path(module: &ModuleKey) -> String {
+    if module.components.is_empty() {
+        "crate".to_owned()
+    } else {
+        format!("crate::{}", module.components.join("::"))
+    }
 }
 
 fn rust_symbol_namespace_key(namespace: RustSymbolNamespace) -> &'static str {
@@ -843,7 +1441,7 @@ fn hash_usize(hasher: &mut CanonicalHasher, name: &str, value: usize) {
 }
 
 fn direct_imported_files(
-    rust: &RustAnalyzer,
+    package_files: &brokk_bifrost_rust::graph_support::RustPackageFileIndex,
     file: &ProjectFile,
     imports: &[ImportInfo],
 ) -> HashSet<ProjectFile> {
@@ -852,7 +1450,7 @@ fn direct_imported_files(
         .filter_map(|import| import.path.as_ref())
         .flat_map(|path| {
             brokk_bifrost_rust::graph_support::resolve_direct_import_files(
-                rust,
+                package_files,
                 file,
                 &path.segments,
             )
@@ -861,7 +1459,7 @@ fn direct_imported_files(
 }
 
 fn direct_import_file_edges(
-    rust: &RustAnalyzer,
+    package_files: &brokk_bifrost_rust::graph_support::RustPackageFileIndex,
     file: &ProjectFile,
     imports: &[ImportInfo],
 ) -> HashMap<ProjectFile, Vec<serde_json::Value>> {
@@ -871,7 +1469,7 @@ fn direct_import_file_edges(
             continue;
         };
         for target in brokk_bifrost_rust::graph_support::resolve_direct_import_files(
-            rust,
+            package_files,
             file,
             &path.segments,
         ) {
@@ -884,8 +1482,212 @@ fn direct_import_file_edges(
     edges
 }
 
+fn persisted_binding_surface_rows_for_files(
+    analyzer: &RustAnalyzer,
+    files: &[ProjectFile],
+    keep_going: &impl Fn() -> bool,
+) -> Option<Vec<RustSummaryBindingSurfaceRow>> {
+    if files.is_empty() {
+        return Some(Vec::new());
+    }
+    if !keep_going() {
+        return None;
+    }
+    let store = analyzer.inner.analyzer_store();
+    let snapshots = analyzer.inner.selected_workspace_snapshots();
+    let rel_paths = files
+        .iter()
+        .map(crate::path_utils::rel_path_string)
+        .collect::<Vec<_>>();
+    let completeness = match store.rust_summary_binding_completeness_rows(&snapshots, &rel_paths) {
+        Ok(rows) => rows,
+        Err(error) => {
+            analyzer.inner.record_store_error(
+                error.context("reading Rust import graph binding completeness for member routes"),
+            );
+            return None;
+        }
+    };
+    let mut complete_paths = HashSet::default();
+    for row in completeness {
+        assert_eq!(
+            row.complete,
+            row.gap_kind == "complete" && row.gap_subject.is_empty(),
+            "Rust summary completeness row has a canonical typed gap: {row:?}"
+        );
+        if !row.complete {
+            return None;
+        }
+        assert!(
+            complete_paths.insert(row.rel_path),
+            "one complete Rust summary completeness row exists per member"
+        );
+    }
+    if !keep_going() || complete_paths.len() != rel_paths.len() {
+        return None;
+    }
+    let rows = match store.rust_summary_binding_surface_rows(&snapshots, &rel_paths) {
+        Ok(rows) => rows,
+        Err(error) => {
+            analyzer
+                .inner
+                .record_store_error(error.context("reading Rust import graph member routes"));
+            return None;
+        }
+    };
+    keep_going().then_some(rows)
+}
+
+fn rust_import_edge_facts_from_summary(
+    package_files: &brokk_bifrost_rust::graph_support::RustPackageFileIndex,
+    file: &ProjectFile,
+    bindings: &[RustImportBinding],
+    surface_rows: &[RustSummaryBindingSurfaceRow],
+    selected_ordinals: Option<&[u32]>,
+    keep_going: &impl Fn() -> bool,
+) -> Option<Vec<ImportedFileEdgeFacts>> {
+    let mut ordinals = selected_ordinals.map_or_else(
+        || {
+            (0..bindings.len())
+                .map(|ordinal| {
+                    u32::try_from(ordinal)
+                        .expect("one Rust source cannot contain more than u32 imports")
+                })
+                .collect::<Vec<_>>()
+        },
+        <[u32]>::to_vec,
+    );
+    ordinals.sort_unstable();
+    ordinals.dedup();
+    let mut by_ordinal = std::collections::BTreeMap::new();
+    for ordinal in &ordinals {
+        assert!(
+            usize::try_from(*ordinal).is_ok_and(|index| index < bindings.len()),
+            "selected Rust import ordinal exists in the canonical source facts"
+        );
+        by_ordinal.insert(*ordinal, HashMap::default());
+    }
+    for ordinal in &ordinals {
+        if !keep_going() {
+            return None;
+        }
+        let binding = &bindings
+            [usize::try_from(*ordinal).expect("Rust import ordinal fits the source binding index")];
+        let edges = by_ordinal
+            .get_mut(ordinal)
+            .expect("selected Rust import ordinal was initialized");
+        for target in brokk_bifrost_rust::graph_support::resolve_direct_import_files(
+            package_files,
+            file,
+            &binding.path,
+        ) {
+            edges
+                .entry(target)
+                .or_insert_with(Vec::new)
+                .push(serde_json::json!({
+                    "kind": "rust_import_fact",
+                    "import_ordinal": ordinal,
+                    "path": binding.path,
+                    "owner_module": binding.owner_module
+                }));
+        }
+    }
+
+    let route_facts = rust_import_origin_route_facts_from_summary(
+        file,
+        bindings,
+        surface_rows,
+        Some(&ordinals),
+        keep_going,
+    )?;
+    for (ordinal, route_edges) in route_facts {
+        let edges = by_ordinal
+            .get_mut(&ordinal)
+            .expect("persisted route belongs to a selected source import");
+        for (target, provenance) in route_edges {
+            edges
+                .entry(target)
+                .or_insert_with(Vec::new)
+                .extend(provenance);
+        }
+    }
+    Some(
+        by_ordinal
+            .into_iter()
+            .map(|(import_ordinal, edges)| ImportedFileEdgeFacts {
+                import_ordinal,
+                edges,
+            })
+            .collect(),
+    )
+}
+
+fn rust_import_origin_route_facts_from_summary(
+    file: &ProjectFile,
+    bindings: &[RustImportBinding],
+    surface_rows: &[RustSummaryBindingSurfaceRow],
+    selected_ordinals: Option<&[u32]>,
+    keep_going: &impl Fn() -> bool,
+) -> Option<std::collections::BTreeMap<u32, HashMap<ProjectFile, Vec<serde_json::Value>>>> {
+    let selected =
+        selected_ordinals.map(|ordinals| ordinals.iter().copied().collect::<HashSet<_>>());
+    let rel_path = crate::path_utils::rel_path_string(file);
+    let mut route_groups: std::collections::BTreeMap<
+        (u32, i64),
+        Vec<&RustSummaryBindingSurfaceRow>,
+    > = std::collections::BTreeMap::new();
+    for row in surface_rows.iter().filter(|row| row.rel_path == rel_path) {
+        let Some(import_ordinal) = row.source_import_ordinal else {
+            assert!(
+                row.source_import_id.is_none(),
+                "Rust summary source import id and ordinal are both present or absent"
+            );
+            continue;
+        };
+        assert!(
+            row.source_import_id.is_some(),
+            "Rust summary source import id and ordinal are both present or absent"
+        );
+        let import_ordinal = u32::try_from(import_ordinal)
+            .expect("Rust source import ordinal is nonnegative and fits u32");
+        if selected
+            .as_ref()
+            .is_none_or(|selected| selected.contains(&import_ordinal))
+        {
+            route_groups
+                .entry((import_ordinal, row.route_ordinal))
+                .or_default()
+                .push(row);
+        }
+    }
+    let mut route_facts = std::collections::BTreeMap::new();
+    for ((import_ordinal, _), rows) in route_groups {
+        if !keep_going() {
+            return None;
+        }
+        let binding = bindings
+            .get(usize::try_from(import_ordinal).expect("Rust import ordinal fits usize"))?;
+        let route_files = rows
+            .iter()
+            .filter(|row| row.route_file != rel_path)
+            .map(|row| ProjectFile::new(file.root().to_path_buf(), row.route_file.clone()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let route = rust_origin_route_provenance_from_summary(file, binding, &rows, route_files)?;
+        let origin_file = ProjectFile::new(file.root().to_path_buf(), rows[0].origin_file.clone());
+        route_facts
+            .entry(import_ordinal)
+            .or_insert_with(HashMap::default)
+            .entry(origin_file)
+            .or_insert_with(Vec::new)
+            .push(route);
+    }
+    Some(route_facts)
+}
+
+#[cfg(test)]
 fn rust_import_edge_facts_for_file(
-    rust: &RustAnalyzer,
     walks: &RustUsageWalks<'_>,
     file: &ProjectFile,
     selected_ordinals: Option<&[u32]>,
@@ -924,7 +1726,7 @@ fn rust_import_edge_facts_for_file(
             .get_mut(ordinal)
             .expect("selected Rust import ordinal was initialized");
         for target in brokk_bifrost_rust::graph_support::resolve_direct_import_files(
-            rust,
+            walks.package_files(),
             file,
             &binding.path,
         ) {
@@ -1017,27 +1819,453 @@ fn rust_origin_route_provenance(
     })
 }
 
-fn extend_origin_files(
-    walks: &RustUsageWalks<'_>,
-    file: &ProjectFile,
-    imported_files: &mut HashSet<ProjectFile>,
-) -> Result<(), brokk_bifrost_rust::graph_support::RustCargoRouteError> {
-    let routes = walks.origin_routes_of(file)?;
-    imported_files.extend(
-        routes
-            .values()
-            .flatten()
-            .map(|route| route.origin.file.clone()),
-    );
-    Ok(())
+fn rust_origin_route_provenance_from_summary(
+    root_file: &ProjectFile,
+    binding: &RustImportBinding,
+    rows: &[&RustSummaryBindingSurfaceRow],
+    route_files: Vec<ProjectFile>,
+) -> Option<serde_json::Value> {
+    let row = *rows.first()?;
+    let import_ordinal = u32::try_from(row.source_import_ordinal?)
+        .expect("Rust source import ordinal is nonnegative and fits u32");
+    let path = match &binding.local_name {
+        RustImportBindingName::Glob => vec![row.origin_name.clone()],
+        RustImportBindingName::Unnamed => return None,
+        RustImportBindingName::Named(local_name) if row.namespace == "module" => {
+            vec![local_name.to_string(), row.origin_name.clone()]
+        }
+        RustImportBindingName::Named(local_name) => vec![local_name.to_string()],
+    };
+    let namespace = match row.namespace.as_str() {
+        "type" => RustSymbolNamespace::Type,
+        "value" => RustSymbolNamespace::Value,
+        "macro" => RustSymbolNamespace::Macro,
+        "module" => RustSymbolNamespace::Module,
+        other => panic!("unknown Rust summary namespace {other:?}"),
+    };
+    let root_components: Vec<String> = serde_json::from_str(&row.root_components).ok()?;
+    let crate_root = root_components.join(".");
+    let module_package =
+        resolve_rust_module_path_with_crate(&crate_root, &crate_root, &row.module_path)?;
+    let module = ModuleKey::with_crate_root(&crate_root, &module_package);
+    let origin_root_components: Vec<String> =
+        serde_json::from_str(&row.origin_root_components).ok()?;
+    let origin_crate_root = origin_root_components.join(".");
+    let origin_package = resolve_rust_module_path_with_crate(
+        &origin_crate_root,
+        &origin_crate_root,
+        &row.origin_module_path,
+    )?;
+    let origin_module = ModuleKey::with_crate_root(&origin_crate_root, &origin_package);
+    let origin = RustSymbolIdentity {
+        file: ProjectFile::new(root_file.root().to_path_buf(), row.origin_file.clone()),
+        module: origin_module,
+        name: row.origin_name.clone(),
+        namespace,
+    };
+    let domain = match row.visibility_kind.as_str() {
+        "public" => Domain::Public,
+        "crate" => Domain::Crate(row.visibility_crate_root.clone()?),
+        "module" => Domain::Module(module),
+        other => panic!("unknown Rust summary visibility kind {other:?}"),
+    };
+    let provenance = match (
+        row.root_crate_name.as_deref(),
+        row.root_target_kind.as_deref(),
+        row.edge_crate_name.as_deref(),
+        row.edge_target_kind.as_deref(),
+    ) {
+        (Some(root_crate), Some(root_kind), Some(edge_crate), Some(edge_kind))
+            if root_crate == edge_crate && root_kind == edge_kind =>
+        {
+            RustRouteProvenance::Local
+        }
+        (Some(root_crate), Some(_), Some(edge_crate), Some("lib")) if root_crate == edge_crate => {
+            RustRouteProvenance::CurrentLibrary
+        }
+        _ => RustRouteProvenance::Dependency,
+    };
+    let route = RustOriginRoute {
+        import_ordinal,
+        importer_module: binding.importer_module.clone(),
+        extent: binding.extent.clone(),
+        path,
+        is_glob_import: binding.local_name.is_glob(),
+        namespace,
+        origin,
+        domain,
+        route_files,
+        provenance,
+        cfg_condition: binding.cfg_condition.clone(),
+    };
+    Some(rust_origin_route_provenance(&route))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{CodeUnitIndex, IAnalyzer, Language, ProjectFile};
+    use crate::analyzer::{CodeUnitIndex, IAnalyzer, Language, ProjectFile, resolve_analyzer};
     use crate::inline_project::InlineTestProject;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn reverse_importers_from_live_summaries_match_import_resolution() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"reverse_summary\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .file("src/lib.rs", "pub mod api; mod named; mod glob;\n")
+            .file("src/api.rs", "pub struct Api; pub fn call() {}\n")
+            .file(
+                "src/named.rs",
+                "use crate::api::Api; pub fn named(_: Api) {}\n",
+            )
+            .file("src/glob.rs", "use crate::api::*; pub fn glob(_: Api) {}\n")
+            .build();
+        let workspace = fixture.workspace_analyzer(crate::AnalyzerConfig::default());
+        let analyzer = resolve_analyzer::<RustAnalyzer>(workspace.analyzer())
+            .expect("workspace contains the Rust analyzer");
+        let target = fixture.file("src/api.rs");
+        let files = analyzer.inner.all_files();
+        let expected = files
+            .iter()
+            .filter(|candidate| {
+                analyzer
+                    .imported_code_units_of(candidate)
+                    .iter()
+                    .any(|definition| definition.source() == &target)
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        let actual = analyzer.referencing_files_of(&target);
+        assert_eq!(
+            actual, expected,
+            "summary reverse-importer symmetric difference"
+        );
+        assert_eq!(
+            actual,
+            [fixture.file("src/named.rs")]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn persisted_import_graph_binding_surfaces_match_rust_usage_walks() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"binding_surface_diff\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "pub mod api; pub mod facade; mod consumer;\n")
+            .file("src/api.rs", "pub struct Item; pub fn call() {}\n")
+            .file(
+                "src/facade.rs",
+                "pub use crate::api::Item as Renamed; pub use crate::api::*; pub mod child;\n",
+            )
+            .file(
+                "src/facade/child.rs",
+                "use super::Renamed; pub fn child(_: Renamed) {}\n",
+            )
+            .file(
+                "src/consumer.rs",
+                "use crate::facade::Renamed as Consumed; pub fn consumer(_: Consumed) {}\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(crate::AnalyzerConfig::default());
+        let analyzer = resolve_analyzer::<RustAnalyzer>(workspace.analyzer())
+            .expect("workspace contains the Rust analyzer");
+        let files = analyzer.inner.all_files();
+        let actual = analyzer
+            .import_graph_binding_surfaces_for_files(&files, None)
+            .expect("live summaries provide complete binding surfaces");
+
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let walks = RustUsageWalks::new(analyzer, scope.token())
+            .expect("fixture Rust routes are available");
+        for file in &files {
+            let mut expected = Vec::new();
+            for module in walks
+                .binding_modules_of(file)
+                .expect("legacy walk enumerates the file's binding modules")
+            {
+                for binding in walks
+                    .bindings_at(file, &module)
+                    .expect("legacy walk resolves the module's binding closure")
+                    .iter()
+                {
+                    let (visibility_kind, visibility_scope) = match &binding.domain {
+                        Domain::Public => ("public", String::new()),
+                        Domain::Crate(crate_root) => ("crate", crate_root.clone()),
+                        Domain::Module(module) => ("module", rust_module_surface_key(module)),
+                    };
+                    let mut route_files = binding.route_files.clone();
+                    route_files.sort();
+                    expected.push(ImportGraphBindingSurface {
+                        module_path: rust_module_surface_key(&module),
+                        name: binding.name.clone(),
+                        namespace: rust_symbol_namespace_key(binding.namespace).to_owned(),
+                        visibility_kind: visibility_kind.to_owned(),
+                        visibility_scope,
+                        origin_file: binding.origin.file.clone(),
+                        origin_module_path: rust_module_surface_key(&binding.origin.module),
+                        origin_name: binding.origin.name.clone(),
+                        route_files,
+                    });
+                }
+            }
+            let expected: HashSet<_> = expected.into_iter().collect();
+            let actual_for_file: HashSet<_> = actual
+                .get(file)
+                .expect("summary reader returns each requested file")
+                .iter()
+                .cloned()
+                .collect();
+            let walk_only = expected.difference(&actual_for_file).collect::<Vec<_>>();
+            let persisted_only = actual_for_file.difference(&expected).collect::<Vec<_>>();
+            assert!(
+                walk_only.is_empty() && persisted_only.is_empty(),
+                "persisted versus walk binding surfaces differ for {file:?}: walk-only={walk_only:#?}; persisted-only={persisted_only:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_import_resolution_dependencies_match_rust_usage_walks() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"import_dependencies_diff\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "pub mod origin; pub mod facade; mod client;\n")
+            .file("src/origin.rs", "pub struct Item;\n")
+            .file("src/facade.rs", "pub use crate::origin::Item as Renamed;\n")
+            .file(
+                "src/client.rs",
+                "use crate::facade::Renamed as Local; fn use_item(_: Local) {}\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(crate::AnalyzerConfig::default());
+        let analyzer = resolve_analyzer::<RustAnalyzer>(workspace.analyzer())
+            .expect("workspace contains the Rust analyzer");
+        let files = analyzer.inner.all_files();
+        let actual = analyzer
+            .import_resolution_dependencies_for_ordinals(
+                &files,
+                None,
+                &crate::hash::HashMap::default(),
+                None,
+            )
+            .expect("live Rust summaries provide import dependencies");
+
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let walks = RustUsageWalks::new(analyzer, scope.token())
+            .expect("fixture Rust routes are available");
+        let mut actual_edge_facts = HashMap::default();
+        analyzer
+            .for_each_import_edge_facts_from_infos(
+                &files,
+                None,
+                &HashMap::default(),
+                None,
+                &mut |file, facts| {
+                    actual_edge_facts.insert(file.clone(), facts);
+                    true
+                },
+            )
+            .expect("live summary rows provide import edge facts");
+        let normalize_edge_facts = |facts: &[ImportedFileEdgeFacts]| {
+            let mut normalized = std::collections::BTreeMap::new();
+            for fact in facts {
+                for (target, values) in &fact.edges {
+                    let key = (
+                        fact.import_ordinal,
+                        crate::path_utils::rel_path_string(target),
+                    );
+                    let mut values = values
+                        .iter()
+                        .map(|value| serde_json::to_string(value).expect("JSON value serializes"))
+                        .collect::<Vec<_>>();
+                    values.sort_unstable();
+                    normalized.insert(key, values);
+                }
+            }
+            normalized
+        };
+        let package_files = analyzer
+            .package_file_index_while(scope.token(), &|| true)
+            .expect("fixture package members are published");
+        let mut actual_bulk_edges = HashMap::default();
+        analyzer
+            .for_each_imported_file_edges_from_infos(&files, None, None, &mut |file, edges| {
+                actual_bulk_edges.insert(file.clone(), edges);
+                true
+            })
+            .expect("live summary rows provide imported-file edge facts");
+        let normalize_file_edges = |edges: &HashMap<ProjectFile, Vec<serde_json::Value>>| {
+            edges
+                .iter()
+                .map(|(file, values)| {
+                    let mut values = values
+                        .iter()
+                        .map(|value| serde_json::to_string(value).expect("JSON value serializes"))
+                        .collect::<Vec<_>>();
+                    values.sort_unstable();
+                    (crate::path_utils::rel_path_string(file), values)
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        for file in &files {
+            let expected = walks
+                .import_resolution_dependencies_for_ordinals(file, None)
+                .expect("legacy walk enumerates import dependencies");
+            let actual = actual
+                .get(file)
+                .expect("summary reader returns every requested file");
+            let lookups = |dependencies: &crate::analyzer::ImportResolutionDependencies| {
+                dependencies
+                    .lookups
+                    .iter()
+                    .map(|lookup| {
+                        (
+                            lookup.import_ordinal,
+                            crate::path_utils::rel_path_string(&lookup.consulted_file),
+                            lookup.name.clone(),
+                        )
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let expected_lookups = lookups(&expected);
+            let actual_lookups = lookups(actual);
+            let walk_only = expected_lookups
+                .difference(&actual_lookups)
+                .collect::<Vec<_>>();
+            let summary_only = actual_lookups
+                .difference(&expected_lookups)
+                .collect::<Vec<_>>();
+            let expected_missing = expected
+                .missing_module_path_keys
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            let actual_missing = actual
+                .missing_module_path_keys
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            let walk_missing = expected_missing
+                .difference(&actual_missing)
+                .collect::<Vec<_>>();
+            let summary_missing = actual_missing
+                .difference(&expected_missing)
+                .collect::<Vec<_>>();
+            assert!(
+                walk_only.is_empty()
+                    && summary_only.is_empty()
+                    && walk_missing.is_empty()
+                    && summary_missing.is_empty(),
+                "persisted versus walk import dependencies differ for {file:?}: \
+                 walk-only lookups={walk_only:#?}; summary-only lookups={summary_only:#?}; \
+                 walk-only missing modules={walk_missing:#?}; \
+                 summary-only missing modules={summary_missing:#?}"
+            );
+            let walk_edges = rust_import_edge_facts_for_file(&walks, file, None, &|| true)
+                .expect("legacy walk enumerates import edge facts");
+            let summary_edges = actual_edge_facts
+                .get(file)
+                .expect("summary reader returns each requested file");
+            let walk_edges = normalize_edge_facts(&walk_edges);
+            let summary_edges = normalize_edge_facts(summary_edges);
+            let walk_only = walk_edges
+                .iter()
+                .filter(|(key, value)| summary_edges.get(key) != Some(value))
+                .collect::<Vec<_>>();
+            let summary_only = summary_edges
+                .iter()
+                .filter(|(key, value)| walk_edges.get(key) != Some(value))
+                .collect::<Vec<_>>();
+            assert!(
+                walk_only.is_empty() && summary_only.is_empty(),
+                "persisted versus walk import edge facts differ for {file:?}: \
+                 walk-only={walk_only:#?}; summary-only={summary_only:#?}"
+            );
+
+            let imports = analyzer.inner.import_info_of(scope.token(), file);
+            let expected_imported = direct_imported_files(&package_files, file, &imports);
+            let mut expected_imported = expected_imported;
+            for route in walks
+                .origin_routes_of(file)
+                .expect("legacy walk enumerates origin routes")
+                .values()
+                .flatten()
+            {
+                expected_imported.insert(route.origin.file.clone());
+            }
+            let actual_imported = analyzer
+                .imported_files_from_infos(file, &imports)
+                .expect("live summary rows provide imported files");
+            let expected_imported = expected_imported
+                .iter()
+                .map(crate::path_utils::rel_path_string)
+                .collect::<std::collections::BTreeSet<_>>();
+            let actual_imported = actual_imported
+                .iter()
+                .map(crate::path_utils::rel_path_string)
+                .collect::<std::collections::BTreeSet<_>>();
+            let walk_only = expected_imported
+                .difference(&actual_imported)
+                .collect::<Vec<_>>();
+            let summary_only = actual_imported
+                .difference(&expected_imported)
+                .collect::<Vec<_>>();
+            assert!(
+                walk_only.is_empty() && summary_only.is_empty(),
+                "persisted versus walk imported files differ for {file:?}: \
+                 walk-only={walk_only:#?}; summary-only={summary_only:#?}"
+            );
+
+            let expected_provenance = rust_import_edge_facts_for_file(&walks, file, None, &|| true)
+                .expect("legacy walk enumerates imported-file provenance")
+                .into_iter()
+                .flat_map(|fact| fact.edges)
+                .fold(HashMap::default(), |mut all, (target, values)| {
+                    all.entry(target).or_insert_with(Vec::new).extend(values);
+                    all
+                });
+            let actual_provenance = analyzer
+                .imported_file_edge_provenance_from_infos(file, &imports)
+                .expect("live summary rows provide imported-file provenance");
+            let expected_provenance = normalize_file_edges(&expected_provenance);
+            let actual_provenance = normalize_file_edges(&actual_provenance);
+            assert_eq!(
+                actual_provenance, expected_provenance,
+                "persisted versus walk imported-file provenance differs for {file:?}"
+            );
+
+            let mut expected_bulk = direct_import_file_edges(&package_files, file, &imports);
+            for route in walks
+                .origin_routes_of(file)
+                .expect("legacy walk enumerates bulk origin routes")
+                .values()
+                .flatten()
+            {
+                expected_bulk
+                    .entry(route.origin.file.clone())
+                    .or_default()
+                    .push(rust_origin_route_provenance(route));
+            }
+            let actual_bulk = actual_bulk_edges
+                .get(file)
+                .expect("bulk summary reader returns every requested file");
+            assert_eq!(
+                normalize_file_edges(actual_bulk),
+                normalize_file_edges(&expected_bulk),
+                "persisted versus walk bulk imported-file edges differ for {file:?}"
+            );
+        }
+    }
 
     #[test]
     fn rust_import_graph_input_digests_ignore_bodies_but_track_bindings_and_imports() {

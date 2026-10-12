@@ -43,7 +43,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 125;
 /// distinguishes nominal and receiver projection outputs on qualified routes.
 /// Once #2771 lands, this floor must not advance for compatible migrations.
 const FIRST_NATIVE_CACHE_VERSION: i64 = 125;
-const CURRENT_MIGRATION_VERSION: i64 = 172;
+const CURRENT_MIGRATION_VERSION: i64 = 174;
 const _: () = assert!(CURRENT_MIGRATION_VERSION >= FIRST_NATIVE_CACHE_VERSION);
 pub const OPTIONAL_FACT_KIND_CPP_CLASS_TEMPLATE: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
@@ -252,6 +252,14 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 172,
         sql: include_str!("../migrations/cache/0172-root-import-activation-ordinal.sql"),
     },
+    CacheMigration {
+        version: 173,
+        sql: include_str!("../migrations/cache/0173-rust-unit-summary-rows.sql"),
+    },
+    CacheMigration {
+        version: 174,
+        sql: include_str!("../migrations/cache/0174-jvm-external-owner-inventory.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -276,8 +284,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    188, 224, 87, 171, 110, 141, 159, 204, 205, 153, 100, 88, 220, 42, 23, 41, 250, 158, 105, 243,
-    253, 58, 168, 159, 146, 61, 102, 143, 204, 71, 62, 23,
+    173, 218, 25, 40, 168, 166, 180, 53, 134, 213, 13, 179, 208, 15, 10, 130, 46, 129, 58, 193,
+    219, 85, 104, 37, 4, 189, 136, 50, 168, 33, 221, 103,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -3926,6 +3934,40 @@ mod tests {
             schema_object_definitions_sha256(&conn).unwrap(),
             CURRENT_SCHEMA_OBJECTS_SHA256
         );
+    }
+
+    #[test]
+    fn jvm_external_owner_inventory_migration_applies_to_fresh_and_173_stores() {
+        let fresh = open_in_memory_cache();
+        assert_eq!(cache_migration_version(&fresh).unwrap(), 174);
+        for table in [
+            "jvm_external_owners",
+            "jvm_external_owner_members",
+            "jvm_external_owner_supertypes",
+        ] {
+            assert!(table_exists(&fresh, table).unwrap(), "missing {table}");
+        }
+
+        let mut upgraded = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 173)
+        {
+            upgraded.execute_batch(migration.sql).unwrap();
+        }
+        upgraded.pragma_update(None, "user_version", 173).unwrap();
+        assert!(!table_exists(&upgraded, "jvm_external_owners").unwrap());
+
+        migrate(&mut upgraded).unwrap();
+
+        assert_eq!(cache_migration_version(&upgraded).unwrap(), 174);
+        for table in [
+            "jvm_external_owners",
+            "jvm_external_owner_members",
+            "jvm_external_owner_supertypes",
+        ] {
+            assert!(table_exists(&upgraded, table).unwrap(), "missing {table}");
+        }
     }
 
     #[test]

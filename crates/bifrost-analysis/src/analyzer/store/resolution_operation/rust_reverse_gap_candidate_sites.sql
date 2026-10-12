@@ -1,31 +1,26 @@
--- The part of a target's gap query that does not depend on the accounted or
--- qualified references: its host blobs, the names it can be spelled under, and
--- the candidate reference sites those names nominate. The gap query is asked
--- twice per target, first to nominate sites for confirmation and then to report
--- the gaps left once confirmation has accounted for some of them, so these
--- stages run once and the sites are kept in a temp table keyed by ?13.
---
+-- Materialize each target's host blobs, summary-backed name closure, and candidate sites
+-- once. The result feeds the two reference-inventory gap checks for this target.
 -- Parameters: ?1 definition mount, ?2 target names (JSON), ?3 admitted (0/1),
--- ?4 admitted fragments (JSON), ?5 member-reference site kind, ?6 target owner is
--- a type scope, ?7 callable-reference site kind, ?8-?12 the macro and expression
--- gap origins that nominate a nameless site, ?13 the target key.
+-- ?4 admitted fragments (JSON), ?5 member-reference site kind, ?6 target owner
+-- is a type scope, ?7 callable-reference site kind, ?8-?12 macro/expression gap
+-- origins, ?13 target key.
 INSERT INTO temp.selected_rust_reverse_gap_sites(target_key,host,blob_id,site)
-WITH RECURSIVE target_scope(topology_id,crate_key) AS (
-  SELECT placement.topology_id,owner.crate_key
+WITH RECURSIVE target_scope(topology_id,crate_key,summary_id) AS (
+  SELECT placement.topology_id,placement.unit_key,placement.summary_id
   FROM temp.selected_rust_module_placements AS placement
-  JOIN selected_rust_crates AS owner ON owner.topology_id=placement.topology_id
   WHERE placement.mount_ordinal=?1
   UNION
-  SELECT importer.topology_id,importer.crate_key
+  SELECT importer.topology_id,importer.unit_key,importer.summary_id
   FROM target_scope AS target
-  JOIN rust_crate_dependencies AS dependency
-    ON dependency.dependency_crate_key=target.crate_key
+  JOIN main.resolution_unit_summary_dependencies AS dependency
+    INDEXED BY resolution_unit_summary_dependencies_unit
+    ON dependency.dependency_unit_key=target.crate_key
    AND dependency.boundary='workspace'
-  JOIN selected_rust_crates AS importer
-    ON importer.topology_id=dependency.topology_id
+  JOIN selected_rust_unit_summaries AS importer
+    ON importer.summary_id=dependency.summary_id
 ),
-target_hosts(host,topology_id,blob_id) AS (
-  SELECT DISTINCT placement.mount_ordinal,placement.topology_id,placement.blob_id
+target_hosts(host,topology_id,blob_id,summary_id) AS (
+  SELECT DISTINCT placement.mount_ordinal,placement.topology_id,placement.blob_id,placement.summary_id
   FROM target_scope AS scope
   JOIN temp.selected_rust_module_placements AS placement
     ON placement.topology_id=scope.topology_id
@@ -33,7 +28,7 @@ target_hosts(host,topology_id,blob_id) AS (
     ON selected.mount_ordinal=placement.mount_ordinal
   WHERE ?3=0 OR placement.mount_ordinal IN (SELECT value FROM json_each(?4))
   UNION
-  SELECT DISTINCT mount.mount_ordinal,NULL,mount.blob_id
+  SELECT DISTINCT mount.mount_ordinal,NULL,mount.blob_id,NULL
   FROM json_each(?4) AS fragment
   JOIN temp.selected_resolution_scope_mounts AS selected
     ON selected.mount_ordinal=fragment.value
@@ -54,10 +49,10 @@ target_name_closure(host,name,namespace) AS (
   UNION
   SELECT names.host,imported.bound_name,names.namespace
   FROM target_name_closure AS names
-  JOIN target_hosts AS host ON host.host=names.host
-  JOIN source_imports AS source INDEXED BY idx_source_imports_identifier
+  CROSS JOIN target_hosts AS host ON host.host=names.host
+  CROSS JOIN source_imports AS source INDEXED BY idx_source_imports_identifier
     ON source.blob_id=host.blob_id AND source.identifier=names.name
-  JOIN rust_import_targets AS imported INDEXED BY idx_rust_import_targets_source_import
+  CROSS JOIN rust_import_targets AS imported INDEXED BY idx_rust_import_targets_source_import
     ON imported.blob_id=source.blob_id AND imported.source_import_id=source.import_id
   WHERE imported.bound_name IS NOT NULL
     AND imported.bound_name<>names.name
@@ -68,11 +63,13 @@ target_name_closure(host,name,namespace) AS (
     -- file-local `crate` scope can be mounted as `crate::child`.
     AND NOT EXISTS (
       SELECT 1 FROM temp.selected_rust_module_placements AS placement
-      JOIN rust_crate_imports AS bound
-        ON bound.topology_id=placement.topology_id
+      JOIN main.rust_resolution_unit_summary_import_routes AS bound
+        INDEXED BY rust_resolution_unit_summary_import_routes_site
+        ON bound.summary_id=placement.summary_id
+       AND bound.member_ordinal=placement.member_ordinal
        AND bound.module_path=placement.container_path
-       AND bound.blob_id=imported.blob_id
-       AND bound.import_ordinal=imported.ordinal
+       AND bound.import_id=imported.source_import_id
+       AND bound.route_ordinal=imported.ordinal
       WHERE placement.mount_ordinal=host.host
         AND placement.topology_id=host.topology_id
         AND placement.blob_id=host.blob_id
@@ -84,19 +81,21 @@ target_name_closure(host,name,namespace) AS (
   UNION
   SELECT names.host,imported.bound_name,names.namespace
   FROM target_name_closure AS names
-  JOIN target_hosts AS host ON host.host=names.host
-  JOIN rust_import_targets AS imported INDEXED BY idx_rust_import_targets_imported_name
+  CROSS JOIN target_hosts AS host ON host.host=names.host
+  CROSS JOIN rust_import_targets AS imported INDEXED BY idx_rust_import_targets_imported_name
     ON imported.blob_id=host.blob_id AND imported.imported_name=names.name
   WHERE imported.source_import_id IS NULL
     AND imported.bound_name IS NOT NULL
     AND imported.bound_name<>names.name
     AND NOT EXISTS (
       SELECT 1 FROM temp.selected_rust_module_placements AS placement
-      JOIN rust_crate_imports AS bound
-        ON bound.topology_id=placement.topology_id
+      JOIN main.rust_resolution_unit_summary_import_routes AS bound
+        INDEXED BY rust_resolution_unit_summary_import_routes_site
+        ON bound.summary_id=placement.summary_id
+       AND bound.member_ordinal=placement.member_ordinal
        AND bound.module_path=placement.container_path
-       AND bound.blob_id=imported.blob_id
-       AND bound.import_ordinal=imported.ordinal
+       AND bound.import_id=imported.source_import_id
+       AND bound.route_ordinal=imported.ordinal
       WHERE placement.mount_ordinal=host.host
         AND placement.topology_id=host.topology_id
         AND placement.blob_id=host.blob_id
@@ -107,9 +106,6 @@ target_name_closure(host,name,namespace) AS (
     )
   UNION
   SELECT names.host,imported.bound_name,names.namespace
-  -- The unresolved source import is the selective side, so it drives the
-  -- join. Driving from the names visited every aliased import of the host's
-  -- blob for each name and ran the binding check below on each of them.
   FROM target_hosts AS host
   CROSS JOIN source_imports AS unresolved
     ON unresolved.blob_id=host.blob_id
@@ -123,11 +119,13 @@ target_name_closure(host,name,namespace) AS (
     AND imported.bound_name<>names.name
     AND NOT EXISTS (
       SELECT 1 FROM temp.selected_rust_module_placements AS placement
-      JOIN rust_crate_imports AS bound
-        ON bound.topology_id=placement.topology_id
+      JOIN main.rust_resolution_unit_summary_import_routes AS bound
+        INDEXED BY rust_resolution_unit_summary_import_routes_site
+        ON bound.summary_id=placement.summary_id
+       AND bound.member_ordinal=placement.member_ordinal
        AND bound.module_path=placement.container_path
-       AND bound.blob_id=imported.blob_id
-       AND bound.import_ordinal=imported.ordinal
+       AND bound.import_id=imported.source_import_id
+       AND bound.route_ordinal=imported.ordinal
       WHERE placement.mount_ordinal=host.host
         AND placement.topology_id=host.topology_id
         AND placement.blob_id=host.blob_id
@@ -148,11 +146,13 @@ target_name_closure(host,name,namespace) AS (
     AND imported.bound_name<>names.name
     AND NOT EXISTS (
       SELECT 1 FROM temp.selected_rust_module_placements AS placement
-      JOIN rust_crate_imports AS bound
-        ON bound.topology_id=placement.topology_id
+      JOIN main.rust_resolution_unit_summary_import_routes AS bound
+        INDEXED BY rust_resolution_unit_summary_import_routes_site
+        ON bound.summary_id=placement.summary_id
+       AND bound.member_ordinal=placement.member_ordinal
        AND bound.module_path=placement.container_path
-       AND bound.blob_id=imported.blob_id
-       AND bound.import_ordinal=imported.ordinal
+       AND bound.import_id=imported.source_import_id
+       AND bound.route_ordinal=imported.ordinal
       WHERE placement.mount_ordinal=host.host
         AND placement.topology_id=host.topology_id
         AND placement.blob_id=host.blob_id
@@ -162,33 +162,35 @@ target_name_closure(host,name,namespace) AS (
           OR (names.namespace='constructor' AND bound.namespace IN ('type','value')))
     )
   UNION
+  -- Keep the selected name and host ahead of shared fact rows so alias
+  -- discovery seeks both the source name index and the selected blob.
   SELECT names.host,alias_unit.identifier,'type'
   FROM target_name_closure AS names
-  JOIN resolution_identities AS identity INDEXED BY resolution_identities_spelling
+  CROSS JOIN target_hosts AS host ON host.host=names.host
+  CROSS JOIN resolution_identities AS identity INDEXED BY resolution_identities_spelling
     ON identity.spelling=names.name
-  JOIN resolution_reference_lookup_identities AS lookup
+  CROSS JOIN resolution_reference_lookup_identities AS lookup
     INDEXED BY resolution_reference_lookup_identities_identity
-    ON lookup.identity_id=identity.id
-  JOIN resolution_binding_projections AS projection
+    ON lookup.identity_id=identity.id AND lookup.blob_id=host.blob_id
+  CROSS JOIN resolution_binding_projections AS projection
     INDEXED BY resolution_binding_projections_output
     ON projection.blob_id=lookup.blob_id
    AND projection.reference=lookup.semantic_key
-  JOIN resolution_underlying_types AS underlying
+  CROSS JOIN resolution_underlying_types AS underlying
     INDEXED BY resolution_underlying_types_slot
     ON underlying.blob_id=projection.blob_id
    AND underlying.slot=projection.output_slot
-  JOIN target_hosts AS host ON host.host=names.host AND host.blob_id=underlying.blob_id
-  JOIN resolution_semantic_sites AS alias_site
+  CROSS JOIN resolution_semantic_sites AS alias_site
     ON alias_site.blob_id=underlying.blob_id
    AND alias_site.semantic_role='definition'
    AND alias_site.semantic_key=underlying.definition
-  JOIN source_native_declaration_bridges AS bridge
+  CROSS JOIN source_native_declaration_bridges AS bridge
     ON bridge.blob_id=alias_site.blob_id
    AND bridge.source_site=alias_site.source_site
-  JOIN source_declaration_units AS alias_declaration
+  CROSS JOIN source_declaration_units AS alias_declaration
     ON alias_declaration.blob_id=bridge.blob_id
    AND alias_declaration.declaration_id=bridge.declaration_id
-  JOIN code_units AS alias_unit
+  CROSS JOIN code_units AS alias_unit
     ON alias_unit.blob_id=alias_declaration.blob_id
    AND alias_unit.unit_key=alias_declaration.unit_key
    AND alias_unit.is_type_alias=1
@@ -196,27 +198,30 @@ target_name_closure(host,name,namespace) AS (
   UNION
   SELECT names.host,alias_unit.identifier,'type'
   FROM target_name_closure AS names
-  JOIN source_rust_type_segments AS terminal
+  CROSS JOIN target_hosts AS host ON host.host=names.host
+  CROSS JOIN source_rust_type_segments AS terminal
     INDEXED BY source_rust_type_segments_name
-    ON terminal.name=names.name
-  JOIN target_hosts AS host
-    ON host.host=names.host AND host.blob_id=terminal.blob_id
-  JOIN source_rust_alias_items AS alias
+    ON terminal.name=names.name AND terminal.blob_id=host.blob_id
+  CROSS JOIN source_rust_alias_items AS alias
     ON alias.blob_id=terminal.blob_id
    AND alias.target_type_occurrence_id=terminal.type_occurrence_id
-  JOIN source_rust_type_segments AS root
+  CROSS JOIN source_rust_type_segments AS root
     ON root.blob_id=terminal.blob_id
    AND root.type_occurrence_id=terminal.type_occurrence_id
    AND root.ordinal=0
-  JOIN rust_crate_dependencies AS dependency
-    ON dependency.topology_id=host.topology_id
-   AND dependency.extern_name=root.name
-  JOIN target_scope AS reachable
-    ON reachable.crate_key=dependency.dependency_crate_key
-  JOIN source_declaration_units AS alias_declaration
+  CROSS JOIN main.rust_resolution_unit_summary_dependency_names AS dependency_name
+    INDEXED BY rust_resolution_unit_summary_dependency_names_extern
+    ON dependency_name.summary_id=host.summary_id
+   AND dependency_name.extern_name=root.name
+  CROSS JOIN main.resolution_unit_summary_dependencies AS dependency
+    ON dependency.summary_id=dependency_name.summary_id
+   AND dependency.dependency_ordinal=dependency_name.dependency_ordinal
+  CROSS JOIN target_scope AS reachable
+    ON reachable.crate_key=dependency.dependency_unit_key
+  CROSS JOIN source_declaration_units AS alias_declaration
     ON alias_declaration.blob_id=alias.blob_id
    AND alias_declaration.declaration_id=alias.declaration_id
-  JOIN code_units AS alias_unit
+  CROSS JOIN code_units AS alias_unit
     ON alias_unit.blob_id=alias_declaration.blob_id
    AND alias_unit.unit_key=alias_declaration.unit_key
    AND alias_unit.is_type_alias=1
@@ -316,4 +321,5 @@ candidate_sites(host,blob_id,site) AS (
      OR (?6=0 AND source_site.site_kind IS NOT ?5)
      OR (?6=1 AND (source_site.site_kind IS NOT ?7 OR source_site.unqualified IS NOT 1))
 )
-SELECT ?13,host,blob_id,site FROM candidate_sites
+SELECT ?13,candidate.host,candidate.blob_id,candidate.site
+FROM candidate_sites AS candidate;

@@ -1277,6 +1277,7 @@ fn assert_native_overlay_publication<A: LanguageAdapter>(
     disk_source: &str,
     overlay_source: &str,
     reference_name: &str,
+    target_name: &str,
 ) {
     use crate::analyzer::resolution::{
         LoweredSemanticRole, ResolutionCompletion, SelectedSemanticLocator,
@@ -1386,6 +1387,23 @@ fn assert_native_overlay_publication<A: LanguageAdapter>(
         panic!("overlay reference must remain natively located");
     };
     assert_eq!(answer.binding().targets().len(), 1, "{answer:?}");
+    let target_sites = facts
+        .identifiers
+        .iter()
+        .filter(|identifier| {
+            identifier.role == ResolutionIdentifierRole::Declaration
+                && facts.names[identifier.name.index()].spelling == target_name
+        })
+        .map(|identifier| identifier.site.get())
+        .collect::<Vec<_>>();
+    assert!(
+        answer.binding().targets().iter().all(|target| {
+            target
+                .local_key()
+                .is_some_and(|key| target_sites.contains(&key))
+        }),
+        "expected {target_name} at {target_sites:?}, got {answer:?}"
+    );
     cancellation.cancel();
     assert!(matches!(
         analyzer
@@ -1399,12 +1417,20 @@ fn assert_native_overlay_publication<A: LanguageAdapter>(
 fn hydrated_java_overlays_publish_same_and_changed_native_content() {
     let original =
         "class Sample { static void original() {} static void caller() { original(); } }";
-    assert_native_overlay_publication(JavaAdapter, "Sample.java", original, original, "original");
+    assert_native_overlay_publication(
+        JavaAdapter,
+        "Sample.java",
+        original,
+        original,
+        "original",
+        "original",
+    );
     assert_native_overlay_publication(
         JavaAdapter,
         "Sample.java",
         original,
         "class Sample { static void changed() {} static void caller() { changed(); } }",
+        "changed",
         "changed",
     );
 }
@@ -1413,14 +1439,45 @@ fn hydrated_java_overlays_publish_same_and_changed_native_content() {
 fn hydrated_go_overlays_publish_same_and_changed_native_content() {
     use crate::analyzer::go::GoAdapter;
     let original = "package sample; func original() {}\nfunc caller() { original() }\n";
-    assert_native_overlay_publication(GoAdapter, "sample.go", original, original, "original");
+    assert_native_overlay_publication(
+        GoAdapter,
+        "sample.go",
+        original,
+        original,
+        "original",
+        "original",
+    );
     assert_native_overlay_publication(
         GoAdapter,
         "sample.go",
         original,
         "package sample; func changed() {}\nfunc caller() { changed() }\n",
         "changed",
+        "changed",
     );
+}
+
+#[test]
+fn hydrated_scala_overlays_keep_extractor_roles_after_eviction() {
+    use crate::analyzer::scala::ScalaAdapter;
+    let disk = "object Pick { def unapply(x: Any): Any = x }; object Use { def run(x: Any) = x match { case Pick(a) => a } }";
+    for (source, target) in [
+        (disk, "unapply"),
+        (
+            "object Pick { def unapplySeq(x: Any): Any = x }; object Use { def run(x: Any) = x match { case Pick(a, b) => a } }",
+            "unapplySeq",
+        ),
+        (
+            "object Pick { def unapply(x: Any): Any = x; def unapplySeq(x: Any): Any = x }; object Use { def run(x: Any) = x match { case Pick(a) => a } }",
+            "unapply",
+        ),
+        (
+            "object Pick { def unapply(x: Any): Any = x; def unapplySeq(x: Any): Any = x }; object Use { def run(x: Any) = x match { case Pick(rest*) => rest } }",
+            "unapplySeq",
+        ),
+    ] {
+        assert_native_overlay_publication(ScalaAdapter, "Use.scala", disk, source, "Pick", target);
+    }
 }
 
 #[test]

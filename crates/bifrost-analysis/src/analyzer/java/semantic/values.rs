@@ -1,5 +1,6 @@
 use super::syntax::*;
 use super::*;
+use crate::analyzer::java_integral_parameter::JavaScalarType;
 
 /// Whether a local or formal parameter declaration structurally declares an
 /// array value. Java permits dimensions either in the type (`int[] values`)
@@ -15,6 +16,44 @@ fn java_binding_declares_array(node: Node<'_>) -> bool {
                 .and_then(|declaration| declaration.child_by_field_name("type"))
         })
         .is_some_and(super::super::java_type_syntax_is_array)
+}
+
+fn java_default_field_value_kind(
+    type_node: Option<Node<'_>>,
+    declarator_is_array: bool,
+) -> Option<SemanticValueKind> {
+    let type_node = type_node.filter(|node| !node.has_error() && !node.is_missing())?;
+    if declarator_is_array || type_node.kind() == "array_type" {
+        return Some(SemanticValueKind::Null);
+    }
+    if let Some(scalar_type) = JavaScalarType::from_type(type_node) {
+        return Some(match scalar_type {
+            JavaScalarType::Integral(_) => SemanticValueKind::UnsignedInteger(0),
+            JavaScalarType::Float | JavaScalarType::Double => SemanticValueKind::FloatingPoint {
+                bits: 0.0_f64.to_bits(),
+            },
+            JavaScalarType::Boolean => SemanticValueKind::Boolean(false),
+        });
+    }
+    match type_node.kind() {
+        "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+            Some(SemanticValueKind::Null)
+        }
+        _ => None,
+    }
+}
+
+fn charge_java_field_step(
+    builder: &mut ProcedureCfgBuilder,
+    cancellation: &CancellationToken,
+) -> Result<(), JavaLoweringError> {
+    if cancellation.is_cancelled() {
+        return Err(JavaLoweringError::Cancelled(Box::new(
+            builder.prospective_work(),
+        )));
+    }
+    builder.descend_nested_entry()?;
+    Ok(())
 }
 
 /// A resolved, unambiguous field declaration: its own name's source anchor,
@@ -553,6 +592,122 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     target,
                 },
             )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn emit_field_initialization_store(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        name: Node<'tree>,
+        point: ProgramPointId,
+        value: ValueId,
+    ) -> Result<(), JavaLoweringError> {
+        let Some(member) = self.field_initialization_locator(name) else {
+            self.session.add_gap_with_impacts(
+                builder,
+                point,
+                SemanticGapSubject::Value(value),
+                SemanticCapability::FieldMemory,
+                SemanticGapImpacts::DEFERRED_EFFECTS,
+                SemanticGapKind::Unsupported,
+                format!(
+                    "field initialization for `{}` has an ambiguous or unknown declaration locator",
+                    node_text(self.prepared.source(), name).unwrap_or("<unknown>"),
+                ),
+            )?;
+            return Ok(());
+        };
+        let base = self
+            .receiver
+            .expect("an instance field initialization has a receiver");
+        let location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Field { base, member },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::MemoryStore {
+                kind: MemoryAccessKind::Field,
+                location,
+                value,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Resolve a field declarator's storage identity directly from the
+    /// source-backed declaration inventory. Unlike a bare body identifier,
+    /// this syntax is the field declaration itself, so a same-named
+    /// constructor parameter cannot shadow it.
+    fn field_initialization_locator(&self, node: Node<'tree>) -> Option<SemanticLocator> {
+        if node.kind() != "identifier" {
+            return None;
+        }
+        self.receiver?;
+        let field = self.enclosing_field_declaration(node)?;
+        if field.is_static {
+            return None;
+        }
+        let procedure = self.session.locator();
+        Some(SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
+            field.anchor,
+        ))
+    }
+
+    pub(super) fn emit_default_field_stores(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        class_body: Node<'tree>,
+        point: ProgramPointId,
+    ) -> Result<(), JavaLoweringError> {
+        let mut fields = class_body.walk();
+        for field in class_body.named_children(&mut fields) {
+            charge_java_field_step(builder, self.session.cancellation())?;
+            if field.kind() != "field_declaration" || has_modifier(field, "static") {
+                continue;
+            }
+            let type_node = field.child_by_field_name("type");
+            let mut declarators = field.walk();
+            for declarator in field.children_by_field_name("declarator", &mut declarators) {
+                charge_java_field_step(builder, self.session.cancellation())?;
+                let Some(name) = declarator.child_by_field_name("name") else {
+                    continue;
+                };
+                let Some(value_kind) = java_default_field_value_kind(
+                    type_node,
+                    java_binding_declares_array(declarator),
+                ) else {
+                    let metadata = self.value_mapping(builder, name)?;
+                    let value = self.session.add_value_with_metadata(
+                        builder,
+                        metadata,
+                        SemanticValueKind::Temporary,
+                    )?;
+                    self.session.add_gap_with_impacts(
+                        builder,
+                        point,
+                        SemanticGapSubject::Value(value),
+                        SemanticCapability::FieldMemory,
+                        SemanticGapImpacts::DEFERRED_EFFECTS,
+                        SemanticGapKind::Unsupported,
+                        format!(
+                            "default constructor field `{}` has an unsupported or unknown type",
+                            node_text(self.prepared.source(), name).unwrap_or("<unknown>"),
+                        ),
+                    )?;
+                    continue;
+                };
+                let value = self.value(builder, point, value_kind)?;
+                self.emit_field_initialization_store(builder, name, point, value)?;
+            }
         }
         Ok(())
     }

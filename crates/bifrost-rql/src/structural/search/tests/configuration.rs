@@ -875,6 +875,143 @@ fn json_paths_stay_workspace_relative_on_every_platform() {
 }
 
 #[test]
+fn empty_configuration_exclusions_keep_root_documents_complete() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub fn ignored() {}\n")
+        .file(
+            "config.json",
+            r#"{"password":"json-secret","username":"json-user"}"#,
+        )
+        .file(
+            "config.yaml",
+            "password: yaml-secret\nusername: yaml-user\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "except": [
+            {
+                "where": ["**/*.json", "**/*.yaml"],
+                "configuration_facts": {
+                    "formats": ["json", "yaml"],
+                    "node_kinds": ["member"],
+                    "roles": ["object_member"],
+                    "scalar_kinds": ["string"],
+                    "keys": ["password"],
+                },
+            },
+            {
+                "union": [
+                    {
+                        "where": ["**/package.json"],
+                        "configuration_facts": {
+                            "formats": ["json"],
+                            "node_kinds": ["member"],
+                        },
+                    },
+                    {
+                        "where": ["**/*.template.json"],
+                        "configuration_facts": {
+                            "formats": ["json"],
+                            "node_kinds": ["member"],
+                        },
+                    },
+                ],
+            },
+        ],
+        "result_detail": "full",
+        "limit": 100,
+    }))
+    .expect("configuration policy query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let rows = configuration_rows(&result);
+
+    assert_eq!(rows.len(), 2, "{}", result.render_text());
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.path.as_str(), row.key.as_deref(), row.completeness))
+            .collect::<Vec<_>>(),
+        vec![
+            ("config.json", Some("password"), "complete"),
+            ("config.yaml", Some("password"), "complete"),
+        ]
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "root-level configuration documents should route completely: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn configuration_absence_requires_a_routed_document_root() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub fn ignored() {}\n")
+        .file(
+            "config.xml",
+            "<configuration><present>value</present></configuration>",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+
+    let absence_query = |path: &str, key: &str| {
+        CodeQuery::from_json(&json!({
+            "where": [path],
+            "configuration_facts": {
+                "formats": ["xml"],
+                "node_kinds": ["document"],
+            },
+            "steps": [{"op": "configuration_absence", "keys": [key]}],
+            "result_detail": "full",
+            "limit": 100,
+        }))
+        .expect("configuration absence query")
+    };
+
+    let missing = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &absence_query("missing.xml", "forbidden"),
+    );
+    assert!(configuration_rows(&missing).is_empty(), "{missing:#?}");
+    let missing_diagnostic =
+        diagnostic_with_code(&missing, CodeQueryDiagnosticCode::PathDerivationIncomplete);
+    assert_eq!(
+        missing_diagnostic.impact,
+        CodeQueryDiagnosticImpact::Incomplete
+    );
+    assert!(missing_diagnostic.branch.is_empty());
+    assert_eq!(missing_diagnostic.language, "workspace");
+    assert_eq!(
+        missing_diagnostic.message,
+        "configuration seed did not route to any workspace document for the requested path scope; absence is not provable"
+    );
+
+    let complete = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &absence_query("config.xml", "forbidden"),
+    );
+    let complete_rows = configuration_rows(&complete);
+    assert_eq!(complete_rows.len(), 1, "{}", complete.render_text());
+    assert_eq!(complete_rows[0].node_kind, "document");
+    assert_eq!(complete_rows[0].completeness, "complete");
+    assert!(complete.diagnostics.is_empty(), "{complete:#?}");
+
+    let matched = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &absence_query("config.xml", "present"),
+    );
+    assert!(configuration_rows(&matched).is_empty(), "{matched:#?}");
+    assert!(matched.diagnostics.is_empty(), "{matched:#?}");
+}
+
+#[test]
 fn json_document_root_cardinality_reaches_the_query_surface() {
     // A file with no value and a file with two top-level values are both
     // authored evidence the single-root model cannot represent; neither may

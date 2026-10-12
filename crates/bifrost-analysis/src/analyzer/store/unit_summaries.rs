@@ -65,6 +65,7 @@ pub(crate) struct UnitInputs {
 /// workspace dependency that had no live summary at this pass; the digest is then
 /// a marker that differs from every real output digest, so a dependent derived
 /// without it is derived again when the dependency appears.
+#[derive(Debug)]
 pub(crate) struct ConsumedDependency {
     pub ordinal: usize,
     pub unit_key: [u8; 32],
@@ -178,6 +179,32 @@ pub(crate) trait UnitSummaryLanguage {
         dependencies: &[ConsumedDependency],
         producer_epoch: &str,
     ) -> Result<UnitOutputs>;
+
+    /// Publish language-specific rows that are children of this shared
+    /// summary. The default is appropriate for languages whose complete
+    /// surface is already represented by the shared rows.
+    fn write_language_rows(
+        &self,
+        _conn: &Connection,
+        _snapshot: &WorkspaceSnapshotId,
+        _unit: &UnitInputs,
+        _dependencies: &[ConsumedDependency],
+        _summary_id: i64,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Publish revision-specific language context alongside the shared
+    /// version row. The default is appropriate when the language has none.
+    fn write_language_version(
+        &self,
+        _conn: &Connection,
+        _snapshot: &WorkspaceSnapshotId,
+        _unit: &UnitInputs,
+        _summary_id: i64,
+    ) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 /// What one reconcile pass did, for profiling and for the caller to report.
@@ -194,6 +221,12 @@ pub(crate) struct UnitSummaryReconciliation {
     /// Output digest changes among derived units that already had a live summary.
     pub output_changes: usize,
     pub closed_versions: usize,
+    /// Fixpoint rounds that derived units again, and the units that round
+    /// `FIXPOINT_ROUNDS + 1` would have: zero when the pass settled.
+    pub fixpoint_rounds: usize,
+    pub fixpoint_unsettled: usize,
+    /// Units whose summary a fixpoint round replaced or rebound.
+    pub rederived: usize,
     /// Units whose derivation failed and so publish nothing, with the error.
     pub failed: Vec<(String, String)>,
     pub cancelled: bool,
@@ -354,7 +387,26 @@ CREATE TEMP TABLE IF NOT EXISTS unit_summary_work(unit_id INTEGER PRIMARY KEY) S
 CREATE TEMP TABLE IF NOT EXISTS unit_summary_edges(
   unit_id INTEGER NOT NULL,
   dependency_unit_id INTEGER NOT NULL,
+  -- 0 for an edge the unit consumes but that must not order the units: a Rust
+  -- library consumes its dev-dependencies, which are inputs of its test
+  -- targets and may form a cycle with the library that depends on it.
+  orders INTEGER NOT NULL DEFAULT 1 CHECK(orders IN (0, 1)),
   PRIMARY KEY(unit_id, dependency_unit_id)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS temp.unit_summary_edges_dependency
+  ON unit_summary_edges(dependency_unit_id);
+-- Workspace dependencies a unit consumed as unavailable because the pass had not
+-- settled them yet.
+CREATE TEMP TABLE IF NOT EXISTS unit_summary_unavailable(
+  unit_id INTEGER NOT NULL,
+  dependency_unit_id INTEGER NOT NULL,
+  PRIMARY KEY(unit_id, dependency_unit_id)
+) WITHOUT ROWID, STRICT;
+-- The units to derive again in a fixpoint round.
+CREATE TEMP TABLE IF NOT EXISTS unit_summary_fixpoint(
+  round INTEGER NOT NULL,
+  unit_id INTEGER NOT NULL,
+  PRIMARY KEY(round, unit_id)
 ) WITHOUT ROWID, STRICT;
 CREATE TEMP TABLE IF NOT EXISTS unit_summary_order(
   ordinal INTEGER PRIMARY KEY,
@@ -363,11 +415,15 @@ CREATE TEMP TABLE IF NOT EXISTS unit_summary_order(
 ) STRICT;
 DELETE FROM temp.unit_summary_work;
 DELETE FROM temp.unit_summary_edges;
+DELETE FROM temp.unit_summary_unavailable;
+DELETE FROM temp.unit_summary_fixpoint;
 DELETE FROM temp.unit_summary_order;";
 
 const CLEAR_STAGING_SQL: &str = "
 DELETE FROM temp.unit_summary_work;
 DELETE FROM temp.unit_summary_edges;
+DELETE FROM temp.unit_summary_unavailable;
+DELETE FROM temp.unit_summary_fixpoint;
 DELETE FROM temp.unit_summary_order;";
 
 // One wave of Kahn's algorithm: every unit all of whose consumed units are
@@ -379,6 +435,7 @@ const ORDER_WAVE_SQL: &str = "INSERT INTO temp.unit_summary_order(unit_id)
        AND NOT EXISTS (
          SELECT 1 FROM temp.unit_summary_edges AS edges
          WHERE edges.unit_id = work.unit_id AND edges.dependency_unit_id <> work.unit_id
+           AND edges.orders = 1
            AND NOT EXISTS (SELECT 1 FROM temp.unit_summary_order AS ordered
                            WHERE ordered.unit_id = edges.dependency_unit_id))
      ORDER BY work.unit_id";
@@ -389,6 +446,31 @@ const ORDER_REMAINDER_SQL: &str = "INSERT INTO temp.unit_summary_order(unit_id)
      SELECT work.unit_id FROM temp.unit_summary_work AS work
      WHERE NOT EXISTS (SELECT 1 FROM temp.unit_summary_order AS ordered WHERE ordered.unit_id = work.unit_id)
      ORDER BY work.unit_id";
+// A unit that consumed a dependency as unavailable is derived again once the
+// dependency has settled, and so is every unit that consumes a unit whose output
+// moved in the previous round. Bounded by FIXPOINT_ROUNDS.
+const SEED_FIXPOINT_SQL: &str = "INSERT OR IGNORE INTO temp.unit_summary_fixpoint(round, unit_id)
+     SELECT DISTINCT 1, unavailable.unit_id FROM temp.unit_summary_unavailable AS unavailable
+     JOIN temp.unit_summary_order AS dependency
+       ON dependency.unit_id = unavailable.dependency_unit_id AND dependency.unit_key IS NOT NULL";
+const MARK_DEPENDENTS_SQL: &str = "INSERT OR IGNORE INTO temp.unit_summary_fixpoint(round, unit_id)
+     SELECT ?2, edges.unit_id FROM temp.unit_summary_edges AS edges
+     WHERE edges.dependency_unit_id = ?1";
+const NEXT_FIXPOINT_UNIT_SQL: &str = "SELECT ordered.ordinal, ordered.unit_id
+     FROM temp.unit_summary_fixpoint AS fixpoint
+     JOIN temp.unit_summary_order AS ordered ON ordered.unit_id = fixpoint.unit_id
+     WHERE fixpoint.round = ?1 AND ordered.ordinal > ?2 ORDER BY ordered.ordinal LIMIT 1";
+const COUNT_FIXPOINT_UNITS_SQL: &str =
+    "SELECT count(*) FROM temp.unit_summary_fixpoint WHERE round = ?1";
+const FORGET_UNAVAILABLE_SQL: &str = "DELETE FROM temp.unit_summary_unavailable WHERE unit_id = ?1";
+const NOTE_UNAVAILABLE_SQL: &str =
+    "INSERT OR IGNORE INTO temp.unit_summary_unavailable(unit_id, dependency_unit_id)
+     VALUES(?1, ?2)";
+/// Rounds of re-derivation after the ordered pass. A unit derived before a
+/// dependency it consumes gets that dependency in round one; a round that moves
+/// an output sends its dependents to the next. Dependency chains behind a
+/// library and its dev-dependency settle within a few rounds.
+const FIXPOINT_ROUNDS: i64 = 4;
 const NEXT_UNIT_SQL: &str = "SELECT ordinal, unit_id FROM temp.unit_summary_order
      WHERE ordinal > ?1 ORDER BY ordinal LIMIT 1";
 const SETTLE_UNIT_SQL: &str = "UPDATE temp.unit_summary_order SET unit_key = ?2 WHERE unit_id = ?1";
@@ -572,9 +654,90 @@ fn reconcile_staged(
                 .max_unit_statements
                 .max(statements.count() - statements_before);
         }
+        if !report.cancelled {
+            conn.execute(SEED_FIXPOINT_SQL, [])?;
+            reconcile_fixpoint(
+                conn,
+                snapshot,
+                language,
+                producer_epoch,
+                cancellation,
+                statements,
+                &mut report,
+            )?;
+        }
     }
     close_unsettled(conn, snapshot, language, &mut report)?;
     Ok(report)
+}
+
+/// Derive again, in order, the units that consumed a dependency before the pass
+/// settled it, then the units that consume a unit whose output moved. A unit
+/// whose consumed digests did not move finds its summary and publishes nothing.
+fn reconcile_fixpoint(
+    conn: &mut Connection,
+    snapshot: &WorkspaceSnapshotId,
+    language: &dyn UnitSummaryLanguage,
+    producer_epoch: &str,
+    cancellation: &CancellationToken,
+    statements: &StatementCounter,
+    report: &mut UnitSummaryReconciliation,
+) -> Result<()> {
+    for round in 1..=FIXPOINT_ROUNDS {
+        let queued: usize = conn
+            .prepare_cached(COUNT_FIXPOINT_UNITS_SQL)?
+            .query_row([round], |row| row.get(0))?;
+        if queued == 0 {
+            return Ok(());
+        }
+        report.fixpoint_rounds = round as usize;
+        let mut after = 0_i64;
+        loop {
+            if cancellation.is_cancelled() {
+                report.cancelled = true;
+                return Ok(());
+            }
+            let next: Option<(i64, i64)> = conn
+                .prepare_cached(NEXT_FIXPOINT_UNIT_SQL)?
+                .query_row(params![round, after], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            let Some((ordinal, unit_id)) = next else {
+                break;
+            };
+            after = ordinal;
+            let statements_before = statements.count();
+            let published = publish_unit(
+                conn,
+                snapshot,
+                language,
+                producer_epoch,
+                unit_id,
+                cancellation,
+                report,
+            )?;
+            report.rederived += usize::from(published.republished);
+            if published.output_moved {
+                conn.prepare_cached(MARK_DEPENDENTS_SQL)?
+                    .execute(params![unit_id, round + 1])?;
+            }
+            report.max_unit_statements = report
+                .max_unit_statements
+                .max(statements.count() - statements_before);
+        }
+    }
+    report.fixpoint_unsettled = conn
+        .prepare_cached(COUNT_FIXPOINT_UNITS_SQL)?
+        .query_row([FIXPOINT_ROUNDS + 1], |row| row.get(0))?;
+    Ok(())
+}
+
+/// What publishing one unit did to its version row.
+struct Published {
+    /// The unit's summary was replaced or rebound.
+    republished: bool,
+    /// The replaced summary of this same revision had a different output digest,
+    /// so the units that consumed it are stale.
+    output_moved: bool,
 }
 
 /// Publish one unit: reuse its summary when the digest exists, otherwise derive
@@ -590,7 +753,11 @@ fn publish_unit(
     unit_id: i64,
     cancellation: &CancellationToken,
     report: &mut UnitSummaryReconciliation,
-) -> Result<()> {
+) -> Result<Published> {
+    let nothing = Published {
+        republished: false,
+        output_moved: false,
+    };
     let unit = match language.inputs(conn, snapshot, unit_id) {
         Ok(unit) => unit,
         Err(error) => {
@@ -598,13 +765,30 @@ fn publish_unit(
                 format!("{} unit {unit_id}", language.lang()),
                 error.to_string(),
             ));
-            return Ok(());
+            return Ok(nothing);
         }
     };
     let dependencies = consume_dependencies(conn, snapshot, language, producer_epoch, &unit)?;
+    conn.prepare_cached(FORGET_UNAVAILABLE_SQL)?
+        .execute([unit_id])?;
+    for dependency in dependencies
+        .iter()
+        .filter(|dependency| !dependency.available)
+    {
+        let unit_ids = unit
+            .dependencies
+            .iter()
+            .filter(|input| input.unit_key == dependency.unit_key)
+            .filter_map(|input| input.unit_id);
+        for dependency_unit_id in unit_ids {
+            conn.prepare_cached(NOTE_UNAVAILABLE_SQL)?
+                .execute(params![unit_id, dependency_unit_id])?;
+        }
+    }
     let digest = summary_digest(language, snapshot, producer_epoch, &unit, &dependencies);
     let existing = find_summary(conn, &digest)?;
     let open = open_version(conn, snapshot, language, &unit.unit_key)?;
+    let mut output_moved = false;
     let publication = if let (Some(existing), Some((open_summary, _))) = (&existing, open)
         && existing.intact
         && existing.summary_id == open_summary
@@ -622,17 +806,18 @@ fn publish_unit(
                         Ok(outputs) => outputs,
                         Err(error) => {
                             report.failed.push((unit.label.clone(), error.to_string()));
-                            return Ok(());
+                            return Ok(nothing);
                         }
                     };
                 if cancellation.is_cancelled() {
                     report.cancelled = true;
-                    return Ok(());
+                    return Ok(nothing);
                 }
                 let output_digest = output_digest(&dependencies, &outputs);
                 let summary_id = write_summary(
                     &tx,
                     language,
+                    snapshot,
                     producer_epoch,
                     &digest,
                     existing.map(|existing| existing.summary_id),
@@ -675,11 +860,26 @@ fn publish_unit(
             )?;
             rows_written += 1;
         }
+        rows_written += language.write_language_version(&tx, snapshot, &unit, summary_id)?;
         tx.commit()?;
         let held = transaction_started.elapsed();
         report.transaction_total += held;
         report.transaction_max = report.transaction_max.max(held);
         report.max_unit_rows = report.max_unit_rows.max(rows_written);
+        output_moved = match (&previous_output, open) {
+            (Some(previous), Some((_, opened))) if opened == snapshot.revision => {
+                let current: Vec<u8> = match &derived_output {
+                    Some(output_digest) => output_digest.to_vec(),
+                    None => conn.query_row(
+                        "SELECT output_digest FROM resolution_unit_summaries WHERE summary_id = ?1",
+                        [summary_id],
+                        |row| row.get(0),
+                    )?,
+                };
+                *previous != current
+            }
+            _ => false,
+        };
         match derived_output {
             Some(output_digest) => UnitPublication::Derived {
                 rows_written,
@@ -706,7 +906,10 @@ fn publish_unit(
             report.output_changes += usize::from(output_changed);
         }
     }
-    Ok(())
+    Ok(Published {
+        republished: !matches!(publication, UnitPublication::Unchanged),
+        output_moved,
+    })
 }
 
 enum UnitPublication {
@@ -849,7 +1052,7 @@ fn close_unsettled(
     }
     // A profile replacement or a failed unit unbinds headers; delete them with
     // the rows that bound them.
-    if report.closed_versions > 0 {
+    if report.closed_versions > 0 || report.rederived > 0 {
         tx.execute(DELETE_UNBOUND_SUMMARIES_SQL, [])?;
     }
     tx.commit()?;
@@ -1051,6 +1254,7 @@ fn output_digest(dependencies: &[ConsumedDependency], outputs: &UnitOutputs) -> 
 fn write_summary(
     tx: &Connection,
     language: &dyn UnitSummaryLanguage,
+    snapshot: &WorkspaceSnapshotId,
     producer_epoch: &str,
     digest: &[u8; 32],
     replace: Option<i64>,
@@ -1204,6 +1408,7 @@ fn write_summary(
             insert.execute(params![summary_id, gap.kind, gap.subject, gap.detail])?;
         }
     }
+    *rows_written += language.write_language_rows(tx, snapshot, unit, dependencies, summary_id)?;
     let counts = |table: &str| -> Result<usize> {
         Ok(tx.query_row(
             &format!("SELECT count(*) FROM {table} WHERE summary_id = ?1"),

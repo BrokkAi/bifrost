@@ -346,6 +346,7 @@ impl KotlinAnalyzer {
             &self.external_index,
             &self.jvm_config,
             self.inner.project(),
+            self.inner.analyzer_store(),
         )
     }
 
@@ -1136,6 +1137,13 @@ impl DeadCodeBulkProof for KotlinDeadCodeBulk {
 }
 
 impl LanguageSupport for KotlinSupport {
+    fn external_inventory_providers(
+        &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+    ) -> Vec<String> {
+        crate::analyzer::jvm::external::kotlin_inventory_providers(analyzer)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn native_rollout_points(
         &self,

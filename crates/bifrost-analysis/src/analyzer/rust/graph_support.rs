@@ -10,10 +10,10 @@ use crate::analyzer::{AnalyzerQueryScope, QueryScope, QueryToken};
 use crate::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use crate::hash::HashSet;
 use brokk_bifrost_rust::graph_support::{
-    ReferenceContextResult, RustCargoRouteError, RustPackageFileIndex, RustReferenceContext,
-    exact_member, forward_reference_context_of, forward_reference_context_of_while,
-    is_rust_trait_declaration, reference_context_of, reference_context_of_while,
-    resolve_module_files, rust_trait_member_implementations, rust_usage_candidate_files,
+    ReferenceContextResult, RustCargoRouteError, RustReferenceContext, exact_member,
+    forward_reference_context_of, forward_reference_context_of_while, is_rust_trait_declaration,
+    reference_context_of, reference_context_of_while, resolve_module_files,
+    rust_trait_member_implementations, rust_usage_candidate_files,
 };
 use brokk_bifrost_rust::lexical_scope::insert_rust_import_binding;
 use std::sync::Arc;
@@ -96,17 +96,6 @@ impl RustAnalyzer {
         keep_going: impl Fn() -> bool + 'a,
     ) -> RustReferenceContext<'a> {
         forward_reference_context_of_while(self, token, file, keep_going)
-    }
-
-    /// The analyzed-file listing bucketed by path-derived Rust package name,
-    /// built at most once per analyzer instance. Same lifetime and invalidation
-    /// as `cargo_routes` — both are pure projections of the analyzed-file set,
-    /// so both are rebuilt by `update`/`update_all`/`clone_with_project` and by
-    /// nothing else (#1230 item 3).
-    pub fn package_file_index(&self) -> Arc<RustPackageFileIndex> {
-        self.package_file_index
-            .get_or_init(|| Arc::new(RustPackageFileIndex::build(self.get_analyzed_files())))
-            .clone()
     }
 
     pub fn resolve_module_files(

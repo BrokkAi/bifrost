@@ -923,6 +923,7 @@ fn a_sanitized_path_does_not_hide_an_unsanitized_one() {
 }
 
 #[test]
+#[hardwon("eeaf43935461: concluded authored-model runs dropped their partial finding causes")]
 fn a_model_replaces_the_callee_with_a_receiver_to_result_transfer() {
     let fixture = fixture();
     let plan = fixture.plan(&["target"], &["target"], None);
@@ -974,6 +975,26 @@ fn a_model_replaces_the_callee_with_a_receiver_to_result_transfer() {
     assert!(incompleteness.is_empty(), "{incompleteness:#?}");
     assert_single_alpha_finding(&plan, &report);
     assert!(report.is_complete());
+    // An unreviewed authored claim concludes the run but leaves its finding
+    // partial. Keep the external call cause independently of run completion.
+    graph
+        .models
+        .get_mut(&(target.durable_key(), call))
+        .unwrap()
+        .authored = Some(Box::default());
+    let outcome = compose(&plan, &graph, BUDGET);
+    assert!(outcome.incompleteness.is_empty());
+    assert!(outcome.report.is_proven_by_authored_summaries());
+    assert!(!outcome.report.findings()[0].is_complete());
+    let [Incompleteness::Dispatch { call: retained, .. }] =
+        outcome.finding_incompleteness.as_slice()
+    else {
+        panic!(
+            "one external finding cause: {:?}",
+            outcome.finding_incompleteness
+        );
+    };
+    assert_eq!(retained, &(target.durable_key(), call));
 }
 
 /// Two findings in one batch. The sink in `target` is reached through a call

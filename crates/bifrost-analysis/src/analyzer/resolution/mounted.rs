@@ -1400,6 +1400,16 @@ where
         ))
     }
 
+    fn lookup_namespace(
+        &self,
+        lookup: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace>>
+    {
+        self.inner
+            .lookup_namespace(self.argument(&lookup), cancellation)
+    }
+
     fn selection_has_java_semantics(&self) -> bool {
         self.inner.selection_has_java_semantics()
     }
@@ -1476,6 +1486,42 @@ where
             .map(|rows| {
                 rows.into_iter()
                     .map(|(lookup, callable)| (self.result(&lookup), self.result(&callable)))
+                    .collect()
+            }))
+    }
+
+    fn invocation_roles_for_references(
+        &self,
+        references: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<super::fact_source::SelectedInvocationRole>>> {
+        let references = self.arguments(references);
+        Ok(self
+            .inner
+            .invocation_roles_for_references(&references, cancellation)?
+            .map(|mut rows| {
+                for row in &mut rows {
+                    row.reference = self.result(&row.reference);
+                }
+                rows
+            }))
+    }
+
+    fn lookups_outside_implicit_root(
+        &self,
+        lookups: &[(BindingFragmentId, SemanticId)],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        let lookups = lookups
+            .iter()
+            .map(|(fragment, lookup)| (self.argument(fragment), self.argument(lookup)))
+            .collect::<Vec<_>>();
+        Ok(self
+            .inner
+            .lookups_outside_implicit_root(&lookups, cancellation)?
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|lookup| self.result(&lookup))
                     .collect()
             }))
     }
@@ -1931,7 +1977,7 @@ mod tests {
         assert_eq!(batch.len(), 29, "BatchResolutionFragmentSource: {batch:?}");
         // The descriptor-only projection is forwarded independently of the
         // seed reader; the source-derived membership check below proves both.
-        assert_eq!(typed.len(), 68, "SelectedTypedFactSource: {typed:?}");
+        assert_eq!(typed.len(), 71, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = forwarded_methods(include_str!("mounted.rs"))
             .into_iter()

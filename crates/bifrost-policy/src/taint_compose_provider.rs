@@ -168,12 +168,12 @@ pub(crate) struct CompositionMemo {
 }
 
 /// One call's dispatch as the composition answers it, with the model that
-/// covers the call and the record its diagnostics read. A call a model covers
-/// has no record: the model replaces it and it is not a boundary.
+/// covers the call and the record its diagnostics read. A model closes the
+/// run boundary, but a partial finding still needs the call's dispatch evidence.
 struct MemoizedDispatch {
     dispatch: Dispatch,
     model: Option<CallModel>,
-    record: Option<(RecordedDispatch, Box<[DispatchBoundary]>)>,
+    record: (RecordedDispatch, Box<[DispatchBoundary]>),
 }
 
 /// A frontier source's selected site: the policy, the source endpoint, the
@@ -190,6 +190,8 @@ type EvidenceKey = (
 struct FrontierMatch {
     by_procedure: HashMap<DurableProcedureKey, Vec<FrontierEndpoint>>,
     gaps: Vec<String>,
+    /// Per-row refusals must survive an earlier first-cause diagnostic.
+    refusals: Vec<String>,
 }
 
 /// One unsliceable selector's workspace-wide rows by file, and the reasons
@@ -311,7 +313,7 @@ impl<'a> PolicyCompositionProvider<'a> {
                         }
                         // Gaps of the one workspace-wide evaluation belong
                         // to every blob it answers.
-                        let (_, gaps) = binder.bind(selector, Vec::new())?;
+                        let gaps = binder.bind(selector, Vec::new())?.gaps;
                         let rows = Arc::new(WidenedRows { by_file, gaps });
                         self.memo
                             .widened
@@ -326,24 +328,45 @@ impl<'a> PolicyCompositionProvider<'a> {
                 )
             }
         };
-        let (endpoints, bind_gaps) = {
+        let bound = {
             let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.endpoints.bind");
             binder.bind(selector, sites)?
         };
-        gaps.extend(bind_gaps);
+        gaps.extend(bound.gaps);
         let mut by_procedure: HashMap<DurableProcedureKey, Vec<FrontierEndpoint>> = HashMap::new();
-        for endpoint in endpoints {
+        for endpoint in bound.endpoints {
             by_procedure
                 .entry(endpoint.procedure())
                 .or_default()
                 .push(endpoint);
         }
-        let matched = Arc::new(FrontierMatch { by_procedure, gaps });
+        let matched = Arc::new(FrontierMatch {
+            by_procedure,
+            gaps,
+            refusals: bound.refusals,
+        });
         self.memo
             .matches
             .borrow_mut()
             .insert(key, Arc::clone(&matched));
         Ok(matched)
+    }
+
+    /// Every refused frontier row of this policy, including cached matches
+    /// served by earlier batches. The run retains them independently of its
+    /// first path-relevant incompleteness (#4919).
+    pub(crate) fn refusal_messages(&self) -> Vec<String> {
+        let mut messages = self
+            .memo
+            .matches
+            .borrow()
+            .iter()
+            .filter(|((policy, _, _), _)| policy == &self.policy)
+            .flat_map(|(_, matched)| matched.refusals.iter().cloned())
+            .collect::<Vec<_>>();
+        messages.sort();
+        messages.dedup();
+        messages
     }
 
     /// The partial-flow answers so far: `(read from the store, computed at
@@ -702,9 +725,8 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                 memoized
             }
         };
-        if let Some((record, boundaries)) = &memoized.record {
-            self.record_dispatch(call, record, boundaries);
-        }
+        let (record, boundaries) = &memoized.record;
+        self.record_dispatch(call, record, boundaries);
         self.models
             .borrow_mut()
             .insert(call.clone(), memoized.model.clone());
@@ -1012,6 +1034,18 @@ impl PolicyCompositionProvider<'_> {
             self.discovery.resolve_call(&call_handle, request)?
         };
         let result = answer.available_value();
+        let status = SemanticInputStatus::from_outcome(&answer);
+        let mut record = RecordedDispatch {
+            handle: call_handle.clone(),
+            status,
+            coverage: result.map_or_else(
+                || CallSiteCoverage::unavailable(status),
+                |result| CallSiteCoverage::from_dispatch(status, result),
+            ),
+        };
+        let boundaries = result
+            .map(|result| result.boundaries().into())
+            .unwrap_or_default();
         let models = self.call_models(&call_handle, &answer)?;
         let continuation = continuation_quality(&models, &call_handle, result);
         // A call a model covers is not a boundary: the model replaces it, and
@@ -1025,16 +1059,10 @@ impl PolicyCompositionProvider<'_> {
                     continuation,
                 },
                 model: Some(model),
-                record: None,
+                record: (record, boundaries),
             });
         }
-        let status = SemanticInputStatus::from_outcome(&answer);
         let Some(result) = result else {
-            let record = RecordedDispatch {
-                handle: call_handle,
-                status,
-                coverage: CallSiteCoverage::unavailable(status),
-            };
             return Ok(MemoizedDispatch {
                 dispatch: Dispatch {
                     candidates: Vec::new(),
@@ -1042,7 +1070,7 @@ impl PolicyCompositionProvider<'_> {
                     continuation,
                 },
                 model: None,
-                record: Some((record, Box::default())),
+                record: (record, boundaries),
             });
         };
         let mut completeness = dispatch_completeness(&answer, result);
@@ -1073,14 +1101,8 @@ impl PolicyCompositionProvider<'_> {
                 Err(reason) => completeness = incomplete(reason),
             }
         }
-        let mut coverage = CallSiteCoverage::from_dispatch(status, result);
-        coverage.entered = entered;
-        coverage.bindings = bindings;
-        let record = RecordedDispatch {
-            handle: call_handle,
-            status,
-            coverage,
-        };
+        record.coverage.entered = entered;
+        record.coverage.bindings = bindings;
         Ok(MemoizedDispatch {
             dispatch: Dispatch {
                 candidates,
@@ -1088,7 +1110,7 @@ impl PolicyCompositionProvider<'_> {
                 continuation,
             },
             model: None,
-            record: Some((record, result.boundaries().into())),
+            record: (record, boundaries),
         })
     }
 

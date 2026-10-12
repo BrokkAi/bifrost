@@ -585,6 +585,12 @@ fn lower_shared_language_facts(
         .filter(|identifier| identifier.role == ResolutionIdentifierRole::Declaration)
         .map(|identifier| identifier.site)
         .collect::<BTreeSet<_>>();
+    let references = facts
+        .identifiers
+        .iter()
+        .filter(|identifier| identifier.role == ResolutionIdentifierRole::Reference)
+        .map(|identifier| identifier.site)
+        .collect::<BTreeSet<_>>();
     let calls = facts
         .calls
         .iter()
@@ -941,9 +947,9 @@ fn lower_shared_language_facts(
                 }
                 brokk_bifrost_core::analyzer::resolution_facts::ResolutionInvocationRole::Unapply
                 | brokk_bifrost_core::analyzer::resolution_facts::ResolutionInvocationRole::UnapplySeq => {
-                    assert_eq!(
-                        site.kind,
-                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::Pattern
+                    assert!(
+                        references.contains(&fact.site),
+                        "an extractor role belongs to the pattern's head reference: {fact:?}, {site:?}"
                     );
                 }
             }
@@ -1627,6 +1633,80 @@ mod tests {
     use super::*;
     use crate::analyzer::resolution::BindingFragmentId;
     use crate::analyzer::resolution::positioned_identifier_for_test as identifier;
+
+    #[test]
+    fn scala_extractor_roles_lower_on_the_pattern_head_reference() {
+        let source = concat!(
+            "package demo\n",
+            "object Use {\n",
+            "  def f(x: Any): Any = x match {\n",
+            "    case Seq(a, b) => a\n",
+            "    case New(n) => n\n",
+            "    case Seq(rest*) => rest\n",
+            "    case _ => 0\n",
+            "  }\n",
+            "}\n",
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), "Extractors.scala");
+        let parsed = crate::analyzer::scala::declarations::parse_scala_file(&file, source, &tree);
+        let facts = &parsed.resolution_facts;
+        let mut identities = ResolutionIdentityCatalogBuilder::new(
+            BindingFragmentId::for_test(b"scala-extractor-roles"),
+            crate::analyzer::resolution::test_shared_names(),
+        );
+        let lowered = lower_common_resolution_facts(&mut identities, Language::Scala, facts);
+        // The row names the head reference, carries the role, and has neither a
+        // receiver nor a result slot; it has no argument count.
+        let rows = lowered
+            .shared_language
+            .invocation_roles
+            .iter()
+            .map(|row| {
+                let site = facts.sites[row.site.index()];
+                (
+                    &source[site.start_byte..site.end_byte],
+                    site.kind,
+                    row.role,
+                    row.receiver.is_some(),
+                    row.result.is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionInvocationRole::{
+            Unapply, UnapplySeq,
+        };
+        assert_eq!(
+            rows,
+            [
+                (
+                    "Seq",
+                    ResolutionSiteKind::ValueReference,
+                    Unapply,
+                    false,
+                    false
+                ),
+                (
+                    "New",
+                    ResolutionSiteKind::ValueReference,
+                    Unapply,
+                    false,
+                    false
+                ),
+                (
+                    "Seq",
+                    ResolutionSiteKind::ValueReference,
+                    UnapplySeq,
+                    false,
+                    false
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn generated_item_surface_gap_is_a_macro_reverse_frontier() {

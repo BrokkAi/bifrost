@@ -170,3 +170,9 @@ Migration `0172-root-import-activation-ordinal.sql` adds a nullable
 `activation_ordinal` to `resolution_paths`. A positional root import (Scala)
 stores the source position at which it takes effect, and the selected import
 context consumes one blob's imports in that order. Other producers store NULL.
+
+Migration `0173-rust-unit-summary-rows.sql` is create-only. It adds the Rust-owned
+`rust_resolution_unit_summary_*` tables that hold placement, route, macro and typed facts
+keyed to the shared per-unit summary rows. It moves no data and changes no shared table.
+
+Migration `0174-jvm-external-owner-inventory.sql` adds durable external declaration inventories for JVM resolution, recording member and supertype rows plus completeness for each member namespace.

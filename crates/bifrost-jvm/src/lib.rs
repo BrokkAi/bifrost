@@ -39,6 +39,7 @@
 //! [`realm::JvmSourceRealm`].
 
 mod call_arguments;
+mod constructor_site;
 pub(crate) mod graph_hits;
 pub mod java;
 pub mod kotlin;
@@ -47,6 +48,7 @@ pub mod proof;
 pub mod queries;
 pub mod realm;
 pub mod scala;
+mod synthetic_members;
 mod test_detection;
 
 pub(crate) fn source_header(source: &str, start_byte: usize, end_byte: usize) -> String {

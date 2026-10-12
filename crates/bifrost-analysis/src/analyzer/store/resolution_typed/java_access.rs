@@ -9,7 +9,7 @@ use crate::hash::{HashMap, HashSet};
 pub(in crate::analyzer::store) const ENDPOINTS: &str = r#"
 WITH RECURSIVE seeds(mount_ordinal, semantic_key, blob_id, package, owner) AS (
  SELECT request.mount_ordinal, request.key0, mount.blob_id, meta.content_package,
-        CASE semantic.semantic_role WHEN 'definition' THEN request.key0 ELSE site.owner END
+        CASE semantic.semantic_role WHEN 'definition' THEN request.key0 ELSE NULLIF(site.owner, -1) END
  FROM temp.selected_resolution_typed_requests_1 AS request
  CROSS JOIN temp.selected_resolution_mounts AS mount
    ON mount.mount_ordinal=request.mount_ordinal AND mount.semantic_language='java'

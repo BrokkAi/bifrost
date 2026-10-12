@@ -1367,9 +1367,11 @@ labelled_enum! {
     }
 }
 
-/// One invocation request. `site` is a call node for `Direct`/`Apply` and a
-/// pattern node for `Unapply`/`UnapplySeq`; receiver and result slots preserve
-/// the typed edges consumed by a shared invocation reader.
+/// One invocation request. `site` is a call node for `Direct`/`Apply` and the
+/// head reference of the pattern for `Unapply`/`UnapplySeq` (the reference a
+/// reader resolves to the extractor, as a call's callee is resolved); receiver
+/// and result slots preserve the typed edges consumed by a shared invocation
+/// reader. The row carries no argument count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionInvocationRoleFact {
     pub site: ResolutionSiteId,

@@ -154,8 +154,19 @@ fn nested_class_callables_have_captured_parameter_shapes() {
     // The record component is not a callable parameter; the other five
     // parameters belong to methods the native walk enters, including local,
     // anonymous, and enum-constant class bodies in if/else arms.
-    assert_eq!(parsed.resolution_facts.callable_signatures.len(), 5);
-    assert_eq!(parsed.resolution_facts.callable_parameters.len(), 5);
+    // The classes that write no constructor supply default constructors, which
+    // have signatures of their own and no parameters.
+    let facts = &parsed.resolution_facts;
+    assert_eq!(
+        facts
+            .callable_signatures
+            .iter()
+            .filter(|signature| facts.sites[signature.callable.index()].kind
+                == ResolutionSiteKind::CallableDeclaration)
+            .count(),
+        5
+    );
+    assert_eq!(facts.callable_parameters.len(), 5);
 }
 
 #[test]

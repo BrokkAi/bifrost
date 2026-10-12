@@ -18,7 +18,7 @@ use super::fact_resolution::{
     FactBatchedReferenceAnswer, FactCallableReceiverTargetDisposition, FactReferenceBatchAnswer,
     FactReferenceReceiverGap, FactResolutionBatchSummary, SelectedFactResolutionSnapshot,
 };
-use super::fact_source::FactResolutionSource;
+use super::fact_source::{FactResolutionSource, language_callables_occupy_value_namespace};
 use super::typed_fact_lowering::LoweredTypedFragment;
 use super::{
     BindingFragmentId, FactReferenceSiteMetadata, MAX_REFERENCE_SEEDS_PER_BATCH, ResolutionAnswer,
@@ -196,6 +196,7 @@ fn reference_gap_domain(
     site_kind: ResolutionSiteKind,
 ) -> Option<FactReferenceEdgeGapDomain> {
     reference_gap_domain_for_receiver_dependency(
+        file.file().declaration_language(),
         namespace,
         site_kind,
         file.receiver_dependency(reference),
@@ -203,10 +204,19 @@ fn reference_gap_domain(
 }
 
 fn reference_gap_domain_for_receiver_dependency(
+    language: Language,
     namespace: ResolutionNamespace,
     site_kind: ResolutionSiteKind,
     receiver_dependency: Option<bool>,
 ) -> Option<FactReferenceEdgeGapDomain> {
+    // A bare value reference is a field occurrence, unless the language files
+    // its callables under the Value namespace too (Scala): then it can name a
+    // def, and an unresolved one cannot exclude the callable graph domain.
+    let value_domain = if language_callables_occupy_value_namespace(language) {
+        FactReferenceEdgeGapDomain::AnyGraphDeclaration
+    } else {
+        FactReferenceEdgeGapDomain::Field
+    };
     match namespace {
         ResolutionNamespace::Type
         | ResolutionNamespace::Callable
@@ -217,7 +227,7 @@ fn reference_gap_domain_for_receiver_dependency(
         ResolutionNamespace::Value if site_kind == ResolutionSiteKind::CallableReference => {
             Some(FactReferenceEdgeGapDomain::AnyGraphDeclaration)
         }
-        ResolutionNamespace::Value => Some(FactReferenceEdgeGapDomain::Field),
+        ResolutionNamespace::Value => Some(value_domain),
         ResolutionNamespace::Constant => Some(FactReferenceEdgeGapDomain::Field),
         ResolutionNamespace::Macro | ResolutionNamespace::Package => None,
         ResolutionNamespace::TypeOrValue
@@ -225,7 +235,7 @@ fn reference_gap_domain_for_receiver_dependency(
         {
             match receiver_dependency {
                 Some(true) => None,
-                Some(false) => Some(FactReferenceEdgeGapDomain::Field),
+                Some(false) => Some(value_domain),
                 None => Some(FactReferenceEdgeGapDomain::AnyGraphDeclaration),
             }
         }
@@ -346,6 +356,41 @@ fn select_graph_declaration(
     }
     if let Some(innermost_span) = candidates.iter().map(|(_, span)| *span).min() {
         candidates.retain(|(_, span)| *span == innermost_span);
+    }
+    if candidates.is_empty()
+        && definition.site.kind == ResolutionSiteKind::ConstructorDeclaration
+        && let Some(owner) = owner
+    {
+        // The class declares no constructor unit that contains this site. When
+        // it declares none at all, the site is the constructor the language
+        // supplies. The class declares that constructor itself and the graph
+        // has no node for it apart from the class, which is where a call that
+        // selects it leads.
+        for candidate in current_graph_declarations {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            if candidate.declaration.terminal_name() != definition.name
+                || !expected_graph_kind.matches(&candidate.declaration)
+            {
+                continue;
+            }
+            let Some(has_owner) = declaration_has_structured_owner(
+                analyzer,
+                &candidate.declaration,
+                owner,
+                cancellation,
+            )?
+            else {
+                return Ok(None);
+            };
+            if has_owner {
+                return Err(StoreError::new(format!(
+                    "the class declares a constructor that does not contain selected native definition in {file:?}: definition={definition:?}, owner={owner:?}, constructor={candidate:?}"
+                )));
+            }
+        }
+        return Ok(Some(owner.clone()));
     }
     if candidates.len() != 1 {
         return Err(StoreError::new(format!(
@@ -1221,6 +1266,7 @@ impl<'analyzer> FactReferenceEdgeCatalog<'analyzer> {
                         receiver_dependencies.insert(lowered.semantic());
                     }
                     let gap_domain = reference_gap_domain_for_receiver_dependency(
+                        lexical.language(),
                         expected.identifier.namespace,
                         expected.site.kind,
                         Some(receiver_dependency),
@@ -1232,7 +1278,21 @@ impl<'analyzer> FactReferenceEdgeCatalog<'analyzer> {
                         } else {
                             lookup_routes(expected.identifier.namespace)
                         };
-                        for &(_, namespace) in routes {
+                        // Lowering publishes such a language's callable under
+                        // the Value lookup as well (`language_callables_occupy_value_namespace`),
+                        // so a Value route also reaches the callables that
+                        // the catalog files under their own Callable lookup.
+                        let value_aliased_callables =
+                            (language_callables_occupy_value_namespace(lexical.language())
+                                && routes.iter().any(|&(_, namespace)| {
+                                    namespace == ResolutionNamespace::Value
+                                }))
+                            .then_some(ResolutionNamespace::Callable);
+                        for namespace in routes
+                            .iter()
+                            .map(|&(_, namespace)| namespace)
+                            .chain(value_aliased_callables)
+                        {
                             let domain = lookup_declaration_domain(namespace);
                             if gap_domain.affects(domain) {
                                 impacts.push(FactReferenceEdgeLookupImpact {

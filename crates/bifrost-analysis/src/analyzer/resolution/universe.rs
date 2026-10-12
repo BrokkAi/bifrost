@@ -3,8 +3,8 @@
 //! Universe entries are engine rules, not producer facts. A language's table
 //! is fixed and small; identities are interned through the active request only
 //! when an entry is actually needed. Go's table holds its predeclared types,
-//! values and builtin functions. Kotlin's holds the `kotlin` package types
-//! that the default imports bring into scope unqualified.
+//! values and builtin functions. Kotlin's and Scala's hold the default-imported
+//! value types, under the names their literals' intrinsic seeds use.
 
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
@@ -86,12 +86,13 @@ const fn go_value(spelling: &'static str) -> UniverseEntry {
     }
 }
 
-const fn kotlin_builtin_type(
+const fn jvm_builtin_type(
+    language: Language,
     spelling: &'static str,
     identity_spelling: &'static str,
 ) -> UniverseEntry {
     UniverseEntry {
-        language: Language::Kotlin,
+        language,
         spelling,
         identity_spelling,
         namespace: ResolutionNamespace::Type,
@@ -104,17 +105,24 @@ const fn java_builtin_type(
     spelling: &'static str,
     identity_spelling: &'static str,
 ) -> UniverseEntry {
-    UniverseEntry {
-        language: Language::Java,
-        spelling,
-        identity_spelling,
-        namespace: ResolutionNamespace::Type,
-        identity_kind: UniverseIdentityKind::Type(IntrinsicTypeKind::LanguageBuiltin),
-        range_type: None,
-    }
+    jvm_builtin_type(Language::Java, spelling, identity_spelling)
 }
 
 const JAVA_UNIVERSE: &[UniverseEntry] = &[java_builtin_type("String", "java.lang.String")];
+
+const fn kotlin_builtin_type(
+    spelling: &'static str,
+    identity_spelling: &'static str,
+) -> UniverseEntry {
+    jvm_builtin_type(Language::Kotlin, spelling, identity_spelling)
+}
+
+const fn scala_builtin_type(
+    spelling: &'static str,
+    identity_spelling: &'static str,
+) -> UniverseEntry {
+    jvm_builtin_type(Language::Scala, spelling, identity_spelling)
+}
 
 const KOTLIN_UNIVERSE: &[UniverseEntry] = &[
     kotlin_builtin_type("Boolean", "kotlin.Boolean"),
@@ -127,6 +135,25 @@ const KOTLIN_UNIVERSE: &[UniverseEntry] = &[
     kotlin_builtin_type("Short", "kotlin.Short"),
     kotlin_builtin_type("String", "java.lang.String"),
     kotlin_builtin_type("Unit", "kotlin.Unit"),
+];
+
+/// The Scala value types that the default `scala` package and `Predef` bring
+/// into scope unqualified, under the names a literal's intrinsic seed uses.
+/// `String` is `Predef.String`, an alias of `java.lang.String`. A declaration
+/// of the same spelling in a selected source scope takes precedence, because
+/// the table is consulted only after those scopes are exhausted.
+const SCALA_UNIVERSE: &[UniverseEntry] = &[
+    scala_builtin_type("Boolean", "scala.Boolean"),
+    scala_builtin_type("Byte", "scala.Byte"),
+    scala_builtin_type("Char", "scala.Char"),
+    scala_builtin_type("Double", "scala.Double"),
+    scala_builtin_type("Float", "scala.Float"),
+    scala_builtin_type("Int", "scala.Int"),
+    scala_builtin_type("Long", "scala.Long"),
+    scala_builtin_type("Null", "scala.Null"),
+    scala_builtin_type("Short", "scala.Short"),
+    scala_builtin_type("String", "java.lang.String"),
+    scala_builtin_type("Unit", "scala.Unit"),
 ];
 
 const GO_UNIVERSE: &[UniverseEntry] = &[
@@ -181,6 +208,7 @@ fn table(language: Language) -> &'static [UniverseEntry] {
         Language::Java => JAVA_UNIVERSE,
         Language::Go => GO_UNIVERSE,
         Language::Kotlin => KOTLIN_UNIVERSE,
+        Language::Scala => SCALA_UNIVERSE,
         _ => &[],
     }
 }

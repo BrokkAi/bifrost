@@ -21,8 +21,8 @@ use brokk_bifrost_core::analyzer::prepared_syntax::{
 
 use crate::analyzer::languages::language_support;
 use crate::analyzer::semantic_model::{
-    SemanticModelMemberTargetDisposition, SemanticModelOverlay, SemanticModelProvenance,
-    SemanticModelSymbolKind,
+    SemanticModelCompleteness, SemanticModelMemberTargetDisposition, SemanticModelOverlay,
+    SemanticModelProvenance, SemanticModelSymbolKind,
 };
 use crate::analyzer::usages::get_type::TypeLookupType;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, WorkspaceAnalyzer};
@@ -334,8 +334,9 @@ pub(crate) type ExternalClassCache =
     HashMap<(Language, Box<str>, Option<Box<str>>), Option<ClassIdentity>>;
 
 /// Resolve one external class from the active model after filtering by the
-/// requested language, owner-less class shape, and optional exact record ID.
-/// Uniqueness is decided only after those filters are applied.
+/// requested language and owner-less class shape. Eligible records with the
+/// same exact qualified name describe one class; complete surfaces and then
+/// the smallest ID choose its stable representative.
 pub(crate) fn external_class_identity(
     overlay: Option<&SemanticModelOverlay>,
     language: Language,
@@ -374,9 +375,40 @@ pub(crate) fn external_class_identity(
                 records = exact;
             }
         }
-        let [symbol] = records.as_slice() else {
+        let names = records
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        if names.len() != 1 {
             return None;
-        };
+        }
+        let group_name = *names.iter().next().expect("one eligible class name exists");
+        let group = overlay
+            .symbols_named(group_name)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.qualified_name == group_name
+                    && symbol.language == language.config_label()
+                    && symbol.owner_id.is_none()
+                    && symbol.kind == SemanticModelSymbolKind::Class
+                    && !symbol.provenance.ambiguous
+            })
+            .collect::<Vec<_>>();
+        if semantic_model_id.is_some()
+            && !group
+                .iter()
+                .any(|symbol| records.iter().any(|record| record.id == symbol.id))
+        {
+            return None;
+        }
+        let mut group = group;
+        group.sort_by(|left, right| {
+            (right.provenance.completeness == SemanticModelCompleteness::Complete)
+                .cmp(&(left.provenance.completeness == SemanticModelCompleteness::Complete))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let symbol = *group.first()?;
         Some(ClassIdentity::External {
             qualified_name: symbol.qualified_name.clone().into_boxed_str(),
             symbol_id: symbol.id.clone().into_boxed_str(),
@@ -427,38 +459,84 @@ pub(crate) fn external_member_lookup(
     owner_id: &str,
     member: &str,
 ) -> MemberLookup {
-    let matched = overlay.member_target_on_owner(owner_id, member);
-    match matched.disposition {
-        SemanticModelMemberTargetDisposition::Unique => {
-            MemberLookup::Present(MemberLookupHit::new(
-                MemberDeclaration::External(ExternalMemberDeclaration::new(
-                    matched
-                        .records
-                        .into_iter()
-                        .map(|record| Box::from(record.id.as_str())),
-                )),
-                CandidateCoverage::Exhaustive,
-            ))
-        }
-        SemanticModelMemberTargetDisposition::Conflict
-            if overlay.member_present_on_owner(owner_id, member) =>
-        {
-            MemberLookup::Present(MemberLookupHit::new(
-                MemberDeclaration::External(ExternalMemberDeclaration::new(
-                    matched
-                        .records
-                        .into_iter()
-                        .map(|record| Box::from(record.id.as_str())),
-                )),
-                CandidateCoverage::Exhaustive,
-            ))
-        }
-        SemanticModelMemberTargetDisposition::Absent => MemberLookup::Absent,
-        SemanticModelMemberTargetDisposition::Incomplete
-        | SemanticModelMemberTargetDisposition::Conflict => {
-            MemberLookup::Unknown(UnknownReason::PackIncomplete)
+    let matched = overlay.symbols_with_id(owner_id);
+    let [owner] = matched.records.as_slice() else {
+        return MemberLookup::Unknown(UnknownReason::PackIncomplete);
+    };
+    if owner.owner_id.is_some() || owner.kind != SemanticModelSymbolKind::Class {
+        return MemberLookup::Unknown(UnknownReason::PackIncomplete);
+    }
+    let owners = overlay
+        .symbols_named(&owner.qualified_name)
+        .records
+        .into_iter()
+        .filter(|candidate| {
+            candidate.qualified_name == owner.qualified_name
+                && candidate.language == owner.language
+                && candidate.owner_id.is_none()
+                && candidate.kind == SemanticModelSymbolKind::Class
+                && !candidate.provenance.ambiguous
+        })
+        .collect::<Vec<_>>();
+    let mut declarations = Vec::new();
+    let mut has_member_record = false;
+    let mut complete_surface = false;
+    let mut coverage_open = false;
+    for candidate in owners {
+        complete_surface |=
+            candidate.provenance.completeness == SemanticModelCompleteness::Complete;
+        let raw_members = overlay
+            .members_of(&candidate.id)
+            .records
+            .into_iter()
+            .filter(|record| {
+                record.owner_id.as_deref() == Some(candidate.id.as_str())
+                    && record.language == candidate.language
+                    && record.name == member
+            })
+            .collect::<Vec<_>>();
+        has_member_record |= !raw_members.is_empty();
+        let matched = overlay.member_target_on_owner(&candidate.id, member);
+        match matched.disposition {
+            SemanticModelMemberTargetDisposition::Unique => declarations.extend(matched.records),
+            SemanticModelMemberTargetDisposition::Conflict
+                if overlay.member_present_on_owner(&candidate.id, member) =>
+            {
+                declarations.extend(matched.records);
+                coverage_open = true;
+            }
+            SemanticModelMemberTargetDisposition::Absent => {}
+            SemanticModelMemberTargetDisposition::Incomplete
+            | SemanticModelMemberTargetDisposition::Conflict => coverage_open = true,
         }
     }
+    declarations.sort_by(|left, right| left.id.cmp(&right.id));
+    declarations.dedup_by(|left, right| left.id == right.id);
+    if !declarations.is_empty() {
+        return MemberLookup::Present(MemberLookupHit::new(
+            MemberDeclaration::External(ExternalMemberDeclaration::new(
+                declarations
+                    .into_iter()
+                    .map(|record| Box::from(record.id.as_str())),
+            )),
+            if coverage_open {
+                CandidateCoverage::Open
+            } else {
+                CandidateCoverage::Exhaustive
+            },
+        ));
+    }
+    if has_member_record {
+        return MemberLookup::Unknown(UnknownReason::PackIncomplete);
+    }
+    if !complete_surface
+        || overlay
+            .gapped_member_surface(&owner.qualified_name, member)
+            .is_some()
+    {
+        return MemberLookup::Unknown(UnknownReason::PackIncomplete);
+    }
+    MemberLookup::Absent
 }
 
 pub fn file_for_locator(

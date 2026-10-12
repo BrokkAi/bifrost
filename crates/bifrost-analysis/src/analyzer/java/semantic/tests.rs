@@ -4,7 +4,10 @@ use super::syntax::{
 };
 use super::*;
 use crate::analyzer::semantic::floating_value_for_test as floating;
+use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxSource};
+use crate::analyzer::{Language, LanguageDialect};
 use crate::test_support::procedure_named as method;
+use std::sync::Arc;
 
 fn parse_java(source: &str) -> tree_sitter::Tree {
     brokk_bifrost_jvm::java::declarations::parse_tree(source).expect("Java source must parse")
@@ -238,6 +241,75 @@ fn java_semantics(source: &str) -> std::sync::Arc<SemanticArtifact> {
         .expect("Java semantic artifact")
 }
 
+fn java_semantic_outcome(
+    source: &str,
+    limits: SemanticWork,
+) -> SemanticOutcome<Vec<ProcedureSemanticsParts>> {
+    let prepared = PreparedSyntaxTree::new(
+        PreparedSyntaxSource::Exact(Arc::from(source)),
+        parse_java(source),
+        crate::text_utils::compute_line_starts(source),
+        LanguageDialect::Standard(Language::Java),
+        PreparedSourceOrigin::Disk,
+        None,
+    );
+    let file = ProjectFile::new(std::env::temp_dir(), "semantic-java-budget.java");
+    let budget = SemanticBudget::new(limits).expect("test budget limits are positive");
+    let cancellation = CancellationToken::default();
+    JavaSemanticLowerer
+        .lower(&file, &prepared, &budget, &cancellation)
+        .expect("Java semantic lowering must report its bounded outcome")
+}
+
+#[test]
+fn synthetic_constructor_budget_failure_retains_pre_drive_composition_work() {
+    let uninitialized = java_semantic_outcome(
+        "class Fixture { int first; int second; }",
+        SemanticWork::default_limits(),
+    );
+    let SemanticOutcome::Complete {
+        work: baseline_work,
+        ..
+    } = uninitialized
+    else {
+        panic!("uninitialized synthetic constructor must complete");
+    };
+    assert!(baseline_work.program_points > 0);
+
+    // The first synthesized initializer entry fits. The second entry is
+    // allocated by schedule_field_initializers before the work driver runs,
+    // so this limit isolates the new pre-drive composition path.
+    let mut limits = SemanticWork::default_limits();
+    limits.program_points = baseline_work.program_points + 1;
+    let outcome = java_semantic_outcome("class Fixture { int first = 1; int second = 2; }", limits);
+    let SemanticOutcome::ExceededBudget { exceeded, work, .. } = outcome else {
+        panic!("second synthesized initializer entry must exhaust the point budget");
+    };
+    assert_eq!(exceeded.dimension(), SemanticBudgetDimension::ProgramPoints);
+    assert_eq!(work.program_points, baseline_work.program_points + 1);
+    assert!(work.program_points > 0);
+}
+
+#[test]
+fn written_constructor_default_store_budget_retains_pre_drive_work() {
+    let mut limits = SemanticWork::default_limits();
+    limits.memory_locations = 1;
+    let outcome = java_semantic_outcome(
+        "class Fixture { int first; int second; Fixture() {} }",
+        limits,
+    );
+    let SemanticOutcome::ExceededBudget { exceeded, work, .. } = outcome else {
+        panic!("the second distinct field store must exhaust the memory-location budget");
+    };
+    assert_eq!(
+        exceeded.dimension(),
+        SemanticBudgetDimension::MemoryLocations
+    );
+    assert_eq!(work.memory_locations, 1);
+    assert!(work.program_points > 0);
+    assert!(work.values > 0);
+}
+
 fn mapping_text<'s>(
     procedure: &ProcedureSemantics,
     source: &'s str,
@@ -247,6 +319,19 @@ fn mapping_text<'s>(
         &procedure.source_mappings()[mapping.index()],
         source,
     )
+}
+
+/// Constructor call sites anchor their callee value at the target token
+/// (`this`/`super`); arguments are separate IR values and are not part of
+/// that target identity.
+fn constructor_call_point(
+    procedure: &ProcedureSemantics,
+    source: &str,
+    target: &str,
+) -> Option<ProgramPointId> {
+    procedure.call_sites().iter().find_map(|call| {
+        (value_text(procedure, source, call.callee) == target).then_some(call.point)
+    })
 }
 
 #[test]
@@ -641,6 +726,141 @@ fn value_kind(procedure: &ProcedureSemantics, value: ValueId) -> SemanticValueKi
     procedure.values()[value.index()].kind.clone()
 }
 
+fn default_field_stores(
+    procedure: &ProcedureSemantics,
+    source: &str,
+) -> Vec<(String, (usize, usize), SemanticValueKind, ValueId)> {
+    let normal_reaches = |start: ProgramPointId, target: ProgramPointId| {
+        let mut visited = HashSet::default();
+        let mut pending = vec![start];
+        while let Some(point) = pending.pop() {
+            if point == target {
+                return true;
+            }
+            if visited.insert(point) {
+                pending.extend(
+                    procedure
+                        .successor_edges(point)
+                        .filter(|(_, edge)| edge.kind == ControlEdgeKind::Normal)
+                        .map(|(_, edge)| edge.target_point),
+                );
+            }
+        }
+        false
+    };
+    let mut stores = procedure
+        .points()
+        .iter()
+        .flat_map(|point| {
+            point
+                .events
+                .iter()
+                .enumerate()
+                .filter_map(move |(event_index, event)| {
+                    let SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Field,
+                        location,
+                        value,
+                    } = &event.effect
+                    else {
+                        return None;
+                    };
+                    let MemoryLocationKind::Field { base, member } =
+                        &procedure.memory_locations()[location.index()].kind
+                    else {
+                        panic!("field store must use a field location")
+                    };
+                    assert!(matches!(
+                        procedure.values()[base.index()].kind,
+                        SemanticValueKind::Receiver { dispatch: true }
+                    ));
+                    let span = member.anchor().span();
+                    let start = span.start_byte() as usize;
+                    let end = span.end_byte() as usize;
+                    Some((
+                        point.id,
+                        event_index,
+                        source[start..end].to_owned(),
+                        (start, end),
+                        value_kind(procedure, *value),
+                        *value,
+                    ))
+                })
+        })
+        .collect::<Vec<_>>();
+    for (point, _, _, _, _, _) in &stores {
+        assert!(
+            normal_reaches(procedure.entry_point(), *point),
+            "field store point {point:?} is unreachable from the constructor entry"
+        );
+    }
+    stores.sort_by(|left, right| {
+        if left.0 == right.0 {
+            return left.3.cmp(&right.3).then_with(|| left.1.cmp(&right.1));
+        }
+        if normal_reaches(left.0, right.0) {
+            std::cmp::Ordering::Less
+        } else if normal_reaches(right.0, left.0) {
+            std::cmp::Ordering::Greater
+        } else {
+            panic!(
+                "field store points are incomparable on the normal CFG: {:?} and {:?}",
+                left.0, right.0
+            );
+        }
+    });
+    stores
+        .into_iter()
+        .map(|(_, _, name, span, kind, value)| (name, span, kind, value))
+        .collect()
+}
+
+fn normal_cfg_reaches(
+    procedure: &ProcedureSemantics,
+    start: ProgramPointId,
+    target: ProgramPointId,
+) -> bool {
+    let mut visited = HashSet::default();
+    let mut pending = vec![start];
+    while let Some(point) = pending.pop() {
+        if point == target {
+            return true;
+        }
+        if visited.insert(point) {
+            pending.extend(
+                procedure
+                    .control_edges()
+                    .iter()
+                    .filter(|edge| {
+                        edge.source_point == point && edge.kind == ControlEdgeKind::Normal
+                    })
+                    .map(|edge| edge.target_point),
+            );
+        }
+    }
+    false
+}
+
+fn field_store_points(procedure: &ProcedureSemantics) -> Vec<(ProgramPointId, SemanticValueKind)> {
+    procedure
+        .points()
+        .iter()
+        .flat_map(|point| {
+            point.events.iter().filter_map(move |event| {
+                let SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    value,
+                    ..
+                } = &event.effect
+                else {
+                    return None;
+                };
+                Some((point.id, value_kind(procedure, *value)))
+            })
+        })
+        .collect()
+}
+
 /// The normalized shape of one guard, with its constant resolved to the
 /// published value kind.
 #[derive(Debug, PartialEq)]
@@ -910,4 +1130,777 @@ fn type_name_prefix_recognizes_qualified_stdlib_types() {
     );
     assert_eq!(java_type_name_prefix_len(&["inheritedField", "nested"]), 0);
     assert_eq!(java_type_name_prefix_len(&["Outer", "Inner"]), 2);
+}
+
+#[test]
+fn default_constructors_publish_source_backed_bodies_and_keep_execution_boundaries() {
+    for (source, complete) in [
+        ("class Fixture {}", true),
+        ("class Fixture { static class Nested {} }", true),
+        ("class Fixture extends Base {} class Base {}", false),
+        (
+            "class Fixture implements Action {} interface Action { default void run() {} }",
+            false,
+        ),
+        (
+            "class Fixture { int value = compute(); int compute() { return 1; } }",
+            false,
+        ),
+        ("class Fixture { int value; }", true),
+        ("class Fixture { { compute(); } void compute() {} }", false),
+        (
+            "class Fixture { static { compute(); } static void compute() {} }",
+            false,
+        ),
+        ("class Outer { class Fixture {} }", false),
+        ("class Outer { void run() { class Fixture {} } }", false),
+    ] {
+        let artifact = java_semantics(source);
+        let constructor = method(&artifact, "Fixture");
+        assert_eq!(constructor.kind(), ProcedureKind::Constructor, "{source}");
+        assert!(constructor.properties().is_synthetic, "{source}");
+        assert_eq!(
+            constructor.properties().construction_return,
+            ConstructionReturn::PreservesAllocation
+        );
+        assert_eq!(
+            constructor.gaps().is_empty(),
+            complete,
+            "{source}: {:?}",
+            constructor.gaps()
+        );
+    }
+    let interface = java_semantics(
+        "class Fixture implements Action {} interface Action { default void run() {} }",
+    );
+    assert!(method(&interface, "Fixture").gaps().iter().any(|gap| {
+        gap.capability == SemanticCapability::DeferredExecution
+            && gap.impacts == SemanticGapImpacts::CALL_EVALUATION
+    }));
+    let artifact = java_semantics("class Fixture { Fixture() {} void run() {} }");
+    let constructors = artifact
+        .procedures()
+        .iter()
+        .filter(|procedure| procedure.kind() == ProcedureKind::Constructor)
+        .collect::<Vec<_>>();
+    assert_eq!(constructors.len(), 1);
+    assert!(!constructors[0].properties().is_synthetic);
+    assert!(method(&artifact, "run").lexical_parent().is_none());
+}
+
+#[test]
+fn explicit_constructor_emits_defaults_and_retains_only_uncomposed_gap() {
+    let source = "class Fixture { int initialized = 1; int plain; Fixture() { super(); } }";
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    assert_eq!(constructor.kind(), ProcedureKind::Constructor);
+    assert!(!constructor.properties().is_synthetic);
+    assert_eq!(
+        default_field_stores(constructor, source)
+            .into_iter()
+            .map(|(name, _, _, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["initialized".to_owned(), "plain".to_owned()]
+    );
+    assert_eq!(
+        constructor
+            .gaps()
+            .iter()
+            .filter(|gap| {
+                gap.capability == SemanticCapability::DeferredExecution
+                    && gap.impacts == SemanticGapImpacts::CALL_EVALUATION
+                    && gap.kind == SemanticGapKind::Unsupported
+                    && gap.subject == SemanticGapSubject::Procedure
+            })
+            .count(),
+        1
+    );
+
+    for source in [
+        "class Fixture { int plain; Fixture() { super(); } }",
+        "class Fixture { int plain; Fixture() { plain = 1; } }",
+    ] {
+        let artifact = java_semantics(source);
+        let constructor = method(&artifact, "Fixture");
+        assert_eq!(constructor.kind(), ProcedureKind::Constructor, "{source}");
+        assert!(!constructor.properties().is_synthetic, "{source}");
+        assert_eq!(
+            default_field_stores(constructor, source)
+                .into_iter()
+                .map(|(name, _, _, _)| name)
+                .next(),
+            Some("plain".into()),
+            "{source}"
+        );
+        assert!(
+            !constructor.gaps().iter().any(|gap| {
+                gap.capability == SemanticCapability::DeferredExecution
+                    && gap.impacts == SemanticGapImpacts::CALL_EVALUATION
+                    && gap.kind == SemanticGapKind::Unsupported
+                    && gap.subject == SemanticGapSubject::Procedure
+            }),
+            "{source}: {:?}",
+            constructor.gaps()
+        );
+    }
+
+    let source = "class Fixture { { setup(); } int plain; Fixture() { super(); } void setup() {} }";
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    assert_eq!(default_field_stores(constructor, source).len(), 1);
+    assert!(constructor.gaps().iter().any(|gap| {
+        gap.capability == SemanticCapability::DeferredExecution
+            && gap.impacts == SemanticGapImpacts::CALL_EVALUATION
+            && gap.kind == SemanticGapKind::Unsupported
+            && gap.subject == SemanticGapSubject::Procedure
+    }));
+}
+
+#[test]
+fn explicit_constructor_defaults_follow_normal_cfg_before_super_and_body_write() {
+    let source = "class Base { Base() {} Base(int seed) {} } class Fixture extends Base { int value; Fixture() { super(7); value = 1; } }";
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    let stores = field_store_points(constructor);
+    let default_point = stores
+        .iter()
+        .find(|(_, kind)| matches!(kind, SemanticValueKind::UnsignedInteger(0)))
+        .map(|(point, _)| *point)
+        .expect("default field store");
+    let body_point = stores
+        .iter()
+        .find(|(_, kind)| matches!(kind, SemanticValueKind::Constant))
+        .map(|(point, _)| *point)
+        .expect("constructor body field write");
+    let super_point =
+        constructor_call_point(constructor, source, "super").expect("explicit super callee anchor");
+    assert!(normal_cfg_reaches(constructor, default_point, super_point));
+    assert!(normal_cfg_reaches(constructor, super_point, body_point));
+    assert!(!normal_cfg_reaches(constructor, body_point, super_point));
+}
+
+#[test]
+fn explicit_constructor_implicit_super_runs_after_default_store() {
+    let source = "class Fixture { int value; Fixture() { value = 1; } }";
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    let stores = field_store_points(constructor);
+    let default_point = stores
+        .iter()
+        .find(|(_, kind)| matches!(kind, SemanticValueKind::UnsignedInteger(0)))
+        .map(|(point, _)| *point)
+        .expect("default field store");
+    let body_point = stores
+        .iter()
+        .find(|(_, kind)| matches!(kind, SemanticValueKind::Constant))
+        .map(|(point, _)| *point)
+        .expect("constructor body field write");
+    let implicit_gaps = constructor
+        .gaps()
+        .iter()
+        .filter(|gap| {
+            gap.capability == SemanticCapability::Calls
+                && gap.subject == SemanticGapSubject::Point
+                && gap.detail.as_ref()
+                    == "implicit super-constructor invocation is not yet represented as a call site"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(implicit_gaps.len(), 1);
+    let super_gap = implicit_gaps[0];
+    assert!(normal_cfg_reaches(
+        constructor,
+        constructor.entry_point(),
+        default_point
+    ));
+    assert!(normal_cfg_reaches(
+        constructor,
+        default_point,
+        super_gap.point
+    ));
+    assert!(normal_cfg_reaches(constructor, super_gap.point, body_point));
+    assert!(constructor.control_edges().iter().any(|edge| {
+        edge.source_point == super_gap.point && edge.kind == ControlEdgeKind::Exceptional
+    }));
+}
+
+#[test]
+fn synthetic_constructor_superclass_gap_follows_defaults_and_has_exception_edge() {
+    let source = "class Base { Base() {} } class Fixture extends Base { int value; }";
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    assert!(constructor.properties().is_synthetic);
+    let default_point = field_store_points(constructor)
+        .into_iter()
+        .find(|(_, kind)| matches!(kind, SemanticValueKind::UnsignedInteger(0)))
+        .map(|(point, _)| point)
+        .expect("synthetic default field store");
+    let superclass_gaps = constructor
+        .gaps()
+        .iter()
+        .filter(|gap| {
+            gap.capability == SemanticCapability::Calls
+                && gap.subject == SemanticGapSubject::Point
+                && gap.detail.as_ref()
+                    == "default constructor superclass invocation is not yet modeled"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(superclass_gaps.len(), 1);
+    let superclass_gap = superclass_gaps[0];
+    assert_eq!(superclass_gap.impacts, SemanticGapImpacts::CALL_EVALUATION);
+    assert_ne!(superclass_gap.point, constructor.entry_point());
+    assert!(
+        constructor
+            .successor_edges(constructor.entry_point())
+            .any(|(_, edge)| {
+                edge.kind == ControlEdgeKind::Normal && edge.target_point == default_point
+            })
+    );
+    assert!(normal_cfg_reaches(
+        constructor,
+        default_point,
+        superclass_gap.point
+    ));
+    assert!(normal_cfg_reaches(
+        constructor,
+        superclass_gap.point,
+        constructor.normal_exit_point()
+    ));
+    assert!(constructor.control_edges().iter().any(|edge| {
+        edge.source_point == superclass_gap.point && edge.kind == ControlEdgeKind::Exceptional
+    }));
+}
+
+#[test]
+fn explicit_constructor_default_locator_ignores_parameter_shadowing() {
+    let source = "class Fixture { int value; Fixture(int value) { super(); } }";
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    assert_eq!(
+        default_field_stores(constructor, source)
+            .into_iter()
+            .map(|(name, _, kind, _)| (name, kind))
+            .collect::<Vec<_>>(),
+        vec![("value".into(), SemanticValueKind::UnsignedInteger(0))]
+    );
+    assert!(!constructor.gaps().iter().any(|gap| {
+        gap.capability == SemanticCapability::FieldMemory
+            && gap.kind == SemanticGapKind::Unsupported
+    }));
+}
+
+#[test]
+fn delegating_constructor_does_not_reset_target_default_stores() {
+    let source = "class Fixture { int value; Fixture() { /* delegate */ this(1); } Fixture(int value) { /* superclass */ super(); } }";
+    let artifact = java_semantics(source);
+    let constructors = artifact
+        .procedures()
+        .iter()
+        .filter(|procedure| procedure.kind() == ProcedureKind::Constructor)
+        .collect::<Vec<_>>();
+    let delegating = constructors
+        .iter()
+        .copied()
+        .find(|procedure| constructor_call_point(procedure, source, "this").is_some())
+        .expect("delegating constructor");
+    let target = constructors
+        .iter()
+        .copied()
+        .find(|procedure| constructor_call_point(procedure, source, "super").is_some())
+        .expect("nondelegating target constructor");
+    assert!(default_field_stores(delegating, source).is_empty());
+    assert_eq!(default_field_stores(target, source).len(), 1);
+    assert!(!delegating.gaps().iter().any(|gap| {
+        gap.capability == SemanticCapability::DeferredExecution
+            && gap.impacts == SemanticGapImpacts::CALL_EVALUATION
+            && gap.kind == SemanticGapKind::Unsupported
+            && gap.subject == SemanticGapSubject::Procedure
+    }));
+}
+
+#[test]
+fn explicit_constructor_reference_field_defaults_to_null_without_resolution() {
+    let source = "class Fixture { Missing value; Fixture() { super(); } }";
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    assert_eq!(
+        default_field_stores(constructor, source)
+            .into_iter()
+            .map(|(name, _, kind, _)| (name, kind))
+            .collect::<Vec<_>>(),
+        vec![("value".into(), SemanticValueKind::Null)]
+    );
+    assert!(!constructor.gaps().iter().any(|gap| {
+        gap.capability == SemanticCapability::FieldMemory
+            && gap.kind == SemanticGapKind::Unsupported
+            && matches!(gap.subject, SemanticGapSubject::Value(_))
+    }));
+}
+
+#[test]
+fn explicit_constructor_without_fields_keeps_existing_gap_shape() {
+    let source = "class Fixture { Fixture() { super(); } }";
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    assert!(default_field_stores(constructor, source).is_empty());
+    assert!(!constructor.gaps().iter().any(|gap| {
+        gap.capability == SemanticCapability::DeferredExecution
+            && gap.impacts == SemanticGapImpacts::CALL_EVALUATION
+            && gap.kind == SemanticGapKind::Unsupported
+            && gap.subject == SemanticGapSubject::Procedure
+    }));
+}
+
+#[test]
+fn explicit_enum_and_record_constructors_do_not_panic_on_class_guard() {
+    let enum_artifact = java_semantics("enum Fixture { A; Fixture() { } }");
+    assert!(
+        enum_artifact
+            .procedures()
+            .iter()
+            .any(|procedure| procedure.kind() == ProcedureKind::Constructor)
+    );
+
+    let record_artifact = java_semantics("record Fixture(int value) { Fixture { } }");
+    assert!(
+        record_artifact
+            .procedures()
+            .iter()
+            .any(|procedure| procedure.kind() == ProcedureKind::Constructor)
+    );
+}
+
+#[test]
+fn explicit_nested_constructor_defaults_keep_field_declaration_boundary() {
+    let source = "class Outer { int outer; class Inner { int inner; Inner() { super(); } } }";
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Inner");
+    assert_eq!(
+        default_field_stores(constructor, source)
+            .into_iter()
+            .map(|(name, _, _, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["inner".to_owned()]
+    );
+}
+
+fn only_lambda_creation(procedure: &ProcedureSemantics) -> (ProcedureId, Option<AllocationId>) {
+    let creations = procedure
+        .points()
+        .iter()
+        .flat_map(|point| &point.events)
+        .filter_map(|event| {
+            let SemanticEffect::CallableCreation { callable, .. } = &event.effect else {
+                return None;
+            };
+            assert_eq!(callable.kind, CallableReferenceKind::Lambda);
+            let CallableTargetResolution::Proven(CallableTarget::Local(target)) = &callable.targets
+            else {
+                panic!("lambda creation must have a proven local target: {callable:?}");
+            };
+            Some((*target, callable.environment))
+        })
+        .collect::<Vec<_>>();
+    let [creation] = creations.as_slice() else {
+        panic!("expected one lambda creation, found {creations:?}");
+    };
+    *creation
+}
+
+#[test]
+fn synthetic_default_constructor_owns_non_capturing_instance_field_lambda() {
+    let source = r#"
+        import java.util.function.Supplier;
+        class Fixture {
+            Supplier<Integer> value = () -> 1;
+            void run() {}
+        }
+    "#;
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    assert_eq!(constructor.kind(), ProcedureKind::Constructor);
+    assert!(constructor.properties().is_synthetic);
+
+    let (target, environment) = only_lambda_creation(constructor);
+    assert!(environment.is_none());
+    let lambda = artifact
+        .procedure(target)
+        .expect("instance field lambda target");
+    assert_eq!(lambda.kind(), ProcedureKind::Lambda);
+    assert_eq!(lambda.lexical_parent(), Some(constructor.id()));
+    assert_eq!(
+        artifact
+            .procedures()
+            .iter()
+            .filter(|procedure| procedure.kind() == ProcedureKind::Lambda)
+            .count(),
+        1
+    );
+    assert!(
+        artifact
+            .procedures()
+            .iter()
+            .all(|procedure| procedure.kind() != ProcedureKind::Initializer)
+    );
+
+    let run = method(&artifact, "run");
+    assert_eq!(run.kind(), ProcedureKind::Method);
+    assert!(run.lexical_parent().is_none());
+    assert_ne!(run.id(), constructor.id());
+}
+
+#[test]
+fn synthetic_default_constructor_owns_capturing_instance_field_lambda() {
+    let source = r#"
+        class Fixture {
+            Runnable action = () -> this.run();
+            void run() {}
+        }
+    "#;
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    assert_eq!(constructor.kind(), ProcedureKind::Constructor);
+    assert!(constructor.properties().is_synthetic);
+
+    let (target, environment) = only_lambda_creation(constructor);
+    assert!(environment.is_some());
+    let lambda = artifact
+        .procedure(target)
+        .expect("capturing instance field lambda target");
+    assert_eq!(lambda.kind(), ProcedureKind::Lambda);
+    assert_eq!(lambda.lexical_parent(), Some(constructor.id()));
+    let [capture] = constructor.captures() else {
+        panic!("receiver capture: {:?}", constructor.captures());
+    };
+    assert_eq!(capture.target, lambda.id());
+    assert_eq!(capture.mode, CaptureMode::Value);
+    let location = lambda
+        .memory_location(capture.destination)
+        .expect("receiver capture destination");
+    let MemoryLocationKind::Capture {
+        lexical_parent,
+        binding: None,
+    } = &location.kind
+    else {
+        panic!("receiver capture location: {:?}", location.kind);
+    };
+    assert_eq!(*lexical_parent, constructor.id());
+    assert_eq!(
+        artifact
+            .procedures()
+            .iter()
+            .filter(|procedure| procedure.kind() == ProcedureKind::Lambda)
+            .count(),
+        1
+    );
+    assert!(
+        artifact
+            .procedures()
+            .iter()
+            .all(|procedure| procedure.kind() != ProcedureKind::Initializer)
+    );
+
+    let run = method(&artifact, "run");
+    assert_eq!(run.kind(), ProcedureKind::Method);
+    assert!(run.lexical_parent().is_none());
+    assert_ne!(run.id(), constructor.id());
+
+    let boundary = java_semantics(
+        "class Boundary { static Runnable shared = () -> {}; Runnable value = () -> {}; Boundary() {} }",
+    );
+    let explicit_constructor = boundary
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == ProcedureKind::Constructor && !procedure.properties().is_synthetic
+        })
+        .expect("written constructor");
+    let initializer_lambdas = boundary
+        .procedures()
+        .iter()
+        .filter(|procedure| procedure.kind() == ProcedureKind::Initializer)
+        .map(|initializer| {
+            let (target, _) = only_lambda_creation(initializer);
+            let lambda = boundary
+                .procedure(target)
+                .expect("initializer lambda target");
+            assert_eq!(lambda.lexical_parent(), Some(initializer.id()));
+            lambda.id()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(initializer_lambdas.len(), 2);
+    assert!(
+        explicit_constructor
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .all(|event| !matches!(
+                event.effect,
+                SemanticEffect::CallableCreation {
+                    callable: CallableValue {
+                        kind: CallableReferenceKind::Lambda,
+                        ..
+                    },
+                    ..
+                }
+            ))
+    );
+}
+
+#[test]
+fn synthetic_default_constructor_stores_typed_jls_defaults_without_locals() {
+    let source = r#"
+        class Fixture {
+            byte signedByte;
+            short signedShort;
+            int count;
+            long total;
+            char letter;
+            boolean ready;
+            float ratio;
+            double scale;
+            Integer boxed;
+            int[] primitiveArray;
+            Integer[] boxedArray;
+            String label;
+            static int shared;
+            static class Nested {
+                long nestedCount;
+                Object nestedObject;
+                static boolean ignored;
+            }
+        }
+    "#;
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    let positive_zero = SemanticValueKind::FloatingPoint {
+        bits: 0.0_f64.to_bits(),
+    };
+    assert_eq!(
+        default_field_stores(constructor, source)
+            .into_iter()
+            .map(|(name, _, kind, _)| (name, kind))
+            .collect::<Vec<_>>(),
+        vec![
+            ("signedByte".into(), SemanticValueKind::UnsignedInteger(0)),
+            ("signedShort".into(), SemanticValueKind::UnsignedInteger(0)),
+            ("count".into(), SemanticValueKind::UnsignedInteger(0)),
+            ("total".into(), SemanticValueKind::UnsignedInteger(0)),
+            ("letter".into(), SemanticValueKind::UnsignedInteger(0)),
+            ("ready".into(), SemanticValueKind::Boolean(false)),
+            ("ratio".into(), positive_zero.clone()),
+            ("scale".into(), positive_zero),
+            ("boxed".into(), SemanticValueKind::Null),
+            ("primitiveArray".into(), SemanticValueKind::Null),
+            ("boxedArray".into(), SemanticValueKind::Null),
+            ("label".into(), SemanticValueKind::Null),
+        ]
+    );
+    assert!(
+        constructor
+            .values()
+            .iter()
+            .all(|value| !matches!(value.kind, SemanticValueKind::Local))
+    );
+
+    let nested = method(&artifact, "Nested");
+    assert_eq!(
+        default_field_stores(nested, source)
+            .into_iter()
+            .map(|(name, _, kind, _)| (name, kind))
+            .collect::<Vec<_>>(),
+        vec![
+            ("nestedCount".into(), SemanticValueKind::UnsignedInteger(0)),
+            ("nestedObject".into(), SemanticValueKind::Null),
+        ]
+    );
+    assert!(
+        nested
+            .values()
+            .iter()
+            .all(|value| !matches!(value.kind, SemanticValueKind::Local))
+    );
+}
+
+#[test]
+fn synthetic_default_constructor_keeps_declarator_and_owner_field_identity() {
+    let source = r#"
+        class Fixture {
+            int value, sibling;
+            String label;
+            static int ignored;
+            void run() { int value = 1; }
+            static class Nested { int value; }
+        }
+    "#;
+    let artifact = java_semantics(source);
+    let fixture = method(&artifact, "Fixture");
+    let fixture_stores = default_field_stores(fixture, source);
+    assert_eq!(
+        fixture_stores
+            .iter()
+            .map(|(name, _, _, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["value", "sibling", "label"]
+    );
+    assert!(
+        fixture
+            .values()
+            .iter()
+            .all(|value| !matches!(value.kind, SemanticValueKind::Local))
+    );
+
+    let nested = method(&artifact, "Nested");
+    let nested_stores = default_field_stores(nested, source);
+    assert_eq!(nested_stores.len(), 1);
+    assert_eq!(nested_stores[0].0, "value");
+    assert_ne!(fixture_stores[0].1, nested_stores[0].1);
+}
+
+#[test]
+fn synthetic_default_constructor_orders_defaults_before_instance_initializers() {
+    let source = r#"
+        class Fixture {
+            int value = 1;
+            Integer boxed = new Integer(2);
+            String spare = "";
+        }
+    "#;
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    let stores = default_field_stores(constructor, source);
+    assert_eq!(
+        stores
+            .iter()
+            .map(|(name, _, kind, _)| (name.as_str(), kind.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("value", SemanticValueKind::UnsignedInteger(0)),
+            ("boxed", SemanticValueKind::Null),
+            ("spare", SemanticValueKind::Null),
+            ("value", SemanticValueKind::Constant),
+            ("boxed", SemanticValueKind::Temporary),
+            ("spare", SemanticValueKind::Constant),
+        ]
+    );
+    assert_eq!(value_text(constructor, source, stores[3].3), "1");
+    assert!(
+        constructor
+            .values()
+            .iter()
+            .all(|value| !matches!(value.kind, SemanticValueKind::Local))
+    );
+}
+
+#[test]
+fn synthetic_default_constructor_retains_field_memory_gap_for_ambiguous_locator() {
+    let source = "class Fixture { int value; int value; }";
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    assert!(default_field_stores(constructor, source).is_empty());
+    let field_gaps = constructor
+        .gaps()
+        .iter()
+        .filter(|gap| {
+            gap.capability == SemanticCapability::FieldMemory
+                && gap.kind == SemanticGapKind::Unsupported
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(field_gaps.len(), 2);
+    assert!(
+        field_gaps
+            .iter()
+            .all(|gap| matches!(gap.subject, SemanticGapSubject::Value(_)))
+    );
+    assert_eq!(
+        field_gaps
+            .iter()
+            .map(|gap| &gap.subject)
+            .collect::<HashSet<_>>()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn default_constructor_owns_the_type_anchor_and_preserves_distinct_typed_gaps() {
+    let source = "class Outer { class Fixture extends Base { int value = 1; String label; static int shared; { setup(); } void setup() {} void run() {} } } class Base {}";
+    let artifact = java_semantics(source);
+    let constructor = method(&artifact, "Fixture");
+    let stores = default_field_stores(constructor, source);
+    assert_eq!(
+        stores
+            .iter()
+            .map(|(name, _, kind, _)| (name.as_str(), kind.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("value", SemanticValueKind::UnsignedInteger(0)),
+            ("label", SemanticValueKind::Null),
+            ("value", SemanticValueKind::Constant),
+        ]
+    );
+    assert_eq!(value_text(constructor, source, stores[2].3), "1");
+    assert!(!constructor.values().iter().any(|value| {
+        value.kind == SemanticValueKind::Local
+            && ["value", "label"].contains(&value_text(constructor, source, value.id))
+    }));
+    let locator = constructor.locator();
+    let segments = locator.declaration().segments();
+    assert_eq!(
+        segments.last().unwrap().kind(),
+        DeclarationSegmentKind::Constructor
+    );
+    assert_eq!(
+        segments[segments.len() - 2].kind(),
+        DeclarationSegmentKind::Type
+    );
+    assert_eq!(segments.last().unwrap().name(), Some("Fixture"));
+    let tree = parse_java(source);
+    let inner = first_kind(tree.root_node(), "class_body")
+        .named_child(0)
+        .unwrap();
+    assert_eq!(
+        locator.anchor().span().start_byte() as usize,
+        inner.start_byte()
+    );
+    assert_eq!(
+        locator.anchor().span().end_byte() as usize,
+        inner.end_byte()
+    );
+    assert!(method(&artifact, "run").lexical_parent().is_none());
+    let caps = constructor
+        .gaps()
+        .iter()
+        .map(|gap| gap.capability)
+        .collect::<HashSet<_>>();
+    let expected_caps = [
+        SemanticCapability::Calls,
+        SemanticCapability::DeferredExecution,
+        SemanticCapability::FieldMemory,
+        SemanticCapability::Captures,
+    ]
+    .into_iter()
+    .collect::<HashSet<_>>();
+    assert_eq!(constructor.gaps().len(), expected_caps.len());
+    assert_eq!(caps, expected_caps);
+    assert!(
+        constructor
+            .gaps()
+            .iter()
+            .all(|gap| gap.impacts != SemanticGapImpacts::NONE)
+    );
+    assert!(constructor.gaps().iter().any(|gap| {
+        gap.capability == SemanticCapability::DeferredExecution
+            && gap.impacts == SemanticGapImpacts::CALL_EVALUATION
+    }));
+    assert!(constructor.gaps().iter().any(|gap| {
+        gap.capability == SemanticCapability::FieldMemory
+            && gap.impacts == SemanticGapImpacts::DEFERRED_EFFECTS
+    }));
+    let malformed = java_semantics("class Fixture { void broken( }");
+    assert!(
+        malformed
+            .procedures()
+            .iter()
+            .all(|p| !p.properties().is_synthetic)
+    );
 }

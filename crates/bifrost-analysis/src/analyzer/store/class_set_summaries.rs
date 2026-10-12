@@ -550,7 +550,7 @@ pub fn class_set_summary_output_digest(
     exits: &[ClassSetSummaryExitRow],
     reached: &[ClassSetSummaryReachedRow],
 ) -> Result<ClassSetSummaryOutputDigest> {
-    const OUTPUT_DOMAIN: &[u8] = b"bifrost-class-set-summary-output-v1";
+    const OUTPUT_DOMAIN: &[u8] = b"bifrost-class-set-summary-output-v2";
     const EXIT_DOMAIN: &[u8] = b"bifrost-class-set-summary-exit-output-v1";
     const REACHED_DOMAIN: &[u8] = b"bifrost-class-set-summary-reached-output-v1";
 

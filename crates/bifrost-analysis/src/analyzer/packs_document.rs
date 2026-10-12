@@ -5,7 +5,7 @@
 //! document is absent, the host uses the ambient default of every ecosystem
 //! serving a language present in the workspace. A present document with an
 //! empty `ecosystems` list explicitly disables that dependency-pack route.
-//! The CLI policy runner, the MCP host, and the LSP host all read this one
+//! The CLI policy runner and the MCP host both read this one
 //! document, so every entry point applies the same dependency-pack selection
 //! (#1868). A host may separately request the reviewed shipped packs selected
 //! by intrinsic language evidence.
@@ -364,7 +364,9 @@ impl WorkspacePacksConfig {
     }
 
     /// Workspace-relative semantic-pack catalog root, when configured.
-    /// Absent means the activation uses an ephemeral catalog.
+    /// When absent, activation uses the default versioned cache catalog for a
+    /// persisted analyzer or an explicit cache relocation, and an ephemeral
+    /// catalog otherwise.
     pub fn catalog(&self) -> Option<&Path> {
         self.catalog.as_deref()
     }
@@ -375,9 +377,9 @@ impl WorkspacePacksConfig {
         &self.ecosystems
     }
 
-    /// Pack ids the workspace opts into activating. Every shipped pack sets
-    /// `safety.review_required = true`, so a pack stays selected but inactive
-    /// until its id is named here (#1937).
+    /// Pack ids the workspace opts into activating. A pack that sets
+    /// `safety.review_required = true` stays selected but inactive until its id
+    /// is named here (#1937).
     pub fn enable(&self) -> &[String] {
         &self.enable
     }
@@ -972,8 +974,8 @@ fn workspace_activation_prelude(
     {
         return Ok(None);
     }
-    // Every shipped pack declares `safety.review_required`, so activation
-    // needs an explicit compatible `Enable` control keyed by pack id --
+    // A pack declaring `safety.review_required` needs an explicit compatible
+    // `Enable` control keyed by pack id --
     // matching evidence alone leaves it selected but inactive
     // (`ReviewRequired`). The document's `enable` list is that control,
     // matching the in-process control build in `owasp_benchmark.rs` (#1937).
@@ -1028,7 +1030,7 @@ fn workspace_activation_prelude(
 
 /// Resolve the dependency ecosystems one host will attempt for this analyzer.
 ///
-/// Keeping this projection beside the activation transaction lets MCP and LSP
+/// Keeping this projection beside the activation transaction lets hosts
 /// retain an exact attempted set even when catalog opening or activation fails.
 pub fn workspace_pack_ecosystems(
     workspace: &WorkspaceAnalyzer,

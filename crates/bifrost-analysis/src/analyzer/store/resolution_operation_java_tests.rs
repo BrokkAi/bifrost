@@ -2178,9 +2178,9 @@ fn selected_java_inheritance_metadata_uses_indexed_source_rows_and_honors_cancel
             .filter(|row| row.role() == LoweredSemanticRole::Definition)
             .map(|row| row.semantic())
             .collect::<Vec<_>>();
-        assert_eq!(definitions.len(), 514);
+        assert_eq!(definitions.len(), 515);
         let typed = operation.ready.typed_source();
-        for count in [1, 256, 514] {
+        for count in [1, 256, 515] {
             let rows = typed
                 .java_inheritance_declarations(&definitions[..count], &cancellation)
                 .unwrap()
@@ -2244,6 +2244,29 @@ fn selected_java_inheritance_metadata_uses_indexed_source_rows_and_honors_cancel
                     "selected metadata must seek {alias} with {statistics}: {plan:#?}"
                 );
             }
+            let synthetic_plan = explain_pin(
+                operation.ready.inventory.connection(),
+                &pinned("java_synthetic_type_bodies"),
+            );
+            for alias in [
+                "mount", "interior", "semantic", "scope", "source", "meta", "bridge",
+            ] {
+                assert!(
+                    synthetic_plan
+                        .iter()
+                        .any(|detail| detail.starts_with(&format!("SEARCH {alias} "))),
+                    "synthetic Java type bodies must seek {alias} with {statistics}: {synthetic_plan:#?}"
+                );
+            }
+            assert!(
+                synthetic_plan
+                    .iter()
+                    .all(|detail| !detail.contains("AUTOMATIC")
+                        && !detail.contains("TEMP B-TREE")
+                        && !detail.contains("CO-ROUTINE")
+                        && (!detail.starts_with("SCAN ") || detail == "SCAN request")),
+                "{statistics}: {synthetic_plan:#?}"
+            );
             // The canonical metadata view checks agreement of source
             // visibility values for one indexed unit. Its DISTINCT set is
             // bounded by the visibility enum; it does not sort workspace rows.
@@ -2270,7 +2293,7 @@ fn selected_java_inheritance_metadata_uses_indexed_source_rows_and_honors_cancel
                 .unwrap()
                 .unwrap()
                 .len(),
-            514
+            515
         );
     }
 }

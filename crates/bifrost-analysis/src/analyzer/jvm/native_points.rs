@@ -13,9 +13,10 @@ use crate::analyzer::store::Result;
 use crate::analyzer::store::resolution_operation::{JvmImportContext, SelectedResolutionOperation};
 use crate::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 use crate::analyzer::usages::get_definition::{
-    BoundedResolution, ClaimSubjectRole, DefinitionLookupDiagnostic, DefinitionLookupOutcome,
-    DefinitionLookupStatus, ResolvedReferenceSite, UnindexedClaim, boundary_unchecked,
-    candidates_outcome, kotlin_import_model_outcome, no_definition,
+    BoundedResolution, ClaimSubjectRole, DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
+    DefinitionLookupDiagnostic, DefinitionLookupOutcome, DefinitionLookupStatus,
+    ResolvedReferenceSite, UnindexedClaim, boundary_unchecked, candidates_outcome,
+    kotlin_import_model_outcome, no_definition,
 };
 use crate::analyzer::usages::get_type::TypeLookupOutcome;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisWork;
@@ -109,7 +110,11 @@ impl StructuralReceiverResolver for JvmNativeRolloutPoints {
                     query,
                     || {},
                 );
-                project_scala_external_boundary(scala, query, resolution)
+                project_scala_external_boundary(
+                    scala,
+                    query,
+                    project_scala_declaration_site(query, resolution),
+                )
             }
             language => unreachable!("JVM native point query has a non-JVM language: {language:?}"),
         }
@@ -517,6 +522,96 @@ fn project_kotlin_external_boundary(
     BoundedResolution::Complete { value, work }
 }
 
+/// A bare spelling in the Scala universe (`Int`, `String`) that no selected
+/// source scope declares resolves to a language builtin identity. That identity
+/// has no source unit, so the native answer is unavailable for want of a
+/// projection. It names a type outside the indexed workspace, so the external
+/// boundary projection treats it as the unresolved reference it was before the
+/// universe table existed.
+fn scala_universe_hit_without_unit(
+    value: &DefinitionLookupOutcome,
+    query: BoundedReceiverQuery<'_>,
+) -> bool {
+    if value.status != DefinitionLookupStatus::Unavailable
+        || !value
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "native_definition_projection_unavailable")
+    {
+        return false;
+    }
+    let Some(focus) = query.tree.and_then(|tree| {
+        smallest_named_node_covering(
+            tree.root_node(),
+            query.site.focus_start_byte,
+            query.site.focus_end_byte,
+        )
+    }) else {
+        return false;
+    };
+    matches!(focus.kind(), "type_identifier" | "identifier")
+        && query
+            .source
+            .get(focus.start_byte()..focus.end_byte())
+            .is_some_and(|spelling| {
+                crate::analyzer::resolution::universe_lookup(
+                    Language::Scala,
+                    ResolutionNamespace::TypeOrValue,
+                    spelling.trim(),
+                )
+                .is_some()
+            })
+}
+
+/// A cursor on a declaration name or on an import alias is not a reference: the
+/// producer publishes no reference there, so the native lookup finds nothing to
+/// locate. Answer it as every other language does, with the shared
+/// `declaration_or_import_site` diagnostic, instead of the unavailable status
+/// that a missing reference maps to.
+fn project_scala_declaration_site(
+    query: BoundedReceiverQuery<'_>,
+    resolution: BoundedResolution<DefinitionLookupOutcome>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    let BoundedResolution::Complete { value, work } = resolution else {
+        return resolution;
+    };
+    if value.status != DefinitionLookupStatus::Unavailable
+        || !value
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "native_reference_unavailable")
+    {
+        return BoundedResolution::Complete { value, work };
+    }
+    let Some(focus) = query.tree.and_then(|tree| {
+        smallest_named_node_covering(
+            tree.root_node(),
+            query.site.focus_start_byte,
+            query.site.focus_end_byte,
+        )
+    }) else {
+        return BoundedResolution::Complete { value, work };
+    };
+    if !scala_is_declaration_name(focus) && !scala_is_import_alias(focus) {
+        return BoundedResolution::Complete { value, work };
+    }
+    BoundedResolution::Complete {
+        value: DefinitionLookupOutcome {
+            modeled_definitions: Vec::new(),
+            status: DefinitionLookupStatus::NoDefinition,
+            reference: Some(query.site.clone()),
+            definitions: Vec::new(),
+            lexical_definition: None,
+            diagnostics: vec![DefinitionLookupDiagnostic {
+                claim: None,
+                kind: DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND.into(),
+                message: format!("`{}` is not a Scala reference site", query.site.text),
+            }],
+        },
+        work,
+    }
+}
+
 fn project_scala_external_boundary(
     scala: &crate::analyzer::scala::ScalaAnalyzer,
     query: BoundedReceiverQuery<'_>,
@@ -525,6 +620,12 @@ fn project_scala_external_boundary(
     let BoundedResolution::Complete { mut value, work } = resolution else {
         return resolution;
     };
+    if scala_universe_hit_without_unit(&value, query) {
+        value.status = DefinitionLookupStatus::NoDefinition;
+        value
+            .diagnostics
+            .retain(|diagnostic| diagnostic.kind != "native_definition_projection_unavailable");
+    }
     if !matches!(
         value.status,
         DefinitionLookupStatus::NoDefinition
@@ -546,8 +647,7 @@ fn project_scala_external_boundary(
     ) else {
         return BoundedResolution::Complete { value, work };
     };
-    if scala_is_declaration_name(focus) || scala_reference_is_import_export_or_package_syntax(focus)
-    {
+    if scala_is_declaration_name(focus) || scala_reference_is_export_or_package_syntax(focus) {
         return BoundedResolution::Complete { value, work };
     }
 
@@ -641,12 +741,9 @@ fn scala_identifier_is_implicit_root_reference(focus: tree_sitter::Node<'_>) -> 
     true
 }
 
-fn scala_reference_is_import_export_or_package_syntax(mut focus: tree_sitter::Node<'_>) -> bool {
+fn scala_reference_is_export_or_package_syntax(mut focus: tree_sitter::Node<'_>) -> bool {
     while let Some(parent) = focus.parent() {
-        if matches!(
-            parent.kind(),
-            "import_declaration" | "export_declaration" | "package_clause"
-        ) {
+        if matches!(parent.kind(), "export_declaration" | "package_clause") {
             return true;
         }
         focus = parent;
@@ -834,11 +931,24 @@ fn scala_explicit_import_binds(
         .any(|import| import.is_wildcard || import.local_name() == Some(head.as_str()))
 }
 
+/// The alias of a renaming import selector (`{default => renderDefault}`).
+fn scala_is_import_alias(node: tree_sitter::Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "as_renamed_identifier" | "arrow_renamed_identifier"
+        ) && parent.child_by_field_name("alias") == Some(node)
+    })
+}
+
+/// A node named by its parent's `name` field. A type parameter list names
+/// several children with that field, so every one is compared.
 fn scala_is_declaration_name(mut node: tree_sitter::Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
+        let mut cursor = parent.walk();
         if parent
-            .child_by_field_name("name")
-            .is_some_and(|name| name.id() == node.id())
+            .children_by_field_name("name", &mut cursor)
+            .any(|name| name.id() == node.id())
         {
             return true;
         }

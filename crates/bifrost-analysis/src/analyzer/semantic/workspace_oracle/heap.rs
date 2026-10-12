@@ -1413,6 +1413,7 @@ fn rust_field_identity_is_supported(
         || member.declaration() != procedure.semantics().locator().declaration())
 }
 
+#[derive(Clone)]
 struct IncomingActualQuery {
     observation: ValueAtPoint,
     proof: ProofStatus,
@@ -1420,7 +1421,17 @@ struct IncomingActualQuery {
     identity_context: crate::analyzer::semantic::OracleCallContext,
 }
 
-struct IncomingActualSet {
+pub(super) type IncomingActualKey = (
+    (
+        crate::analyzer::semantic::SemanticArtifactKey,
+        crate::analyzer::semantic::ProcedureId,
+    ),
+    crate::analyzer::semantic::ValueId,
+    crate::analyzer::semantic::OracleCallContext,
+);
+
+#[derive(Clone)]
+pub(super) struct IncomingActualSet {
     candidates: Vec<IncomingActualQuery>,
     open: bool,
 }
@@ -1758,8 +1769,46 @@ fn incoming_call_actual_queries(
 /// Compose a formal parameter/receiver back to its exact incoming actuals
 /// through the existing bounded call-relation, dispatch, and call-binding
 /// services. This is query-local: every retained site and actual is charged
-/// to the semantic budget, and no call graph survives the call.
+/// to the semantic budget on the first enumeration; completed bindings are
+/// reused without another charge for the lifetime of this query provider.
 fn incoming_actual_queries(
+    oracle: &WorkspaceSemanticOracle<'_>,
+    procedure: &ProcedureHandle,
+    formal_value: crate::analyzer::semantic::ValueId,
+    context: &crate::analyzer::semantic::OracleCallContext,
+    limits: crate::analyzer::semantic::OracleLimits,
+    staged: &mut WorkStager,
+    cancellation: &crate::cancellation::CancellationToken,
+) -> Result<IncomingActualSet, InterruptionOrProvider> {
+    let key = (procedure.durable_key(), formal_value, context.clone());
+    if let Some(answer) = oracle
+        .incoming_actuals
+        .lock()
+        .expect("incoming actual memo poisoned")
+        .get(&key)
+    {
+        return Ok(answer.clone());
+    }
+    let answer = compute_incoming_actual_queries(
+        oracle,
+        procedure,
+        formal_value,
+        context,
+        limits,
+        staged,
+        cancellation,
+    )?;
+    // Only successful enumeration is reusable. Interruptions propagate above
+    // without retaining a partial answer or charging a later memo hit.
+    oracle
+        .incoming_actuals
+        .lock()
+        .expect("incoming actual memo poisoned")
+        .insert(key, answer.clone());
+    Ok(answer)
+}
+
+fn compute_incoming_actual_queries(
     oracle: &WorkspaceSemanticOracle<'_>,
     procedure: &ProcedureHandle,
     formal_value: crate::analyzer::semantic::ValueId,
@@ -5365,6 +5414,9 @@ func inspect() {
     }
 
     #[test]
+    #[hardwon(
+        "#4929: one source judgement enumerated the same formal's callers once per observation"
+    )]
     fn incoming_actual_is_rebased_to_the_callee_with_query_context() {
         let source = r#"
 struct Payload(u8);
@@ -5440,15 +5492,87 @@ fn caller() {
             identity_context.clone(),
         )
         .expect("formal observation");
+        let oracle = fixture.analyzer.semantic_oracle_provider();
         let mut budget = SemanticBudget::default();
-        let outcome = fixture
-            .analyzer
-            .semantic_oracle_provider()
+        let outcome = oracle
             .pointees(
                 &query,
                 &mut SemanticRequest::new(&mut budget, &cancellation),
             )
             .expect("helper formal points-to query validates");
+        assert_eq!(
+            oracle
+                .incoming_actuals
+                .lock()
+                .expect("incoming actual memo poisoned")
+                .len(),
+            1
+        );
+        let request = SemanticRequest::new(&mut budget, &cancellation);
+        let mut hit = WorkStager::new(&request);
+        incoming_actual_queries(
+            &oracle,
+            &helper,
+            formal.id,
+            &identity_context,
+            *oracle.limits(),
+            &mut hit,
+            &cancellation,
+        )
+        .unwrap_or_else(|_| panic!("completed incoming query must be reusable"));
+        assert_eq!(
+            hit.work,
+            SemanticWork::default(),
+            "memo hits charge no work"
+        );
+        let mut reused_budget = SemanticBudget::default();
+        let reused = oracle
+            .pointees(
+                &query,
+                &mut SemanticRequest::new(&mut reused_budget, &cancellation),
+            )
+            .expect("memoized points-to query validates");
+        // Each points-to result owns a fresh provenance arena. Compare the
+        // semantic answer, not those deliberately distinct arena handles.
+        let answer = |outcome: &SemanticOutcome<PointsToResult>| {
+            let objects = outcome
+                .available_value()
+                .expect("points-to answer")
+                .objects();
+            (
+                objects.coverage(),
+                objects
+                    .candidates()
+                    .iter()
+                    .map(|candidate| {
+                        (
+                            candidate
+                                .value()
+                                .identity()
+                                .durable_identity()
+                                .expect("durable object"),
+                            candidate.value().cardinality(),
+                            candidate.proof().clone(),
+                            candidate.completeness().clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(answer(&reused), answer(&outcome));
+        oracle
+            .incoming_actuals
+            .lock()
+            .expect("incoming actual memo poisoned")
+            .clear();
+        let mut fresh_budget = SemanticBudget::default();
+        let fresh = oracle
+            .pointees(
+                &query,
+                &mut SemanticRequest::new(&mut fresh_budget, &cancellation),
+            )
+            .expect("unmemoized points-to query validates");
+        assert_eq!(answer(&fresh), answer(&reused));
         let points_to = outcome
             .available_value()
             .expect("partial results retain the substituted candidate");
