@@ -2417,11 +2417,6 @@ struct EventRow {
     event_type: u32,
 }
 
-#[cfg(test)]
-fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> {
-    parse_assembly_bounded(path, bytes, MAX_SIGNATURE_DEPTH, None).map(|(types, _)| types)
-}
-
 fn parse_assembly_bounded(
     path: &Path,
     bytes: &[u8],
@@ -3226,17 +3221,6 @@ fn full_type_name(
     } else {
         format!("{}.{}", namespace, parts.join("."))
     }
-}
-#[cfg(test)]
-fn resolve_typedef_or_ref(
-    value: u32,
-    types: &[TypeRow],
-    type_refs: &[TypeRefRow],
-    type_specs: &[TypeSpecRow],
-) -> String {
-    resolve_typedef_or_ref_type(value, types, type_refs, type_specs)
-        .map(|value| value.legacy_name())
-        .unwrap_or_default()
 }
 fn resolve_typedef_or_ref_type(
     value: u32,

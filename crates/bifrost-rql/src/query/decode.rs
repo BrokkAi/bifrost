@@ -2776,6 +2776,17 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             super::schema::QueryStepOp::CallArgument => {
                 QueryStep::CallArgument(CallArgumentSelector::FormalIndex(0))
             }
+            super::schema::QueryStepOp::ProgramPointById => {
+                let id_path = child_path(&entry_path, "id");
+                let id = object
+                    .get("id")
+                    .ok_or_else(|| QueryError::new(&id_path, "required field is missing"))?
+                    .as_str()
+                    .ok_or_else(|| {
+                        QueryError::new(&id_path, "expected a program-point ID string")
+                    })?;
+                QueryStep::ProgramPointById { id: id.to_owned() }
+            }
             _ => QueryStep::from_label(label)
                 .expect("option-free and defaultable query steps construct from their labels"),
         };
@@ -2796,6 +2807,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let row_filter = matches!(step, QueryStep::Filter(_));
         let row_project = matches!(step, QueryStep::Project(_));
         let capture_anchor = matches!(step, QueryStep::CaptureAnchor(_));
+        let program_point_by_id = matches!(step, QueryStep::ProgramPointById { .. });
         let configuration_absence = matches!(step, QueryStep::ConfigurationAbsence(_));
         let statement_facts = matches!(step, QueryStep::StatementFacts(_));
         let cpp_facts = matches!(step, QueryStep::CppFacts(_));
@@ -2883,6 +2895,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 }
                 Some(QueryStepField::RowWhere) if row_filter => {}
                 Some(QueryStepField::Columns) if row_project => {}
+                Some(QueryStepField::ProgramPointId) if program_point_by_id => {}
                 Some(QueryStepField::StatementFactKind) if statement_facts => {}
                 Some(QueryStepField::StatementFactKind) => {
                     return Err(QueryError::new(
@@ -3041,6 +3054,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::FormalIndex
                     | QueryStepField::RowWhere
                     | QueryStepField::Columns
+                    | QueryStepField::ProgramPointId
                     | QueryStepField::CppFactKind,
                 )
                 | None => {

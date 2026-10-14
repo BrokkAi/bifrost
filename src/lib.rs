@@ -11,7 +11,6 @@ pub mod mcp_install;
 pub mod owasp_benchmark;
 #[cfg(feature = "python")]
 mod python_module;
-mod shard;
 // Stage 4 of the procedure-summary foundry (#1871). It runs generated fixtures
 // through the production policy evaluator, so it needs both the foundry IR from
 // brokk-bifrost-semantic-packs and the evaluator from brokk-bifrost-policy;

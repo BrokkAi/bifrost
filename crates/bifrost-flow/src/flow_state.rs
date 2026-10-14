@@ -315,6 +315,13 @@ pub enum FlowStateIncompleteReason {
     /// Such an access has no stable property subject, so it contributes no
     /// event rather than an approximated one.
     PropertyBaseNotCanonical { accesses: usize },
+    /// A scoped property proof retained a semantic endpoint that public
+    /// event projection could not present. The exact join identity is kept.
+    SelectedPropertyEndpointUnavailable {
+        point: ProgramPointId,
+        event_index: u32,
+        source: SourceMappingId,
+    },
     /// The lowering declares a local binding it never establishes, so reads of
     /// that binding have no establishment to reach them in this artifact and
     /// their absence is unknown, not proven.
@@ -335,7 +342,7 @@ pub enum FlowStateIncompleteReason {
     /// The structured property provider retained typed evidence, but one or
     /// more proof/completeness conditions remained open.
     PropertyReaching {
-        reason: PropertyReachingIncompleteReason,
+        reason: Box<PropertyReachingIncompleteReason>,
     },
 }
 
@@ -355,7 +362,9 @@ impl FlowStateIncompleteReason {
             AxisUnsupported(blocked) => *blocked == axis,
             BudgetExhausted { axis: blocked, .. } => *blocked == axis,
             LoweringGap { capability, .. } => axes_blocked_by(*capability).contains(&axis),
-            PropertyBaseNotCanonical { .. } => property_axes().contains(&axis),
+            PropertyBaseNotCanonical { .. } | SelectedPropertyEndpointUnavailable { .. } => {
+                property_axes().contains(&axis)
+            }
             BindingWithoutEstablishment { .. } => matches!(
                 axis,
                 FlowStateAxis::BindingEvents
@@ -416,7 +425,14 @@ fn property_reason_blocks(reason: &PropertyReachingIncompleteReason, axis: FlowS
                     | FlowStateAxis::SameEvaluationRelation
             )
         }
-        InputRelationBudgetExceeded { .. }
+        SelectedReadMissing { .. }
+        | SelectedReadAmbiguous { .. }
+        | SelectedRelationEndpointUnavailable { .. }
+        | SelectedRuntimeAccess { .. }
+        | SelectedAncestorStore { .. }
+        | SelectedAliasClosureUnavailable { .. }
+        | SelectedSemanticGap { .. }
+        | InputRelationBudgetExceeded { .. }
         | Cancelled
         | UnsupportedLocation { .. }
         | DurableIdentityUnavailable { .. }
@@ -5662,6 +5678,192 @@ pub fn flow_state_for_materialized_procedure(
     flow_state_for_materialized_selection(workspace, file, outcome, Some(procedure.id()), request)
 }
 
+/// Prove only the reaching relations of the property read at one exact point.
+/// This is a new scope, not a filter over aggregate completeness. The source
+/// derivation and its diagnostics are never modified. Unknown stored values
+/// remain their original handles; this proves storage, not scalar contents.
+pub fn flow_state_for_selected_property(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    state: &FileFlowState,
+    procedure: &ProcedureHandle,
+    point: ProgramPointId,
+    request: &mut FlowStateRequest<'_>,
+) -> FileFlowState {
+    let Some(original) = state
+        .procedures
+        .iter()
+        .find(|row| row.procedure == procedure.id())
+    else {
+        return FileFlowState::incomplete(
+            vec![FlowStateIncompleteReason::PropertyAnalysisPartial {
+                detail: "selected procedure has no flow-state derivation".into(),
+            }],
+            state.generation,
+            state.active_model_set_hash.clone(),
+        );
+    };
+    assert!(
+        Weak::ptr_eq(
+            &original.procedure_artifact,
+            &Arc::downgrade(procedure.artifact())
+        ),
+        "selected property requires the exact materialized artifact"
+    );
+    debug_assert!(original.events.iter().all(|event| &event.site.file == file));
+    let analyzer = workspace.analyzer();
+    let _scope = request
+        .active_semantic_model_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            AnalyzerQueryScope::with_active_semantic_model_snapshot(analyzer, snapshot.clone())
+        });
+    let mut reasons = state.completeness.reasons().to_vec();
+    let selected_model_hash = request
+        .active_semantic_model_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.as_ref())
+        .map(|snapshot| snapshot.active_models().active_model_set_hash());
+    if state.active_model_set_hash() != selected_model_hash {
+        reasons.push(FlowStateIncompleteReason::PropertyProviderFailed {
+            detail: "selected property activation differs from the event projection".into(),
+        });
+    }
+    if analyzer.project().analysis_generation() != state.generation {
+        reasons.push(FlowStateIncompleteReason::SourceGenerationChanged);
+    }
+    // These are acquisition/control failures, independent of a property
+    // subject. Aggregate memory/lowering reasons are checked by the selected
+    // provider against their original semantic identities below.
+    reasons.extend(
+        original
+            .completeness
+            .reasons()
+            .iter()
+            .filter(|reason| {
+                reason.blocks(FlowStateAxis::PropertyReachingRelation)
+                    && !matches!(
+                        reason,
+                        FlowStateIncompleteReason::LoweringGap { .. }
+                            | FlowStateIncompleteReason::PropertyBaseNotCanonical { .. }
+                            | FlowStateIncompleteReason::PropertyReaching { .. }
+                            | FlowStateIncompleteReason::PropertyProviderUnavailable
+                            | FlowStateIncompleteReason::PropertyProviderFailed { .. }
+                            | FlowStateIncompleteReason::PropertyAnalysisPartial { .. }
+                    )
+            })
+            .cloned(),
+    );
+    let mut derived = original.clone();
+    derived.relations.clear();
+    let outcome = workspace.semantic_oracle_provider().procedure_relations(
+        procedure,
+        &OracleCallContext::empty(),
+        &mut SemanticRequest::new(&mut SemanticBudget::default(), request.cancellation),
+    );
+    match outcome {
+        Err(error) => reasons.push(FlowStateIncompleteReason::PropertyProviderFailed {
+            detail: error.to_string(),
+        }),
+        Ok(outcome) => {
+            if !matches!(outcome, SemanticOutcome::Complete { .. }) {
+                reasons.push(FlowStateIncompleteReason::PropertyAnalysisPartial {
+                    detail: format!(
+                        "selected property acquisition is `{}`",
+                        outcome_label(&outcome)
+                    ),
+                });
+            }
+            if let Some(snapshot) = outcome.available_value() {
+                let graph =
+                    ProjectedProcedureGraph::new(procedure.semantics(), &derived.control_edge_mask);
+                let selected =
+                    crate::analyzer::semantic::derive_selected_property_reaching_over_graph(
+                        snapshot,
+                        &graph,
+                        procedure.semantics().entry_point(),
+                        point,
+                        PropertyReachingLimits {
+                            cfg_work: request.cfg_budget.limits(),
+                            ..PropertyReachingLimits::default()
+                        },
+                        request.cancellation,
+                    );
+                reasons.extend(selected.incomplete_reasons().iter().cloned().map(|reason| {
+                    FlowStateIncompleteReason::PropertyReaching {
+                        reason: Box::new(reason),
+                    }
+                }));
+                // Check every selected modeled endpoint, even a dead store
+                // that contributes no reaching row. Missing joins remain
+                // explicit rather than silently shrinking the proof domain.
+                for (class, point, event_index, source) in selected
+                    .stores()
+                    .iter()
+                    .map(|row| {
+                        (
+                            StateEventClass::Establish,
+                            row.point.id(),
+                            row.event_index,
+                            row.source,
+                        )
+                    })
+                    .chain(selected.reads().iter().map(|row| {
+                        (
+                            StateEventClass::Read,
+                            row.point.id(),
+                            row.event_index,
+                            row.source,
+                        )
+                    }))
+                {
+                    if property_event_id(
+                        &derived.events,
+                        &derived.event_keys,
+                        class,
+                        point,
+                        event_index,
+                        source,
+                    )
+                    .is_none()
+                    {
+                        reasons.push(
+                            FlowStateIncompleteReason::SelectedPropertyEndpointUnavailable {
+                                point,
+                                event_index,
+                                source,
+                            },
+                        );
+                    }
+                }
+                derived.relations = property_reaching_relations(
+                    &derived.events,
+                    &derived.event_keys,
+                    &selected,
+                    state.generation,
+                );
+            } else {
+                reasons.push(FlowStateIncompleteReason::PropertyAnalysisPartial {
+                    detail: format!(
+                        "selected property snapshot outcome is `{}`",
+                        outcome_label(&outcome)
+                    ),
+                });
+            }
+        }
+    }
+    if analyzer.project().analysis_generation() != state.generation {
+        reasons.push(FlowStateIncompleteReason::SourceGenerationChanged);
+    }
+    derived.completeness = FlowStateCompleteness::from_reasons(reasons.clone());
+    FileFlowState {
+        procedures: vec![derived],
+        completeness: FlowStateCompleteness::from_reasons(reasons),
+        generation: state.generation,
+        active_model_set_hash: state.active_model_set_hash.clone(),
+    }
+}
+
 fn flow_state_for_materialized_selection(
     workspace: &WorkspaceAnalyzer,
     file: &ProjectFile,
@@ -6206,7 +6408,7 @@ fn derive_procedure(
             Ok(result) => {
                 for reason in result.incomplete_reasons() {
                     reasons.push(FlowStateIncompleteReason::PropertyReaching {
-                        reason: reason.clone(),
+                        reason: Box::new(reason.clone()),
                     });
                 }
                 Some(result)
@@ -8492,17 +8694,12 @@ where
 /// vocabulary. The relation has already been keyed by the durable receiver,
 /// access path, and structured member in `bifrost-analysis`; the `FlowSubject`
 /// on each event is only a source-facing presentation value.
-fn property_flow_relations<G>(
-    graph: &G,
+fn property_reaching_relations(
     events: &[StateEventRow],
     event_keys: &[SemanticEventKey],
     property_result: &PropertyReachingResult,
-    dominance: &Dominators<ProgramPointId>,
     generation: u64,
-) -> Vec<FlowRelationRow>
-where
-    G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
-{
+) -> Vec<FlowRelationRow> {
     let mut rows = Vec::new();
     for relation in property_result.reaching() {
         let Some(source_event) = property_event_id(
@@ -8537,6 +8734,22 @@ where
             generation,
         });
     }
+
+    rows
+}
+
+fn property_flow_relations<G>(
+    graph: &G,
+    events: &[StateEventRow],
+    event_keys: &[SemanticEventKey],
+    property_result: &PropertyReachingResult,
+    dominance: &Dominators<ProgramPointId>,
+    generation: u64,
+) -> Vec<FlowRelationRow>
+where
+    G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
+{
+    let mut rows = property_reaching_relations(events, event_keys, property_result, generation);
 
     for store in property_result.stores() {
         let Some(source_event) = property_event_id(
@@ -16038,6 +16251,174 @@ def outer():
                     FlowStateIncompleteReason::BudgetExhausted { .. }
                 ))
         ));
+    }
+
+    /// The selected analysis and public event projection evolve separately:
+    /// endpoint loss, cancellation and CFG limits must never turn into a
+    /// complete empty selected answer.
+    #[test]
+    fn selected_property_preserves_endpoint_and_request_failures() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_READ_AFTER_ESTABLISHMENT)],
+        );
+        let outcome = fixture.materialized(0);
+        let artifact = outcome.available_value().cloned().expect("JS artifact");
+        let token = CancellationToken::default();
+        let state = flow_state_for_materialized_artifact(
+            &fixture.workspace,
+            &fixture.files[0],
+            outcome,
+            &mut FlowStateRequest::new(&token),
+        );
+        let (index, read) = state.procedures.iter().enumerate().find_map(|(index, row)| {
+            row.events.iter().find(|event| event.event_class == StateEventClass::Read
+                && matches!(&event.subject, FlowSubject::Property { member, .. } if member.as_ref() == "value"))
+                .map(|event| (index, event.event))
+        }).expect("property read");
+        let procedure = artifact
+            .procedure_handle(state.procedures[index].procedure)
+            .expect("procedure");
+        let point = state.procedures[index].events[read].point;
+        let selected = flow_state_for_selected_property(
+            &fixture.workspace,
+            &fixture.files[0],
+            &state,
+            &procedure,
+            point,
+            &mut FlowStateRequest::new(&token),
+        );
+        assert!(
+            selected.procedures[0]
+                .completeness
+                .covers(FlowStateAxis::PropertyReachingRelation),
+            "baseline selected proof: {selected:?}"
+        );
+        assert!(!selected.procedures[0].relations.is_empty());
+        let mut budget = SemanticBudget::default();
+        let outcome = fixture
+            .workspace
+            .semantic_oracle_provider()
+            .procedure_relations(
+                &procedure,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut budget, &token),
+            )
+            .expect("published relation snapshot");
+        let snapshot = outcome.available_value().expect("available snapshot");
+        let store = snapshot
+            .relations()
+            .iter()
+            .find(|relation| {
+                relation.kind == crate::analyzer::semantic::ValueFlowRelationKind::MemoryStore
+            })
+            .expect("fixture store");
+        let omitted_key = (store.point.id(), store.event_index);
+        let retained = snapshot
+            .relations()
+            .iter()
+            .filter(|relation| {
+                relation.kind != crate::analyzer::semantic::ValueFlowRelationKind::MemoryStore
+            })
+            .cloned()
+            .collect();
+        let damaged = crate::analyzer::semantic::ValueFlowSnapshot::with_discharged_gaps(
+            procedure.clone(),
+            OracleCallContext::empty(),
+            retained,
+            CandidateCoverage::Exhaustive,
+            crate::analyzer::semantic::OracleLimits::default(),
+            procedure
+                .semantics()
+                .gaps()
+                .iter()
+                .filter(|gap| snapshot.gap_is_discharged(gap.id))
+                .map(|gap| gap.id)
+                .collect(),
+        )
+        .expect("retained rows still satisfy the oracle relation contract");
+        let selected = crate::analyzer::semantic::derive_selected_property_reaching_over_graph(
+            &damaged,
+            procedure.semantics(),
+            procedure.semantics().entry_point(),
+            point,
+            PropertyReachingLimits::default(),
+            &token,
+        );
+        assert!(!selected.is_complete(), "omitted IR store: {selected:?}");
+        assert!(selected.incomplete_reasons().iter().any(|reason|
+            matches!(reason, PropertyReachingIncompleteReason::SelectedRelationEndpointUnavailable {
+                point, event_index, relation: crate::analyzer::semantic::ValueFlowRelationKind::MemoryStore, ..
+            } if (*point, *event_index) == omitted_key)), "exact omitted key: {selected:?}");
+        let selected = crate::analyzer::semantic::derive_selected_property_reaching_over_graph(
+            snapshot,
+            procedure.semantics(),
+            procedure.semantics().entry_point(),
+            point,
+            PropertyReachingLimits {
+                max_input_relations: 0,
+                ..PropertyReachingLimits::default()
+            },
+            &token,
+        );
+        assert!(!selected.is_complete(), "input frontier: {selected:?}");
+        assert!(selected.incomplete_reasons().iter().any(|reason| matches!(
+            reason,
+            PropertyReachingIncompleteReason::InputRelationBudgetExceeded { limit: 0, .. }
+        )));
+        let mut missing = state.clone();
+        // Keep the parallel join keys intact, but remove the endpoint's
+        // property presentation. This models independently failed projection.
+        missing.procedures[index].events[read].subject = FlowSubject::Binding {
+            value: state.procedures[index].events[read].value,
+        };
+        let selected = flow_state_for_selected_property(
+            &fixture.workspace,
+            &fixture.files[0],
+            &missing,
+            &procedure,
+            point,
+            &mut FlowStateRequest::new(&token),
+        );
+        assert!(selected.completeness.reasons().iter().any(|reason|
+            matches!(reason, FlowStateIncompleteReason::SelectedPropertyEndpointUnavailable { point: missing, .. } if *missing == point)));
+        assert!(
+            !selected
+                .completeness
+                .covers(FlowStateAxis::PropertyReachingRelation)
+        );
+        let mut limited = FlowStateRequest::new(&token);
+        limited.cfg_budget = CfgAlgorithmBudget::uniform(0);
+        let selected = flow_state_for_selected_property(
+            &fixture.workspace,
+            &fixture.files[0],
+            &state,
+            &procedure,
+            point,
+            &mut limited,
+        );
+        assert!(
+            !selected
+                .completeness
+                .covers(FlowStateAxis::PropertyReachingRelation),
+            "budget: {selected:?}"
+        );
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let selected = flow_state_for_selected_property(
+            &fixture.workspace,
+            &fixture.files[0],
+            &state,
+            &procedure,
+            point,
+            &mut FlowStateRequest::new(&cancelled),
+        );
+        assert!(
+            !selected
+                .completeness
+                .covers(FlowStateAxis::PropertyReachingRelation),
+            "cancelled: {selected:?}"
+        );
     }
 
     #[test]

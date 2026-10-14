@@ -1143,6 +1143,8 @@ query_step_ops! {
     ImplementationOf { shape: RowLocal, label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to." }
     StubsOf { shape: RowLocal, label: "stubs_of", signature: "declaration -> declaration_state", description: "Return the declaration-only stub state rows whose implementation link resolves to each declaration; composed with except, this lists the stubs no implementation answers." }
     ExportTarget { shape: DerivedValue, label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one." }
+    SelectedPropertyRelationsOf { shape: RowLocal, label: "selected_property_relations_of", signature: "program_point -> flow_relation", description: "Prove reaching relations for the unique property read at one exact program point. Coverage is scoped to its structured receiver, member, dependencies and every modeled endpoint; missing or ambiguous reads, relevant gaps, alias escape, runtime behavior, budgets and cancellation remain incomplete. Unknown stored values remain unknown. Whole-procedure flow coverage and existing postfilters are unchanged.", semantic: [Procedures, ProgramPoints, ControlEdges, ValueFlow] }
+    ProgramPointById { shape: RowLocal, label: "program_point_by_id", signature: "procedure -> program_point", description: "Select one physical point by an observed content/environment-scoped public ID in the supplied current procedure. This does not claim exhaustive AST/read discovery or semantic-overlay freshness. Missing, stale, wrong-procedure, ambiguous or incomplete point selection remains incomplete; downstream proofs acquire current evidence.", semantic: [Procedures, ProgramPoints] }
 }
 
 /// The generated step reference: one line per registry step, in
@@ -1294,6 +1296,7 @@ macro_rules! rql_forms {
                     | Self::EnclosingDecl
                     | Self::ProcedureOf
                     | Self::ProgramPointOf
+                    | Self::ProgramPointById
                     | Self::CfgEntry
                     | Self::CfgExits
                     | Self::CfgSuccessorEdges
@@ -1457,6 +1460,7 @@ macro_rules! rql_forms {
                     | Self::EdgeTarget
                     | Self::StateEventsOf
                     | Self::BindingInitializerCallsOf
+                    | Self::SelectedPropertyRelationsOf
                     | Self::FlowRelationsOf
                     | Self::FlowSource
                     | Self::FlowTarget
@@ -2916,6 +2920,14 @@ rql_forms! {
         description: (QueryStepOp::BindingInitializerCallsOf),
         step: BindingInitializerCallsOf,
     }
+    SelectedPropertyRelationsOf {
+        labels: ["selected-property-relations-of", "selected_property_relations_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(selected-property-relations-of program-point-query)",
+        description: (QueryStepOp::SelectedPropertyRelationsOf),
+        step: SelectedPropertyRelationsOf,
+    }
     FlowRelationsOf {
         labels: ["flow-relations-of", "flow_relations_of"],
         class: Wrapper,
@@ -3326,6 +3338,14 @@ rql_forms! {
         shape: String,
         signature: "(body-owner if-consequence|if-alternative|loop-body)",
         description: "Restrict a body-state match to its structured if or loop owner role.",
+    }
+    ProgramPointById {
+        labels: ["program-point-by-id", "program_point_by_id"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(program-point-by-id :id \"public-program-point-id\" procedure-query)",
+        description: (QueryStepOp::ProgramPointById),
+        step: ProgramPointById,
     }
 }
 
@@ -3795,6 +3815,7 @@ json_fields! {
     FormalIndex { label: "formal_index", shape: NonNegativeInteger, signature: "\"formal_index\": non-negative integer", description: "Select one zero-based formal index." }
     RowWhere { label: "where", shape: RowPredicates, signature: "\"where\": [{ \"field\": FIELD, \"op\": OP, ... }]", description: "State a bounded conjunction of typed predicates over this step's input row." }
     Columns { label: "columns", shape: RowProjectionColumns, signature: "\"columns\": [{ \"source\": FIELD, \"name\": NEW_FIELD }, ...]", description: "Select and optionally rename public input-row fields." }
+    ProgramPointId { label: "id", shape: String, signature: "\"id\": \"public-program-point-id\"", description: "Select one exact public program-point identity." }
 }
 
 impl QueryStepField {
@@ -4051,6 +4072,10 @@ const PROJECT_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
 const CAPTURE_ANCHOR_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
     QueryStepField::Capture,
     &[":capture"],
+)];
+const PROGRAM_POINT_BY_ID_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
+    QueryStepField::ProgramPointId,
+    &[":id"],
 )];
 const STATEMENT_FACTS_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
     QueryStepField::StatementFactKind,
@@ -4451,6 +4476,7 @@ impl QueryStepOp {
             Self::Filter => FILTER_STEP_OPTIONS,
             Self::Project => PROJECT_STEP_OPTIONS,
             Self::CaptureAnchor => CAPTURE_ANCHOR_STEP_OPTIONS,
+            Self::ProgramPointById => PROGRAM_POINT_BY_ID_STEP_OPTIONS,
             Self::StatementFacts => STATEMENT_FACTS_STEP_OPTIONS,
             Self::CppFacts => CPP_FACTS_STEP_OPTIONS,
             Self::Typestate => TYPESTATE_STEP_OPTIONS,

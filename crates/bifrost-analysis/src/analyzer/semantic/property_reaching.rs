@@ -13,16 +13,19 @@ use super::cfg_algorithms::{
     DenseBidirectionalGraph, GenKillFacts, dominators, forward_reachability, reaching_definitions,
     reverse_reachability,
 };
-use super::ids::{ProgramPointId, SemanticLocator, SourceMappingId, SourceSpan, ValueId};
+use super::ids::{
+    MemoryLocationId, ProgramPointId, SemanticLocator, SourceMappingId, SourceSpan, ValueId,
+};
 use super::ir::{
     CaptureSource, EvidenceCompleteness, ExecutionTiming, MemoryAccessKind, MemoryLocationKind,
-    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticEffect, SemanticGapImpact,
-    SemanticGapSubject, ValueHandle,
+    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticEffect, SemanticGap,
+    SemanticGapImpact, SemanticGapSubject, ValueHandle,
 };
 use super::oracle::{
     AbstractLocation, AccessSelector, CandidateCoverage, DurableIdentityError,
-    DurableValueIdentity, ExecutionTimingClaim, IndexSelector, ValueFlowEndpoint,
-    ValueFlowRelation, ValueFlowRelationKind, ValueFlowSnapshot,
+    DurableValueIdentity, ExecutionTimingClaim, IndexSelector, MemoryOperationKey,
+    MemoryRelationRole, ValueFlowEndpoint, ValueFlowRelation, ValueFlowRelationKind,
+    ValueFlowSnapshot,
 };
 use super::oracle::{OracleCallContext, ValueFlowOracle};
 use super::provider::{SemanticBudget, SemanticOutcome, SemanticProviderError, SemanticRequest};
@@ -384,9 +387,55 @@ fn evaluation_acquisition_reason_is_local_complete(
     }
 }
 
+/// Which endpoint a retained property relation failed to publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PropertyEndpointSide {
+    Source,
+    Target,
+}
+
 /// Why a property-reaching result cannot be treated as complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PropertyReachingIncompleteReason {
+    /// The selected point did not contain one projectable property read.
+    SelectedReadMissing { point: ProgramPointId },
+    /// More than one property read was published at the selected point.
+    SelectedReadAmbiguous {
+        point: ProgramPointId,
+        event_indices: Box<[u32]>,
+    },
+    /// A selected property relation omitted an endpoint needed to identify it.
+    SelectedRelationEndpointUnavailable {
+        point: ProgramPointId,
+        event_index: u32,
+        relation: ValueFlowRelationKind,
+        endpoint: PropertyEndpointSide,
+        source: SourceMappingId,
+        source_locator: Option<SemanticLocator>,
+    },
+    /// An unmodeled runtime or otherwise uncertain access may alias the
+    /// selected receiver.
+    SelectedRuntimeAccess {
+        point: ProgramPointId,
+        event_index: u32,
+        source: SourceMappingId,
+        source_locator: Option<SemanticLocator>,
+        receiver: Option<super::oracle::DurableObjectIdentity>,
+    },
+    /// Replacing an ancestor property may establish the selected descendant.
+    SelectedAncestorStore {
+        point: ProgramPointId,
+        event_index: u32,
+        source: SourceMappingId,
+        source_locator: Option<SemanticLocator>,
+        location: Option<PropertyLocationIdentity>,
+    },
+    /// The selected receiver did not have a closed local-allocation alias set.
+    SelectedAliasClosureUnavailable {
+        receiver: super::oracle::DurableObjectIdentity,
+    },
+    /// A structured semantic gap can affect the selected property result.
+    SelectedSemanticGap { gap: SemanticGap },
     /// The value-flow snapshot did not establish an exhaustive candidate set.
     CandidateCoverage(CandidateCoverage),
     /// The input relation bound stopped collection with partial rows retained.
@@ -1130,6 +1179,172 @@ pub fn derive_property_reaching(
     )
 }
 
+struct PropertyEventProjection {
+    stores: Vec<PropertyStoreRecord>,
+    reads: Vec<PropertyReadRecord>,
+    incomplete_reasons: Vec<PropertyReachingIncompleteReason>,
+}
+
+fn project_property_relations<'a>(
+    procedure: &ProcedureHandle,
+    relations: impl Iterator<Item = &'a ValueFlowRelation>,
+    cancellation: &CancellationToken,
+) -> PropertyEventProjection {
+    let mut stores = Vec::new();
+    let mut reads = Vec::new();
+    let mut incomplete_reasons = Vec::new();
+    for relation in relations {
+        if cancellation.is_cancelled() {
+            incomplete_reasons.push(PropertyReachingIncompleteReason::Cancelled);
+            break;
+        }
+        match relation.kind {
+            ValueFlowRelationKind::MemoryStore => {
+                let Some(location) = endpoint_location(&relation.target) else {
+                    if field_memory_event(procedure, relation) {
+                        incomplete_reasons.push(
+                            PropertyReachingIncompleteReason::FieldMemoryEndpointUnavailable {
+                                point: relation.point.id(),
+                                event_index: relation.event_index,
+                                relation: relation.kind,
+                            },
+                        );
+                    }
+                    continue;
+                };
+                let Some(value) = endpoint_value(&relation.source) else {
+                    if field_memory_event(procedure, relation) {
+                        incomplete_reasons.push(
+                            PropertyReachingIncompleteReason::FieldMemoryEndpointUnavailable {
+                                point: relation.point.id(),
+                                event_index: relation.event_index,
+                                relation: relation.kind,
+                            },
+                        );
+                    }
+                    continue;
+                };
+                let reason_count = incomplete_reasons.len();
+                if let Some(record) = project_store(
+                    procedure,
+                    relation,
+                    location,
+                    value,
+                    &mut incomplete_reasons,
+                ) {
+                    stores.push(record);
+                } else if reason_count == incomplete_reasons.len()
+                    && field_memory_event(procedure, relation)
+                {
+                    incomplete_reasons.push(
+                        PropertyReachingIncompleteReason::UnsupportedLocation {
+                            point: relation.point.id(),
+                            event_index: relation.event_index,
+                        },
+                    );
+                }
+            }
+            ValueFlowRelationKind::MemoryLoad => {
+                let Some(location) = endpoint_location(&relation.source) else {
+                    if field_memory_event(procedure, relation) {
+                        incomplete_reasons.push(
+                            PropertyReachingIncompleteReason::FieldMemoryEndpointUnavailable {
+                                point: relation.point.id(),
+                                event_index: relation.event_index,
+                                relation: relation.kind,
+                            },
+                        );
+                    }
+                    continue;
+                };
+                let Some(value) = endpoint_value(&relation.target) else {
+                    if field_memory_event(procedure, relation) {
+                        incomplete_reasons.push(
+                            PropertyReachingIncompleteReason::FieldMemoryEndpointUnavailable {
+                                point: relation.point.id(),
+                                event_index: relation.event_index,
+                                relation: relation.kind,
+                            },
+                        );
+                    }
+                    continue;
+                };
+                let reason_count = incomplete_reasons.len();
+                if let Some(record) = project_read(
+                    procedure,
+                    relation,
+                    location,
+                    value,
+                    &mut incomplete_reasons,
+                ) {
+                    reads.push(record);
+                } else if reason_count == incomplete_reasons.len()
+                    && field_memory_event(procedure, relation)
+                {
+                    incomplete_reasons.push(
+                        PropertyReachingIncompleteReason::UnsupportedLocation {
+                            point: relation.point.id(),
+                            event_index: relation.event_index,
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    PropertyEventProjection {
+        stores,
+        reads,
+        incomplete_reasons,
+    }
+}
+
+fn memory_relation_role(
+    relation: &ValueFlowRelation,
+    effect: &SemanticEffect,
+) -> Option<MemoryRelationRole> {
+    match effect {
+        SemanticEffect::MemoryLoad { .. } | SemanticEffect::MemoryStore { .. } => Some(
+            relation
+                .memory_origin()
+                .expect("a snapshot row at a memory event has a validated producer origin")
+                .role(),
+        ),
+        _ => None,
+    }
+}
+
+type CanonicalMemoryOperationKeys<'a> = HashSet<MemoryOperationKey<'a>>;
+
+fn record_canonical_memory_operation<'a>(
+    keys: &mut CanonicalMemoryOperationKeys<'a>,
+    relation: &'a ValueFlowRelation,
+) {
+    let key = relation
+        .memory_operation_key()
+        .expect("a validated memory event has an exact scoped operation key");
+    keys.insert(key);
+}
+
+fn canonical_memory_operation_is_present(
+    keys: &CanonicalMemoryOperationKeys<'_>,
+    point: &ProgramPointHandle,
+    event_index: u32,
+    location: MemoryLocationId,
+    context: &OracleCallContext,
+) -> bool {
+    let key = MemoryOperationKey {
+        point,
+        event_index,
+        location: point
+            .procedure()
+            .memory_location_handle(location)
+            .expect("a validated memory event names a retained memory location"),
+        context,
+    };
+    keys.contains(&key)
+}
+
 /// Build the same relation over a caller-supplied graph view.  Flow-state
 /// projections can pass their masked graph here, keeping omitted control edges
 /// consistent with the relation rows without making analysis depend on flow.
@@ -1144,112 +1359,18 @@ where
     G: DenseBidirectionalGraph<Node = ProgramPointId>,
 {
     let procedure = snapshot.procedure().clone();
-    let mut stores = Vec::new();
-    let mut reads = Vec::new();
-    let mut incomplete_reasons = Vec::new();
-    let mut evaluation_incomplete_reasons = Vec::new();
     let relations = snapshot.relations();
     let relation_limit = limits.max_input_relations.min(relations.len());
+    let projection = project_property_relations(
+        &procedure,
+        relations.iter().take(relation_limit),
+        cancellation,
+    );
+    let stores = projection.stores;
+    let reads = projection.reads;
+    let mut incomplete_reasons = projection.incomplete_reasons;
+    let mut evaluation_incomplete_reasons = Vec::new();
 
-    for relation in relations.iter().take(relation_limit) {
-        if cancellation.is_cancelled() {
-            incomplete_reasons.push(PropertyReachingIncompleteReason::Cancelled);
-            break;
-        }
-        match relation.kind {
-            ValueFlowRelationKind::MemoryStore => {
-                let Some(location) = endpoint_location(&relation.target) else {
-                    if field_memory_event(&procedure, relation) {
-                        incomplete_reasons.push(
-                            PropertyReachingIncompleteReason::FieldMemoryEndpointUnavailable {
-                                point: relation.point.id(),
-                                event_index: relation.event_index,
-                                relation: relation.kind,
-                            },
-                        );
-                    }
-                    continue;
-                };
-                let Some(value) = endpoint_value(&relation.source) else {
-                    if field_memory_event(&procedure, relation) {
-                        incomplete_reasons.push(
-                            PropertyReachingIncompleteReason::FieldMemoryEndpointUnavailable {
-                                point: relation.point.id(),
-                                event_index: relation.event_index,
-                                relation: relation.kind,
-                            },
-                        );
-                    }
-                    continue;
-                };
-                let reason_count = incomplete_reasons.len();
-                if let Some(record) = project_store(
-                    &procedure,
-                    relation,
-                    location,
-                    value,
-                    &mut incomplete_reasons,
-                ) {
-                    stores.push(record);
-                } else if reason_count == incomplete_reasons.len()
-                    && field_memory_event(&procedure, relation)
-                {
-                    incomplete_reasons.push(
-                        PropertyReachingIncompleteReason::UnsupportedLocation {
-                            point: relation.point.id(),
-                            event_index: relation.event_index,
-                        },
-                    );
-                }
-            }
-            ValueFlowRelationKind::MemoryLoad => {
-                let Some(location) = endpoint_location(&relation.source) else {
-                    if field_memory_event(&procedure, relation) {
-                        incomplete_reasons.push(
-                            PropertyReachingIncompleteReason::FieldMemoryEndpointUnavailable {
-                                point: relation.point.id(),
-                                event_index: relation.event_index,
-                                relation: relation.kind,
-                            },
-                        );
-                    }
-                    continue;
-                };
-                let Some(value) = endpoint_value(&relation.target) else {
-                    if field_memory_event(&procedure, relation) {
-                        incomplete_reasons.push(
-                            PropertyReachingIncompleteReason::FieldMemoryEndpointUnavailable {
-                                point: relation.point.id(),
-                                event_index: relation.event_index,
-                                relation: relation.kind,
-                            },
-                        );
-                    }
-                    continue;
-                };
-                let reason_count = incomplete_reasons.len();
-                if let Some(record) = project_read(
-                    &procedure,
-                    relation,
-                    location,
-                    value,
-                    &mut incomplete_reasons,
-                ) {
-                    reads.push(record);
-                } else if reason_count == incomplete_reasons.len()
-                    && field_memory_event(&procedure, relation)
-                {
-                    incomplete_reasons.push(
-                        PropertyReachingIncompleteReason::UnsupportedLocation {
-                            point: relation.point.id(),
-                            event_index: relation.event_index,
-                        },
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
     if relation_limit < relations.len() {
         incomplete_reasons.push(
             PropertyReachingIncompleteReason::InputRelationBudgetExceeded {
@@ -1264,6 +1385,7 @@ where
         relation_limit,
         stores.iter().map(|store| &store.location),
         reads.iter().map(|read| &read.location),
+        cancellation,
     );
     if !property_coverage.is_exhaustive() {
         incomplete_reasons.push(PropertyReachingIncompleteReason::CandidateCoverage(
@@ -1287,6 +1409,745 @@ where
         );
     }
 
+    derive_property_reaching_from_records(
+        procedure,
+        graph,
+        entry,
+        stores,
+        reads,
+        evaluations,
+        property_coverage,
+        incomplete_reasons,
+        evaluation_incomplete_reasons,
+        limits,
+        cancellation,
+    )
+}
+
+/// Derive property reaching for the unique property read at `point`.
+///
+/// Projection uses the same durable identities as aggregate analysis. The
+/// receiver and its alias closure scope candidate blockers before the shared
+/// CFG kernel assigns reaching rows.
+pub fn derive_selected_property_reaching_over_graph<G>(
+    snapshot: &ValueFlowSnapshot,
+    graph: &G,
+    entry: ProgramPointId,
+    point: ProgramPointId,
+    limits: PropertyReachingLimits,
+    cancellation: &CancellationToken,
+) -> PropertyReachingResult
+where
+    G: DenseBidirectionalGraph<Node = ProgramPointId>,
+{
+    let procedure = snapshot.procedure().clone();
+    let relations = snapshot.relations();
+    let relation_limit = limits.max_input_relations.min(relations.len());
+    let projection = project_property_relations(
+        &procedure,
+        relations.iter().take(relation_limit).filter(|relation| {
+            if cancellation.is_cancelled() {
+                return true;
+            }
+            let event = relation_event(&procedure, relation);
+            !matches!(
+                memory_relation_role(relation, &event.effect),
+                Some(MemoryRelationRole::Supplemental)
+            )
+        }),
+        cancellation,
+    );
+    let read_events = property_read_event_indices(&procedure, point);
+    let mut incomplete_reasons = Vec::new();
+    let selected_read = match read_events.as_slice() {
+        [] => {
+            incomplete_reasons
+                .push(PropertyReachingIncompleteReason::SelectedReadMissing { point });
+            None
+        }
+        [event_index] => projection
+            .reads
+            .iter()
+            .find(|read| read.point.id() == point && read.event_index == *event_index)
+            .cloned()
+            .or_else(|| {
+                incomplete_reasons
+                    .push(PropertyReachingIncompleteReason::SelectedReadMissing { point });
+                None
+            }),
+        _ => {
+            incomplete_reasons.push(PropertyReachingIncompleteReason::SelectedReadAmbiguous {
+                point,
+                event_indices: read_events.clone().into_boxed_slice(),
+            });
+            None
+        }
+    };
+    let selected_read_missing = selected_read.is_none();
+    if selected_read_missing {
+        incomplete_reasons.extend(selected_point_endpoint_reasons(
+            snapshot,
+            relations,
+            relation_limit,
+            point,
+            cancellation,
+        ));
+    }
+
+    if relation_limit < relations.len() {
+        incomplete_reasons.push(
+            PropertyReachingIncompleteReason::InputRelationBudgetExceeded {
+                limit: limits.max_input_relations,
+                observed: relation_limit,
+            },
+        );
+    }
+    if cancellation.is_cancelled()
+        || projection
+            .incomplete_reasons
+            .iter()
+            .any(|reason| matches!(reason, PropertyReachingIncompleteReason::Cancelled))
+    {
+        incomplete_reasons.push(PropertyReachingIncompleteReason::Cancelled);
+    }
+
+    if relation_limit < relations.len()
+        || snapshot.coverage().is_truncated()
+        || cancellation.is_cancelled()
+    {
+        let reads = selected_read.into_iter().collect::<Vec<_>>();
+        let stores = projection
+            .stores
+            .into_iter()
+            .filter(|store| reads.iter().any(|read| store.location == read.location))
+            .collect();
+        incomplete_reasons.extend(projection.incomplete_reasons);
+        let coverage = if relation_limit < relations.len() || snapshot.coverage().is_truncated() {
+            CandidateCoverage::Truncated
+        } else {
+            CandidateCoverage::Open
+        };
+        incomplete_reasons.push(PropertyReachingIncompleteReason::CandidateCoverage(
+            coverage,
+        ));
+        return derive_property_reaching_from_records(
+            procedure,
+            graph,
+            entry,
+            stores,
+            reads,
+            Vec::new(),
+            coverage,
+            incomplete_reasons,
+            Vec::new(),
+            limits,
+            cancellation,
+        );
+    }
+
+    let (stores, reads, coverage, scoped_event_keys) = if let Some(read) = selected_read {
+        let stores = projection
+            .stores
+            .iter()
+            .filter(|store| store.location == read.location)
+            .cloned()
+            .collect::<Vec<_>>();
+        let (scope_reasons, scoped_event_keys) = selected_property_scope_reasons(
+            snapshot,
+            relations,
+            relation_limit,
+            &read,
+            &projection.stores,
+            cancellation,
+        );
+        incomplete_reasons.extend(scope_reasons);
+        let coverage = property_candidate_coverage(
+            snapshot,
+            relations,
+            relation_limit,
+            stores.iter().map(|store| &store.location),
+            std::iter::once(&read.location),
+            cancellation,
+        );
+        if !coverage.is_exhaustive() {
+            incomplete_reasons.push(PropertyReachingIncompleteReason::CandidateCoverage(
+                coverage,
+            ));
+        }
+        (stores, vec![read], coverage, scoped_event_keys)
+    } else {
+        let coverage = if relation_limit < relations.len() || snapshot.coverage().is_truncated() {
+            CandidateCoverage::Truncated
+        } else {
+            CandidateCoverage::Open
+        };
+        incomplete_reasons.push(PropertyReachingIncompleteReason::CandidateCoverage(
+            coverage,
+        ));
+        (Vec::new(), Vec::new(), coverage, HashSet::new())
+    };
+
+    for reason in projection.incomplete_reasons {
+        if incomplete_reason_event_key(&reason).is_some_and(|key| {
+            scoped_event_keys.contains(&key) || (selected_read_missing && key.0 == point)
+        }) {
+            incomplete_reasons.push(reason);
+        }
+    }
+
+    derive_property_reaching_from_records(
+        procedure,
+        graph,
+        entry,
+        stores,
+        reads,
+        Vec::new(),
+        coverage,
+        incomplete_reasons,
+        Vec::new(),
+        limits,
+        cancellation,
+    )
+}
+
+fn property_read_event_indices(procedure: &ProcedureHandle, point: ProgramPointId) -> Vec<u32> {
+    procedure
+        .semantics()
+        .point(point)
+        .into_iter()
+        .flat_map(|point| point.events.iter().enumerate())
+        .filter_map(|(index, event)| {
+            matches!(
+                event.effect,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Field
+                        | MemoryAccessKind::Property
+                        | MemoryAccessKind::Index
+                        | MemoryAccessKind::Dereference,
+                    ..
+                }
+            )
+            .then_some(index as u32)
+        })
+        .collect()
+}
+
+fn selected_point_endpoint_reasons(
+    snapshot: &ValueFlowSnapshot,
+    relations: &[ValueFlowRelation],
+    relation_limit: usize,
+    point: ProgramPointId,
+    cancellation: &CancellationToken,
+) -> Vec<PropertyReachingIncompleteReason> {
+    let procedure = snapshot.procedure();
+    let mut reasons = Vec::new();
+    let mut canonical_operations = CanonicalMemoryOperationKeys::new();
+    let mut relation_scan_complete =
+        relation_limit == relations.len() && !snapshot.coverage().is_truncated();
+    for relation in relations.iter().take(relation_limit) {
+        if cancellation.is_cancelled() {
+            reasons.push(PropertyReachingIncompleteReason::Cancelled);
+            relation_scan_complete = false;
+            break;
+        }
+        if relation.kind != ValueFlowRelationKind::MemoryLoad || relation.point.id() != point {
+            continue;
+        }
+        let event = relation_event(procedure, relation);
+        if !matches!(
+            event.effect,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Field
+                    | MemoryAccessKind::Property
+                    | MemoryAccessKind::Index
+                    | MemoryAccessKind::Dereference,
+                ..
+            }
+        ) {
+            continue;
+        }
+        let role = memory_relation_role(relation, &event.effect)
+            .expect("a validated memory-load row has a producer-attested origin");
+        if role == MemoryRelationRole::Supplemental {
+            continue;
+        }
+        if role == MemoryRelationRole::Canonical {
+            record_canonical_memory_operation(&mut canonical_operations, relation);
+        }
+
+        let source = event.source;
+        let source_locator = procedure.source_locator(source).cloned();
+        if endpoint_location(&relation.source).is_none() {
+            reasons.push(
+                PropertyReachingIncompleteReason::SelectedRelationEndpointUnavailable {
+                    point,
+                    event_index: relation.event_index,
+                    relation: relation.kind,
+                    endpoint: PropertyEndpointSide::Source,
+                    source,
+                    source_locator: source_locator.clone(),
+                },
+            );
+        }
+        if endpoint_value(&relation.target).is_none() {
+            reasons.push(
+                PropertyReachingIncompleteReason::SelectedRelationEndpointUnavailable {
+                    point,
+                    event_index: relation.event_index,
+                    relation: relation.kind,
+                    endpoint: PropertyEndpointSide::Target,
+                    source,
+                    source_locator,
+                },
+            );
+        }
+    }
+
+    if relation_scan_complete && let Some(point_row) = procedure.semantics().point(point) {
+        let point_handle = procedure
+            .point_handle(point)
+            .expect("a retained semantic point has a procedure handle");
+        for (index, event) in point_row.events.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                reasons.push(PropertyReachingIncompleteReason::Cancelled);
+                break;
+            }
+            let location = match event.effect {
+                SemanticEffect::MemoryLoad {
+                    kind:
+                        MemoryAccessKind::Field
+                        | MemoryAccessKind::Property
+                        | MemoryAccessKind::Index
+                        | MemoryAccessKind::Dereference,
+                    location,
+                    ..
+                } => location,
+                _ => continue,
+            };
+            let event_index =
+                u32::try_from(index).expect("validated event indices fit semantic IDs");
+            if !canonical_memory_operation_is_present(
+                &canonical_operations,
+                &point_handle,
+                event_index,
+                location,
+                snapshot.context(),
+            ) {
+                reasons.push(
+                    PropertyReachingIncompleteReason::SelectedRelationEndpointUnavailable {
+                        point,
+                        event_index,
+                        relation: ValueFlowRelationKind::MemoryLoad,
+                        endpoint: PropertyEndpointSide::Source,
+                        source: event.source,
+                        source_locator: procedure.source_locator(event.source).cloned(),
+                    },
+                );
+            }
+        }
+    }
+    reasons
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedPathRelation {
+    Exact,
+    Ancestor,
+    Disjoint,
+    Unknown,
+}
+
+fn selected_path_relation(
+    location: &AbstractLocation,
+    selected: &PropertyLocationIdentity,
+) -> SelectedPathRelation {
+    let mut actual = Vec::with_capacity(location.path().selectors().len());
+    for selector in location.path().selectors() {
+        let selector = match selector {
+            AccessSelector::Field(field) => PropertyAccessSelector::Field(field.locator().clone()),
+            AccessSelector::Property(_) => return SelectedPathRelation::Unknown,
+            AccessSelector::Index(IndexSelector::Exact(value)) => {
+                let Ok(identity) = DurableValueIdentity::of(value) else {
+                    return SelectedPathRelation::Unknown;
+                };
+                PropertyAccessSelector::IndexExact(identity)
+            }
+            AccessSelector::Index(IndexSelector::Constant(index)) => {
+                PropertyAccessSelector::IndexConstant(*index)
+            }
+            AccessSelector::Index(IndexSelector::Any) => return SelectedPathRelation::Unknown,
+        };
+        actual.push(selector);
+    }
+    let mut expected = selected.access_path.to_vec();
+    expected.push(PropertyAccessSelector::Field(selected.member.clone()));
+    let common = actual.len().min(expected.len());
+    if actual[..common] != expected[..common] {
+        return SelectedPathRelation::Disjoint;
+    }
+    if actual.len() == expected.len() {
+        SelectedPathRelation::Exact
+    } else if actual.len() < expected.len() {
+        SelectedPathRelation::Ancestor
+    } else {
+        // A read of an ancestor and a store below the selected cell do not
+        // replace the selected property value.
+        SelectedPathRelation::Disjoint
+    }
+}
+
+fn selected_property_scope_reasons(
+    snapshot: &ValueFlowSnapshot,
+    relations: &[ValueFlowRelation],
+    relation_limit: usize,
+    selected_read: &PropertyReadRecord,
+    projected_stores: &[PropertyStoreRecord],
+    cancellation: &CancellationToken,
+) -> (
+    Vec<PropertyReachingIncompleteReason>,
+    HashSet<(ProgramPointId, u32)>,
+) {
+    let procedure = snapshot.procedure();
+    let mut reasons = Vec::new();
+    let mut scoped_event_keys = HashSet::new();
+    scoped_event_keys.insert((selected_read.point.id(), selected_read.event_index));
+    for store in projected_stores
+        .iter()
+        .filter(|store| store.location == selected_read.location)
+    {
+        scoped_event_keys.insert((store.point.id(), store.event_index));
+    }
+
+    let selected_aliases = closed_local_allocation_aliases(
+        snapshot,
+        relations,
+        &selected_read.location.receiver,
+        cancellation,
+    );
+    if selected_aliases.is_none() {
+        reasons.push(
+            PropertyReachingIncompleteReason::SelectedAliasClosureUnavailable {
+                receiver: selected_read.location.receiver.clone(),
+            },
+        );
+    }
+
+    let mut canonical_operations = CanonicalMemoryOperationKeys::new();
+    for relation in relations.iter().take(relation_limit) {
+        if cancellation.is_cancelled() {
+            reasons.push(PropertyReachingIncompleteReason::Cancelled);
+            break;
+        }
+        let event = relation_event(procedure, relation);
+        let role = memory_relation_role(relation, &event.effect);
+        if role == Some(MemoryRelationRole::Supplemental) {
+            continue;
+        }
+        let (access_kind, is_store) = match &event.effect {
+            SemanticEffect::MemoryStore { kind, .. }
+                if matches!(
+                    kind,
+                    MemoryAccessKind::Field
+                        | MemoryAccessKind::Property
+                        | MemoryAccessKind::Index
+                        | MemoryAccessKind::Dereference
+                ) =>
+            {
+                (*kind, true)
+            }
+            SemanticEffect::MemoryLoad { kind, .. }
+                if matches!(
+                    kind,
+                    MemoryAccessKind::Field
+                        | MemoryAccessKind::Property
+                        | MemoryAccessKind::Index
+                        | MemoryAccessKind::Dereference
+                ) =>
+            {
+                (*kind, false)
+            }
+            _ => continue,
+        };
+        if role == Some(MemoryRelationRole::Canonical) {
+            record_canonical_memory_operation(&mut canonical_operations, relation);
+        }
+        let endpoint_side = if is_store {
+            PropertyEndpointSide::Target
+        } else {
+            PropertyEndpointSide::Source
+        };
+        let location = if is_store {
+            endpoint_location(&relation.target)
+        } else {
+            endpoint_location(&relation.source)
+        };
+        let source = event.source;
+        let source_locator = procedure.source_locator(source).cloned();
+        let Some(location) = location else {
+            scoped_event_keys.insert((relation.point.id(), relation.event_index));
+            reasons.push(
+                PropertyReachingIncompleteReason::SelectedRelationEndpointUnavailable {
+                    point: relation.point.id(),
+                    event_index: relation.event_index,
+                    relation: relation.kind,
+                    endpoint: endpoint_side,
+                    source,
+                    source_locator,
+                },
+            );
+            continue;
+        };
+
+        let receiver = location.object().identity().durable_identity().ok();
+        let Some(receiver) = receiver else {
+            scoped_event_keys.insert((relation.point.id(), relation.event_index));
+            reasons.push(PropertyReachingIncompleteReason::SelectedRuntimeAccess {
+                point: relation.point.id(),
+                event_index: relation.event_index,
+                source,
+                source_locator,
+                receiver: None,
+            });
+            continue;
+        };
+
+        let path_relation = selected_path_relation(location, &selected_read.location);
+        if access_kind == MemoryAccessKind::Property
+            || path_relation == SelectedPathRelation::Unknown
+        {
+            scoped_event_keys.insert((relation.point.id(), relation.event_index));
+            reasons.push(PropertyReachingIncompleteReason::SelectedRuntimeAccess {
+                point: relation.point.id(),
+                event_index: relation.event_index,
+                source,
+                source_locator,
+                receiver: Some(receiver),
+            });
+            continue;
+        }
+
+        if receiver != selected_read.location.receiver {
+            let receiver_aliases =
+                closed_local_allocation_aliases(snapshot, relations, &receiver, cancellation);
+            match (selected_aliases.as_ref(), receiver_aliases) {
+                (Some(selected_aliases), Some(receiver_aliases))
+                    if receiver_aliases.is_disjoint(selected_aliases) =>
+                {
+                    continue;
+                }
+                (Some(_), Some(_)) => {}
+                _ => {
+                    scoped_event_keys.insert((relation.point.id(), relation.event_index));
+                    reasons.push(PropertyReachingIncompleteReason::SelectedRuntimeAccess {
+                        point: relation.point.id(),
+                        event_index: relation.event_index,
+                        source,
+                        source_locator,
+                        receiver: Some(receiver),
+                    });
+                    continue;
+                }
+            }
+        }
+
+        if (is_store && endpoint_value(&relation.source).is_none())
+            || (!is_store && endpoint_value(&relation.target).is_none())
+        {
+            scoped_event_keys.insert((relation.point.id(), relation.event_index));
+            reasons.push(
+                PropertyReachingIncompleteReason::SelectedRelationEndpointUnavailable {
+                    point: relation.point.id(),
+                    event_index: relation.event_index,
+                    relation: relation.kind,
+                    endpoint: if is_store {
+                        PropertyEndpointSide::Source
+                    } else {
+                        PropertyEndpointSide::Target
+                    },
+                    source,
+                    source_locator: source_locator.clone(),
+                },
+            );
+        }
+
+        if path_relation == SelectedPathRelation::Exact {
+            // A projection failure cannot remove this key from the selected
+            // dependency set merely because no public store record survived.
+            scoped_event_keys.insert((relation.point.id(), relation.event_index));
+        }
+        if is_store && path_relation == SelectedPathRelation::Ancestor {
+            let mut projection_reasons = Vec::new();
+            let projected_location = project_location(
+                procedure,
+                relation.point.id(),
+                relation.event_index,
+                location,
+                &mut projection_reasons,
+            );
+            scoped_event_keys.insert((relation.point.id(), relation.event_index));
+            reasons.push(PropertyReachingIncompleteReason::SelectedAncestorStore {
+                point: relation.point.id(),
+                event_index: relation.event_index,
+                source,
+                source_locator: source_locator.clone(),
+                location: projected_location,
+            });
+            continue;
+        }
+        if path_relation == SelectedPathRelation::Disjoint {
+            continue;
+        }
+    }
+
+    for point in procedure.semantics().points() {
+        if cancellation.is_cancelled() {
+            reasons.push(PropertyReachingIncompleteReason::Cancelled);
+            break;
+        }
+        let mut point_handle_slot = None;
+        for (index, event) in point.events.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                reasons.push(PropertyReachingIncompleteReason::Cancelled);
+                break;
+            }
+            let (relation, endpoint, location) = match event.effect {
+                SemanticEffect::MemoryStore {
+                    kind:
+                        MemoryAccessKind::Field
+                        | MemoryAccessKind::Property
+                        | MemoryAccessKind::Index
+                        | MemoryAccessKind::Dereference,
+                    location,
+                    ..
+                } => (
+                    ValueFlowRelationKind::MemoryStore,
+                    PropertyEndpointSide::Target,
+                    location,
+                ),
+                SemanticEffect::MemoryLoad {
+                    kind:
+                        MemoryAccessKind::Field
+                        | MemoryAccessKind::Property
+                        | MemoryAccessKind::Index
+                        | MemoryAccessKind::Dereference,
+                    location,
+                    ..
+                } => (
+                    ValueFlowRelationKind::MemoryLoad,
+                    PropertyEndpointSide::Source,
+                    location,
+                ),
+                _ => continue,
+            };
+            let event_index =
+                u32::try_from(index).expect("validated event indices fit semantic IDs");
+            let point_handle = point_handle_slot.get_or_insert_with(|| {
+                procedure
+                    .point_handle(point.id)
+                    .expect("a retained semantic point has a procedure handle")
+            });
+            if !canonical_memory_operation_is_present(
+                &canonical_operations,
+                point_handle,
+                event_index,
+                location,
+                snapshot.context(),
+            ) {
+                // The selected proof requires the producer's canonical row;
+                // alternatives and supplemental rows do not establish it.
+                scoped_event_keys.insert((point.id, event_index));
+                reasons.push(
+                    PropertyReachingIncompleteReason::SelectedRelationEndpointUnavailable {
+                        point: point.id,
+                        event_index,
+                        relation,
+                        endpoint,
+                        source: event.source,
+                        source_locator: procedure.source_locator(event.source).cloned(),
+                    },
+                );
+            }
+        }
+    }
+
+    for gap in procedure.semantics().gaps() {
+        // A scoped storage projection does not invent a new discharge for
+        // executable runtime behavior or control. Only the exact publishing
+        // snapshot's reviewed discharge can close these obligations. Preserve
+        // full gap provenance even when its value is not a selected endpoint.
+        if !snapshot.gap_is_discharged(gap.id) {
+            reasons
+                .push(PropertyReachingIncompleteReason::SelectedSemanticGap { gap: gap.clone() });
+        }
+    }
+
+    (reasons, scoped_event_keys)
+}
+
+fn incomplete_reason_event_key(
+    reason: &PropertyReachingIncompleteReason,
+) -> Option<(ProgramPointId, u32)> {
+    match reason {
+        PropertyReachingIncompleteReason::UnsupportedLocation { point, event_index }
+        | PropertyReachingIncompleteReason::DurableIdentityUnavailable {
+            point, event_index, ..
+        }
+        | PropertyReachingIncompleteReason::SourceMappingUnavailable {
+            point, event_index, ..
+        }
+        | PropertyReachingIncompleteReason::StoreEvidenceIncomplete {
+            point, event_index, ..
+        }
+        | PropertyReachingIncompleteReason::ReadEvidenceIncomplete {
+            point, event_index, ..
+        }
+        | PropertyReachingIncompleteReason::FieldMemoryEndpointUnavailable {
+            point,
+            event_index,
+            ..
+        }
+        | PropertyReachingIncompleteReason::EvaluationEndpointUnavailable {
+            point,
+            event_index,
+            ..
+        }
+        | PropertyReachingIncompleteReason::EvaluationEvidenceIncomplete {
+            point,
+            event_index,
+            ..
+        }
+        | PropertyReachingIncompleteReason::SelectedRelationEndpointUnavailable {
+            point,
+            event_index,
+            ..
+        }
+        | PropertyReachingIncompleteReason::SelectedRuntimeAccess {
+            point, event_index, ..
+        } => Some((*point, *event_index)),
+        PropertyReachingIncompleteReason::SelectedAncestorStore {
+            point, event_index, ..
+        } => Some((*point, *event_index)),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derive_property_reaching_from_records<G>(
+    procedure: ProcedureHandle,
+    graph: &G,
+    entry: ProgramPointId,
+    mut stores: Vec<PropertyStoreRecord>,
+    mut reads: Vec<PropertyReadRecord>,
+    evaluations: Vec<EvaluationRelationRecord>,
+    property_coverage: CandidateCoverage,
+    mut incomplete_reasons: Vec<PropertyReachingIncompleteReason>,
+    evaluation_incomplete_reasons: Vec<PropertyReachingIncompleteReason>,
+    limits: PropertyReachingLimits,
+    cancellation: &CancellationToken,
+) -> PropertyReachingResult
+where
+    G: DenseBidirectionalGraph<Node = ProgramPointId>,
+{
     stores.sort_by_key(|store| (store.point.id(), store.event_index));
     reads.sort_by_key(|read| (read.point.id(), read.event_index));
 
@@ -1487,6 +2348,7 @@ fn property_candidate_coverage<'store, 'read>(
     relation_limit: usize,
     stores: impl Iterator<Item = &'store PropertyLocationIdentity>,
     reads: impl Iterator<Item = &'read PropertyLocationIdentity>,
+    cancellation: &CancellationToken,
 ) -> CandidateCoverage {
     if relation_limit < relations.len() || snapshot.coverage().is_truncated() {
         return CandidateCoverage::Truncated;
@@ -1527,10 +2389,9 @@ fn property_candidate_coverage<'store, 'read>(
     if receivers.is_empty() {
         return CandidateCoverage::Exhaustive;
     }
-    if receivers
-        .iter()
-        .all(|receiver| closed_local_allocation_aliases(snapshot, relations, receiver).is_some())
-    {
+    if receivers.iter().all(|receiver| {
+        closed_local_allocation_aliases(snapshot, relations, receiver, cancellation).is_some()
+    }) {
         CandidateCoverage::Exhaustive
     } else {
         CandidateCoverage::Open
@@ -1545,6 +2406,7 @@ fn closed_local_allocation_aliases(
     snapshot: &ValueFlowSnapshot,
     relations: &[ValueFlowRelation],
     receiver: &super::oracle::DurableObjectIdentity,
+    cancellation: &CancellationToken,
 ) -> Option<HashSet<ValueId>> {
     if !matches!(
         receiver,
@@ -1557,6 +2419,9 @@ fn closed_local_allocation_aliases(
     let mut aliases = HashSet::new();
     let mut found_allocation = false;
     for relation in relations {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         if relation.kind != ValueFlowRelationKind::Allocation {
             continue;
         }
@@ -1592,6 +2457,9 @@ fn closed_local_allocation_aliases(
     while changed {
         changed = false;
         for relation in relations {
+            if cancellation.is_cancelled() {
+                return None;
+            }
             if relation.kind != ValueFlowRelationKind::Assignment || relation.transfer.is_some() {
                 continue;
             }
@@ -1610,6 +2478,9 @@ fn closed_local_allocation_aliases(
         }
     }
 
+    if cancellation.is_cancelled() {
+        return None;
+    }
     let semantics = snapshot.procedure().semantics();
     if semantics.call_sites().iter().any(|call| {
         call.receiver.is_some_and(|value| aliases.contains(&value))

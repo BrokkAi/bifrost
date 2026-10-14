@@ -16,7 +16,7 @@ use super::super::flow_state::{
     FLOW_STATE_AXES, FileFlowState, FlowRelationRow, FlowStateAxis, FlowStateCompleteness,
     FlowStateDerivation, FlowStateIncompleteReason, FlowStateRequest, StateEventRow,
     flow_state_for_file_with_snapshot, flow_state_for_materialized_artifact,
-    flow_state_for_materialized_procedure,
+    flow_state_for_materialized_procedure, flow_state_for_selected_property,
 };
 use super::rel_path_string;
 use super::results::{
@@ -27,8 +27,8 @@ use super::results::{
 #[cfg(test)]
 use crate::analyzer::semantic::SemanticGapKind;
 use crate::analyzer::semantic::{
-    LengthDelimitedDigest, ProcedureHandle, ProcedureId, SemanticArtifact, SemanticCapability,
-    SemanticOutcome,
+    LengthDelimitedDigest, ProcedureHandle, ProcedureId, ProgramPointId, SemanticArtifact,
+    SemanticCapability, SemanticOutcome,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{Language, ProjectFile, WorkspaceAnalyzer};
@@ -248,6 +248,32 @@ impl FlowStateTraversalCache {
         )
     }
 
+    /// Derive property-reaching rows for one exact point from its retained
+    /// procedure artifact and this request's frozen semantic-model snapshot.
+    pub(super) fn for_selected_property(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        file: &ProjectFile,
+        outcome: SemanticOutcome<Arc<SemanticArtifact>>,
+        procedure: &ProcedureHandle,
+        point: ProgramPointId,
+        cancellation: Option<&CancellationToken>,
+    ) -> Arc<FileFlowState> {
+        let state =
+            self.for_materialized_procedure(workspace, file, outcome, procedure, cancellation);
+        let token = cancellation.cloned().unwrap_or_default();
+        let mut request = FlowStateRequest::new(&token)
+            .with_active_semantic_model_snapshot(self.active_semantic_model_snapshot.clone());
+        Arc::new(flow_state_for_selected_property(
+            workspace,
+            file,
+            &state,
+            procedure,
+            point,
+            &mut request,
+        ))
+    }
+
     fn cached_materialized_scope<F>(
         &mut self,
         file: &ProjectFile,
@@ -401,6 +427,10 @@ fn classify_reason(reason: &FlowStateIncompleteReason) -> (CodeQueryDiagnosticCo
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "a control-flow algorithm exhausted its budget, so its relation emitted no rows",
         ),
+        SelectedPropertyEndpointUnavailable { .. } => (
+            CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
+            "a selected semantic property endpoint has no public event projection",
+        ),
         PropertyBaseNotCanonical { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "a field access has no binding-rooted base, so it contributes no property subject",
@@ -461,6 +491,10 @@ pub(super) struct StateEventValue {
     /// Exact request-retained semantic procedure used to relate the event's
     /// establishment value to call results in its initializer.
     pub(super) procedure: ProcedureHandle,
+    /// A scoped relation endpoint still belongs to the original aggregate
+    /// derivation. Its origin tells a subsequent aggregate expansion to emit
+    /// that scope's coverage before filtering.
+    pub(super) selected_property_origin: Option<ProgramPointId>,
 }
 
 impl StateEventValue {
@@ -481,12 +515,22 @@ impl StateEventValue {
             file: self.file.clone(),
             procedure: self.procedure_id.to_string(),
             event: self.event,
+            selected_property_origin: self.selected_property_origin,
         }
     }
 
     pub(super) fn id(&self) -> String {
         state_event_id(&self.procedure_id, self.row())
     }
+}
+
+/// Evidence for one selected read. It retains only its relation rows and
+/// coverage; endpoints remain in the shared aggregate derivation.
+#[derive(Debug)]
+pub(super) struct SelectedPropertyRelations {
+    pub(super) point: ProgramPointId,
+    pub(super) relations: Box<[FlowRelationRow]>,
+    pub(super) completeness: FlowStateCompleteness,
 }
 
 /// One flow-relation row travelling through the pipeline.
@@ -498,6 +542,7 @@ pub(super) struct FlowRelationValue {
     pub(super) file: ProjectFile,
     pub(super) procedure_id: Arc<str>,
     pub(super) procedure: ProcedureHandle,
+    pub(super) selected_property: Option<Arc<SelectedPropertyRelations>>,
 }
 
 impl FlowRelationValue {
@@ -506,7 +551,17 @@ impl FlowRelationValue {
     }
 
     pub(super) fn row(&self) -> &FlowRelationRow {
-        &self.derivation().relations[self.relation]
+        match &self.selected_property {
+            Some(proof) => &proof.relations[self.relation],
+            None => &self.derivation().relations[self.relation],
+        }
+    }
+
+    fn completeness(&self) -> &FlowStateCompleteness {
+        match &self.selected_property {
+            Some(proof) => &proof.completeness,
+            None => &self.derivation().completeness,
+        }
     }
 
     pub(super) fn source(&self) -> &StateEventRow {
@@ -528,6 +583,8 @@ impl FlowRelationValue {
             file: self.file.clone(),
             procedure: self.procedure_id.to_string(),
             relation: self.relation,
+            selected_property_origin: self.selected_property.as_ref().map(|proof| proof.point),
+            selected_relation: self.selected_property.as_ref().map(|_| self.id()),
         }
     }
 
@@ -554,6 +611,7 @@ impl FlowRelationValue {
             file: self.file.clone(),
             procedure_id: Arc::clone(&self.procedure_id),
             procedure: self.procedure.clone(),
+            selected_property_origin: self.selected_property.as_ref().map(|proof| proof.point),
         }
     }
 }
@@ -587,6 +645,7 @@ pub(super) struct StateEventKey {
     pub(super) file: ProjectFile,
     pub(super) procedure: String,
     pub(super) event: usize,
+    pub(super) selected_property_origin: Option<ProgramPointId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -594,6 +653,8 @@ pub(super) struct FlowRelationKey {
     pub(super) file: ProjectFile,
     pub(super) procedure: String,
     pub(super) relation: usize,
+    pub(super) selected_property_origin: Option<ProgramPointId>,
+    pub(super) selected_relation: Option<String>,
 }
 
 pub(super) fn state_event_filter_matches(filter: &StateEventFilter, row: &StateEventRow) -> bool {
@@ -676,10 +737,10 @@ pub(super) fn public_flow_relation(
         source: state_event_ref(&value.procedure_id, value.source(), source_range),
         target: state_event_ref(&value.procedure_id, value.target(), target_range),
         completeness: axis_completeness_label(
-            &value.derivation().completeness,
+            value.completeness(),
             row.relation.axis_for_subject(value.target().subject.kind()),
         ),
-        uncovered_axes: uncovered_axes(&value.derivation().completeness),
+        uncovered_axes: uncovered_axes(value.completeness()),
         generation: row.generation,
     }
 }

@@ -787,6 +787,7 @@ pub(super) fn state_event_expansions(
                 file: file.clone(),
                 procedure_id: Arc::clone(&procedure_id),
                 procedure: procedure.handle.clone(),
+                selected_property_origin: None,
             },
         ))));
     }
@@ -823,13 +824,168 @@ pub(super) fn flow_relation_expansions(
     )
 }
 
+/// Derive only the property-reaching relations for the exact read point
+/// selected by the caller. Completeness comes from the scoped derivation, and
+/// its full typed reasons are retained in one diagnostic rather than folded
+/// into the aggregate flow-state summary.
+pub(super) fn selected_property_relation_expansions(
+    workspace: &WorkspaceAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    flow_state_cache: &mut FlowStateTraversalCache,
+    point: &SemanticProgramPointValue,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    let file = point.file();
+    let public_point = point.public();
+    if let Some(reason) = point.exact_selection_incomplete_reason() {
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: format!(
+                "{} selected property relations require complete program-point selection for {}: {reason}",
+                rel_path_string(file),
+                public_point.id
+            ),
+            exhausted_roots: Vec::new(),
+        });
+        return Vec::new();
+    }
+    let Some(outcome) = semantic.materialized_outcome(file) else {
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: format!(
+                "{} selected property relations for program point {} have no retained semantic artifact",
+                rel_path_string(file),
+                public_point.id
+            ),
+            exhausted_roots: Vec::new(),
+        });
+        return Vec::new();
+    };
+
+    let procedure = point.handle.procedure().clone();
+    let aggregate = flow_state_cache.for_materialized_procedure(
+        workspace,
+        file,
+        outcome.clone(),
+        &procedure,
+        cancellation,
+    );
+    let scoped = flow_state_cache.for_selected_property(
+        workspace,
+        file,
+        outcome,
+        &procedure,
+        point.handle.id(),
+        cancellation,
+    );
+    report_selected_property_completeness(file, &public_point.id, &scoped, diagnostics);
+
+    let Some(procedure_index) = aggregate
+        .procedures
+        .iter()
+        .position(|derivation| derivation.procedure == procedure.id())
+    else {
+        return Vec::new();
+    };
+    if scoped.procedures.is_empty() {
+        return Vec::new();
+    }
+    let scoped = Arc::try_unwrap(scoped).expect("the selected answer has one query-local owner");
+    assert_eq!(scoped.procedures.len(), 1, "one selected procedure");
+    let derived = scoped
+        .procedures
+        .into_iter()
+        .next()
+        .expect("selected procedure");
+    let proof = Arc::new(flow_state::SelectedPropertyRelations {
+        point: point.handle.id(),
+        relations: derived.relations.into_boxed_slice(),
+        completeness: derived.completeness,
+    });
+    let procedure_id: Arc<str> = Arc::from(public_point.procedure_id);
+    (0..proof.relations.len())
+        .map(|relation| {
+            pipeline_expansion(PipelineValue::FlowRelation(Box::new(FlowRelationValue {
+                file_state: Arc::clone(&aggregate),
+                procedure_index,
+                relation,
+                file: file.clone(),
+                procedure_id: Arc::clone(&procedure_id),
+                procedure: procedure.clone(),
+                selected_property: Some(Arc::clone(&proof)),
+            })))
+        })
+        .collect()
+}
+
+fn report_selected_property_completeness(
+    file: &ProjectFile,
+    point_id: &str,
+    scoped: &super::super::flow_state::FileFlowState,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) {
+    let reasons = scoped
+        .completeness
+        .reasons()
+        .iter()
+        .filter(|reason| {
+            reason.blocks(super::super::flow_state::FlowStateAxis::PropertyReachingRelation)
+        })
+        .collect::<Vec<_>>();
+    if reasons.is_empty() {
+        return;
+    }
+
+    diagnostics.push(CodeQueryDiagnostic {
+        code: CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: "workspace",
+        message: format!(
+            "{} selected property-reaching relations for program point {point_id} are incomplete in generation {}: reasons={reasons:?}",
+            rel_path_string(file),
+            scoped.generation
+        ),
+        exhausted_roots: Vec::new(),
+    });
+}
+
 /// The flow relations incident to one state event: seeded from an event, an
 /// author is asking what serves (or is served by) exactly that event, so both
 /// ends are matched rather than the read end alone.
 pub(super) fn flow_relations_of_event(
     value: &StateEventValue,
     filter: &FlowRelationFilter,
+    flow_state_cache: &mut FlowStateTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
+    if value.selected_property_origin.is_some() {
+        let subject = rel_path_string(&value.file);
+        let language = crate::analyzer::common::language_for_file(&value.file);
+        flow_state_cache.report_completeness(
+            &subject,
+            language,
+            &value.file_state.completeness,
+            flow_state::FLOW_RELATION_AXES,
+            value.file_state.generation,
+            diagnostics,
+        );
+        flow_state_cache.report_completeness(
+            &subject,
+            language,
+            &value.derivation().completeness,
+            flow_state::FLOW_RELATION_AXES,
+            value.file_state.generation,
+            diagnostics,
+        );
+    }
     relation_expansions(
         &value.file_state,
         value.procedure_index,
@@ -871,6 +1027,7 @@ fn relation_expansions(
                 file: file.clone(),
                 procedure_id: Arc::clone(procedure_id),
                 procedure: procedure.clone(),
+                selected_property: None,
             },
         ))));
     }

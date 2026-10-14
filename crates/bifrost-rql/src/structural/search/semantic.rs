@@ -116,6 +116,20 @@ impl SemanticQueryQuality {
     fn is_complete(&self) -> bool {
         self.proof_reason.is_none() && self.completeness_reason.is_none()
     }
+
+    fn exact_selection_incomplete_reason(&self) -> Option<String> {
+        if self.is_complete() {
+            return None;
+        }
+        let mut reasons = Vec::new();
+        if let Some(reason) = &self.proof_reason {
+            reasons.push(format!("proof: {reason}"));
+        }
+        if let Some(reason) = &self.completeness_reason {
+            reasons.push(format!("coverage: {reason}"));
+        }
+        Some(reasons.join("; "))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1776,23 +1790,46 @@ impl<'a> SemanticQueryContext<'a> {
             == brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::Await;
         let mut points = Vec::new();
         for procedure in procedures {
+            // Await selection uses the observed suspend event below.
+            // Uniqueness depends on the complete point inventory, even
+            // when one point has an exact structural source mapping.
+            let quality = procedure.quality.combine(&self.capability_quality(
+                &procedure.file,
+                procedure.handle.artifact().as_ref(),
+                &[SemanticCapability::ProgramPoints],
+            ));
             let semantics = procedure.handle.semantics();
             for point in semantics.points() {
-                let Some(mapping) = semantics.source_mapping(point.source) else {
-                    continue;
-                };
-                if mapping.ast_identity != Some(identity) {
+                if !self.charge_consumer_traversal(&procedure.file, 1, "program-point selection") {
+                    return Vec::new();
+                }
+                let point_matches = semantics
+                    .source_mapping(point.source)
+                    .is_some_and(|mapping| mapping.ast_identity == Some(identity));
+                if !point_matches {
                     continue;
                 }
-                if is_await
-                    && !point
-                        .events
-                        .iter()
-                        .any(|event| matches!(event.effect, SemanticEffect::AsyncSuspend { .. }))
-                {
-                    continue;
+                if is_await {
+                    let mut suspend_matches = false;
+                    for event in &point.events {
+                        if !self.charge_consumer_traversal(
+                            &procedure.file,
+                            1,
+                            "program-point suspend selection",
+                        ) {
+                            return Vec::new();
+                        }
+                        if matches!(event.effect, SemanticEffect::AsyncSuspend { .. }) {
+                            suspend_matches = true;
+                            break;
+                        }
+                    }
+                    if !suspend_matches {
+                        continue;
+                    }
                 }
-                if let Some(value) = procedure.point_value(point.id) {
+                if let Some(mut value) = procedure.point_value(point.id) {
+                    value.quality = quality.clone();
                     points.push(value);
                 }
             }
@@ -1821,20 +1858,82 @@ impl<'a> SemanticQueryContext<'a> {
         Vec::new()
     }
 
+    fn program_point_by_id(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+        id: &str,
+    ) -> Vec<SemanticProgramPointValue> {
+        if !self.source_generation_is_current(
+            &procedure.file,
+            procedure.handle.artifact().key().revision().content(),
+        ) {
+            return Vec::new();
+        }
+        let quality = procedure.quality.combine(&self.capability_quality(
+            &procedure.file,
+            procedure.handle.artifact().as_ref(),
+            &[SemanticCapability::ProgramPoints],
+        ));
+        let mut points = Vec::new();
+        for point in procedure.handle.semantics().points() {
+            if !self.charge_consumer_traversal(&procedure.file, 1, "program-point ID selection") {
+                return Vec::new();
+            }
+            let handle = procedure
+                .handle
+                .point_handle(point.id)
+                .expect("a validated procedure owns its points");
+            if program_point_wire_id(&handle) != id {
+                continue;
+            }
+            points.push(SemanticProgramPointValue {
+                handle,
+                file: procedure.file.clone(),
+                source: procedure.source.clone(),
+                quality: quality.clone(),
+            });
+        }
+        if points.len() == 1 {
+            return points;
+        }
+        let matched_ids = points
+            .iter()
+            .map(|point| point.handle.id())
+            .collect::<Vec<_>>();
+        self.push_diagnostic(
+            CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
+            CodeQueryDiagnosticImpact::Incomplete,
+            &procedure.file,
+            &format!(
+                "program-point-by-id requires one content-scoped point {id:?} in procedure {}; matched program point ids: {matched_ids:?}",
+                procedure.wire_id()
+            ),
+        );
+        Vec::new()
+    }
+
     pub(super) fn seed_generation_is_current(&mut self, seed: &SeedMatch) -> bool {
+        self.source_generation_is_current(&seed.file, seed.facts.source_identity())
+    }
+
+    fn source_generation_is_current(
+        &mut self,
+        file: &ProjectFile,
+        identity: ContentIdentity,
+    ) -> bool {
         let current = *self
             .indexed_source_identities
-            .entry(seed.file.clone())
+            .entry(file.clone())
             .or_insert_with(|| {
                 self.workspace
                     .analyzer()
-                    .indexed_source(&seed.file)
+                    .indexed_source(file)
                     .map(|source| ContentIdentity::hash_bytes(source.as_bytes()))
             });
-        if current == Some(seed.facts.source_identity()) {
+        if current == Some(identity) {
             return true;
         }
-        self.push_source_generation_changed(&seed.file);
+        self.push_source_generation_changed(file);
         false
     }
 
@@ -3918,6 +4017,14 @@ impl CfgQueryAdapter<'_, '_> {
         self.context.program_point_of_match(seed)
     }
 
+    pub(super) fn program_point_by_id(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+        id: &str,
+    ) -> Vec<SemanticProgramPointValue> {
+        self.context.program_point_by_id(procedure, id)
+    }
+
     pub(super) fn procedure_of_declaration(
         &mut self,
         declaration: &DeclarationValue,
@@ -3984,17 +4091,7 @@ impl SemanticProcedureValue {
     /// partial. Local row families may still expose proven facts, but must not
     /// promote them to a complete selection while this quality is open.
     pub(super) fn exact_selection_incomplete_reason(&self) -> Option<String> {
-        if self.quality.is_complete() {
-            return None;
-        }
-        let mut reasons = Vec::new();
-        if let Some(reason) = &self.quality.proof_reason {
-            reasons.push(format!("proof: {reason}"));
-        }
-        if let Some(reason) = &self.quality.completeness_reason {
-            reasons.push(format!("coverage: {reason}"));
-        }
-        Some(reasons.join("; "))
+        self.quality.exact_selection_incomplete_reason()
     }
 
     /// The procedure's public wire identity, so a derived row family can name
@@ -4074,6 +4171,10 @@ impl SemanticProcedureValue {
 }
 
 impl SemanticProgramPointValue {
+    pub(super) fn exact_selection_incomplete_reason(&self) -> Option<String> {
+        self.quality.exact_selection_incomplete_reason()
+    }
+
     fn source_mapping(&self) -> &SourceMapping {
         let procedure = self.handle.procedure().semantics();
         let point = procedure

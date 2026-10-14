@@ -2888,6 +2888,19 @@ fn apply_pipeline_step_general<'a>(
             ),
             (
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::ProgramPointById { id },
+            ) => semantic
+                .as_mut()
+                .expect("point-ID selection requires semantic services")
+                .cfg()
+                .program_point_by_id(procedure, id)
+                .into_iter()
+                .map(SemanticPipelineValue::ProgramPoint)
+                .map(PipelineValue::Semantic)
+                .map(pipeline_expansion)
+                .collect(),
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
                 QueryStep::CfgEntry,
             ) => semantic
                 .as_mut()
@@ -5059,6 +5072,19 @@ fn apply_pipeline_step_general<'a>(
                     .collect()
             }
             (
+                PipelineValue::Semantic(SemanticPipelineValue::ProgramPoint(point)),
+                QueryStep::SelectedPropertyRelationsOf,
+            ) => row_relations::selected_property_relation_expansions(
+                workspace.expect("selected property relations require a semantic workspace"),
+                semantic
+                    .as_mut()
+                    .expect("selected property relations require semantic context"),
+                flow_state_cache,
+                point,
+                cancellation,
+                diagnostics,
+            ),
+            (
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
                 QueryStep::FlowRelationsOf(filter),
             ) => flow_relation_expansions(
@@ -5070,7 +5096,7 @@ fn apply_pipeline_step_general<'a>(
                 diagnostics,
             ),
             (PipelineValue::StateEvent(value), QueryStep::FlowRelationsOf(filter)) => {
-                flow_relations_of_event(value, filter)
+                flow_relations_of_event(value, filter, flow_state_cache, diagnostics)
             }
             (PipelineValue::StateEvent(value), QueryStep::BindingInitializerCallsOf) => {
                 row_relations::binding_initializer_call_expansions(

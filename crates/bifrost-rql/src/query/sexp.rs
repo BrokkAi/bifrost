@@ -609,6 +609,35 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             );
             append_step(expr, &items[3], step)
         }
+        RqlForm::ProgramPointById => {
+            let op = form
+                .query_step_op()
+                .expect("program-point-by-id declares a query step");
+            let option = items
+                .get(1)
+                .and_then(Expr::as_symbol)
+                .and_then(|label| op.option_for_rql_label(label));
+            if items.len() != 4
+                || option.is_none_or(|option| option.field() != QueryStepField::ProgramPointId)
+            {
+                return Err(lower_error(
+                    expr,
+                    "(program-point-by-id ...) expects :id, a public program-point id string, and a procedure query",
+                ));
+            }
+            let id = string_arg(&items[2])?;
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String(op.label().to_string()));
+            step.insert(
+                option
+                    .expect("validated program-point-by-id option")
+                    .field()
+                    .label()
+                    .to_string(),
+                Value::String(id),
+            );
+            append_step(expr, &items[3], step)
+        }
         RqlForm::EnclosingDecl
         | RqlForm::ProcedureOf
         | RqlForm::ProgramPointOf
@@ -1871,11 +1900,11 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             step.insert("op".to_string(), Value::String(op.label().to_string()));
             append_step(expr, &items[1], step)
         }
-        RqlForm::BindingInitializerCallsOf => {
+        RqlForm::BindingInitializerCallsOf | RqlForm::SelectedPropertyRelationsOf => {
             expect_len(expr, items, 2, head)?;
             let op = form
                 .query_step_op()
-                .expect("binding initializer wrapper declares a query step");
+                .expect("unit wrapper declares a query step");
             let mut step = Map::new();
             step.insert("op".to_string(), Value::String(op.label().to_string()));
             append_step(expr, &items[1], step)
@@ -2985,6 +3014,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::EnclosingDecl
         | RqlForm::ProcedureOf
         | RqlForm::ProgramPointOf
+        | RqlForm::ProgramPointById
         | RqlForm::CfgEntry
         | RqlForm::CfgExits
         | RqlForm::CfgSuccessorEdges
@@ -3138,6 +3168,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::EdgesFrom
         | RqlForm::EdgeTarget
         | RqlForm::BindingInitializerCallsOf
+        | RqlForm::SelectedPropertyRelationsOf
         | RqlForm::StateEventsOf
         | RqlForm::FlowRelationsOf
         | RqlForm::FlowSource

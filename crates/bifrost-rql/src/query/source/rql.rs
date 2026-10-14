@@ -523,6 +523,50 @@ fn validate_wrapper(
             }
             return;
         }
+        RqlForm::ProgramPointById => {
+            if args.len() != 3 {
+                analysis.error(
+                    query.range.clone(),
+                    "wrong-value-shape",
+                    "program-point-by-id expects :id, an id string, and a procedure query",
+                );
+                return;
+            }
+            let Some(label) = args[0].as_symbol() else {
+                analysis.error(
+                    args[0].range.clone(),
+                    "unknown-property",
+                    "program-point-by-id option names must be keywords",
+                );
+                return;
+            };
+            let Some(option) = QueryStepOp::ProgramPointById.option_for_rql_label(label) else {
+                analysis.error(
+                    args[0].range.clone(),
+                    "unknown-property",
+                    "program-point-by-id accepts only :id",
+                );
+                return;
+            };
+            analysis.add_help(
+                args[0].range.clone(),
+                option.field().signature(),
+                option.field().description(),
+            );
+            let step_path = step_path.expect("program-point-by-id is a query step");
+            if args[1].as_string().is_none() {
+                analysis.error(
+                    args[1].range.clone(),
+                    "wrong-value-shape",
+                    "program-point-by-id :id must be a string literal",
+                );
+            } else {
+                analysis.path(
+                    format!("{step_path}.{}", option.field().label()),
+                    args[1].range.clone(),
+                );
+            }
+        }
         RqlForm::EnclosingDecl
         | RqlForm::ProcedureOf
         | RqlForm::ProgramPointOf
@@ -967,6 +1011,7 @@ fn validate_wrapper(
         | RqlForm::ExportTarget
         | RqlForm::EdgeTarget
         | RqlForm::BindingInitializerCallsOf
+        | RqlForm::SelectedPropertyRelationsOf
         | RqlForm::FlowSource
         | RqlForm::FlowTarget
         | RqlForm::TargetOf

@@ -981,6 +981,12 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         QueryStep::CaptureAnchor(capture) => {
             object.insert("capture".to_string(), json!(capture));
         }
+        QueryStep::ProgramPointById { id } => {
+            object.insert(
+                QueryStepField::ProgramPointId.label().to_string(),
+                json!(id),
+            );
+        }
         QueryStep::ConfigurationAbsence(filter) => {
             object.extend(configuration_facts_filter_to_json(filter));
         }
@@ -1102,7 +1108,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::CallableApplicability
         | QueryStep::OverloadSelection
         | QueryStep::CppExpressions => {}
-        QueryStep::BindingInitializerCallsOf => {}
+        QueryStep::BindingInitializerCallsOf | QueryStep::SelectedPropertyRelationsOf => {}
         // The default tier is omitted so a query written before the filter
         // existed keeps its canonical form and semantic hash.
         QueryStep::AbsentMember(proof) => {

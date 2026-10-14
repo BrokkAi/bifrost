@@ -1905,6 +1905,7 @@ pub enum QueryStep {
     EnclosingDecl,
     ProcedureOf,
     ProgramPointOf,
+    ProgramPointById { id: String },
     CfgEntry,
     CfgExits,
     CfgSuccessorEdges,
@@ -2042,6 +2043,7 @@ pub enum QueryStep {
     EdgeTarget,
     StateEventsOf(StateEventFilter),
     BindingInitializerCallsOf,
+    SelectedPropertyRelationsOf,
     FlowRelationsOf(FlowRelationFilter),
     FlowSource,
     FlowTarget,
@@ -2546,6 +2548,7 @@ impl QueryStep {
             Self::EnclosingDecl => QueryStepOp::EnclosingDecl,
             Self::ProcedureOf => QueryStepOp::ProcedureOf,
             Self::ProgramPointOf => QueryStepOp::ProgramPointOf,
+            Self::ProgramPointById { .. } => QueryStepOp::ProgramPointById,
             Self::CfgEntry => QueryStepOp::CfgEntry,
             Self::CfgExits => QueryStepOp::CfgExits,
             Self::CfgSuccessorEdges => QueryStepOp::CfgSuccessorEdges,
@@ -2695,6 +2698,7 @@ impl QueryStep {
             Self::EdgeTarget => QueryStepOp::EdgeTarget,
             Self::StateEventsOf(_) => QueryStepOp::StateEventsOf,
             Self::BindingInitializerCallsOf => QueryStepOp::BindingInitializerCallsOf,
+            Self::SelectedPropertyRelationsOf => QueryStepOp::SelectedPropertyRelationsOf,
             Self::FlowRelationsOf(_) => QueryStepOp::FlowRelationsOf,
             Self::FlowSource => QueryStepOp::FlowSource,
             Self::FlowTarget => QueryStepOp::FlowTarget,
@@ -2733,6 +2737,7 @@ impl QueryStep {
             QueryStepOp::EnclosingDecl => Some(Self::EnclosingDecl),
             QueryStepOp::ProcedureOf => Some(Self::ProcedureOf),
             QueryStepOp::ProgramPointOf => Some(Self::ProgramPointOf),
+            QueryStepOp::ProgramPointById => None,
             QueryStepOp::CfgEntry => Some(Self::CfgEntry),
             QueryStepOp::CfgExits => Some(Self::CfgExits),
             QueryStepOp::CfgSuccessorEdges => Some(Self::CfgSuccessorEdges),
@@ -2900,6 +2905,7 @@ impl QueryStep {
             QueryStepOp::EdgeTarget => Some(Self::EdgeTarget),
             QueryStepOp::StateEventsOf => Some(Self::StateEventsOf(StateEventFilter::default())),
             QueryStepOp::BindingInitializerCallsOf => Some(Self::BindingInitializerCallsOf),
+            QueryStepOp::SelectedPropertyRelationsOf => Some(Self::SelectedPropertyRelationsOf),
             QueryStepOp::FlowRelationsOf => {
                 Some(Self::FlowRelationsOf(FlowRelationFilter::default()))
             }
@@ -2960,6 +2966,9 @@ impl QueryStep {
                 Some(QueryValueKind::Procedure)
             }
             (Self::ProgramPointOf, QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::ProgramPoint)
+            }
+            (Self::ProgramPointById { .. }, QueryValueKind::Procedure) => {
                 Some(QueryValueKind::ProgramPoint)
             }
             (Self::CfgEntry | Self::CfgExits, QueryValueKind::Procedure) => {
@@ -3342,6 +3351,9 @@ impl QueryStep {
             (Self::BindingInitializerCallsOf, QueryValueKind::StateEvent) => {
                 Some(QueryValueKind::BindingInitializerCall)
             }
+            (Self::SelectedPropertyRelationsOf, QueryValueKind::ProgramPoint) => {
+                Some(QueryValueKind::FlowRelation)
+            }
             (Self::FlowRelationsOf(_), QueryValueKind::StateEvent | QueryValueKind::Procedure) => {
                 Some(QueryValueKind::FlowRelation)
             }
@@ -3461,6 +3473,7 @@ fn validate_query_steps(
             QueryStep::EnclosingDecl => "structural_match or dispatch_target",
             QueryStep::ProcedureOf => "structural_match or declaration",
             QueryStep::ProgramPointOf => "structural_match",
+            QueryStep::ProgramPointById { .. } => "procedure",
             QueryStep::CfgEntry | QueryStep::CfgExits => "procedure",
             QueryStep::CfgSuccessorEdges | QueryStep::CfgPredecessorEdges => "program_point",
             QueryStep::CfgEdgeSource | QueryStep::CfgEdgeTarget => "control_edge",
@@ -3599,6 +3612,7 @@ fn validate_query_steps(
             QueryStep::EdgeTarget => "reference_edge",
             QueryStep::StateEventsOf(_) => "procedure or declaration",
             QueryStep::BindingInitializerCallsOf => "state_event",
+            QueryStep::SelectedPropertyRelationsOf => "program_point",
             QueryStep::FlowRelationsOf(_) => "state_event or procedure",
             QueryStep::FlowSource | QueryStep::FlowTarget => "flow_relation",
             QueryStep::ControlRelations(_) => "procedure",
