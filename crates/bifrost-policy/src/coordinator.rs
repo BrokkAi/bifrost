@@ -22,7 +22,7 @@ use brokk_bifrost_analysis::analyzer::packs_document::{
 };
 use brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest;
 use brokk_bifrost_analysis::analyzer::semantic::{
-    WorkspaceRelativePath, authored_procedure_target_identity,
+    ConfigurationFingerprint, WorkspaceRelativePath, authored_procedure_target_identity,
 };
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActiveSemanticModelShard, ActiveSemanticModelSnapshot, CatalogPackSourceKind, Completeness,
@@ -41,11 +41,12 @@ use brokk_bifrost_analysis::analyzer::usages::effects::ModeledProcedureKey;
 use brokk_bifrost_analysis::analyzer::usages::effects::modeled_procedure_key_for_unit;
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, ChangedFacts, CodeUnit, DependencyPackActivationOutcome,
-    DependencyPackEcosystem, FilesystemProject, GoDependencyDiscoveryMode, Language, Project,
-    ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache,
+    DependencyPackEcosystem, FilesystemProject, Language, Project, ProjectFile, WorkspaceAnalyzer,
+    WorkspaceFileListingCache,
 };
 use brokk_bifrost_analysis::diff_analysis::{
-    RevisionExport, RevisionWorkspace, export_revision, resolve_revision_subtree,
+    RevisionExport, RevisionWorkspace, changed_buffer_ranges, export_revision,
+    resolve_revision_subtree,
 };
 use brokk_bifrost_analysis::path_normalization::NormalizePath;
 use brokk_bifrost_analysis::path_utils::rel_path_string;
@@ -115,7 +116,7 @@ use super::units::{
     UnitSnapshots, WidenReason, WorkspaceUnitInputs, row_key, workspace_snapshot,
 };
 
-use super::taint_policy::ProductionTaintPolicyEvaluator;
+use super::taint_policy::{PolicyChangedFile, ProductionTaintPolicyEvaluator};
 use super::typestate_policy::ProductionTypestatePolicyEvaluator;
 use super::{PolicyBatchBudget, PolicyBudget};
 
@@ -160,8 +161,8 @@ pub enum PolicyRangeRequest {
     /// Every endpoint of the workspace.
     #[default]
     Workspace,
-    /// The files the diff base changed, read from the base comparison that the
-    /// incremental context builds. Needs a diff base and incremental reuse.
+    /// The changed hunks of the diff base comparison. Sink procedures must
+    /// overlap a hunk. Needs a diff base and incremental reuse.
     DiffBase,
     /// Exactly these workspace-relative files.
     Files(Vec<String>),
@@ -716,15 +717,16 @@ pub fn evaluate_policy_inputs_with_analyzer(
 ///
 /// Policy evaluation answers one question whatever asks it. The CLI, the
 /// GitHub action, an MCP session and a full scan all evaluate on a workspace
-/// analyzed under [`owned_policy_analyzer_config`] and activated with the
+/// analyzed under the default analyzer configuration and activated with the
 /// policy's own semantic sources -- the shipped models, the repository's
 /// reviewed models and its packs document -- so their findings, their content
 /// identities and the keys of the evidence they publish agree, and one entry
 /// point's published units serve another's later run. A session's own
 /// analyzer and activation serve its other tools under the configuration
-/// those tools need. The coordinator therefore builds the policy workspace
+/// those tools need. When that configuration matches, the coordinator borrows
+/// the session's analyzer and projection. Otherwise it builds the policy workspace
 /// over the session's project, languages and store -- the files and overlays
-/// the session sees, the facts it already parsed -- and activates it itself.
+/// the session sees, the facts it already parsed. It activates policy sources itself.
 /// The session's activation is not borrowed.
 pub fn evaluate_policy_inputs_for_host_session(
     root: impl AsRef<Path>,
@@ -1405,17 +1407,10 @@ fn analyzed_source_volume(workspace: &WorkspaceAnalyzer) -> (u64, usize) {
 
 /// Activate every semantic source an owned policy workspace uses.
 ///
-/// Ordinary evaluation and explanation both build short-lived workspace
-/// analyzers. Keep their activation authority in one place so shipped models,
+/// Evaluation may borrow a matching host workspace; explanation may build a
+/// short-lived one. Keep their activation authority in one place so shipped models,
 /// reviewed workspace models, and dependency packs cannot diverge between the
 /// report and the explanation of that report.
-/// The analyzer configuration used by built-in policy evaluation.
-pub fn owned_policy_analyzer_config() -> AnalyzerConfig {
-    let mut config = AnalyzerConfig::default();
-    config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
-    config
-}
-
 pub(crate) fn activate_owned_policy_workspace(
     root: &Path,
     workspace: &WorkspaceAnalyzer,
@@ -1424,8 +1419,9 @@ pub(crate) fn activate_owned_policy_workspace(
 ) -> Result<Option<WorkspacePacksActivation>, WorkspaceActivationError> {
     activate_workspace_semantic_sources(
         workspace,
-        &owned_policy_analyzer_config(),
+        &AnalyzerConfig::default(),
         WorkspaceActivationSources {
+            activation_receipt: None,
             catalog_root: root,
             workspace_model_root: Some(root),
             config,
@@ -2381,10 +2377,10 @@ enum PolicyWorkspaceSource<'a> {
     /// The coordinator builds the policy workspace over the root and activates
     /// it: the CLI and the GitHub action.
     Root,
-    /// The coordinator builds the policy workspace over a host session's
-    /// project, languages and store and activates it: an MCP session, or a
-    /// scoped CLI session. The session's own analyzer and activation serve its
-    /// other tools.
+    /// The coordinator reuses a matching host analyzer or builds the policy
+    /// workspace over its project, languages and store: an MCP session, or a
+    /// scoped CLI session. Policy semantic sources are activated independently
+    /// of the session's other tools.
     HostSession(&'a WorkspaceAnalyzer),
     /// The caller analyzed and activated this snapshot itself and owns that
     /// choice: an API caller, or the base half of a diff run, which is built
@@ -2768,25 +2764,49 @@ fn evaluate_prepared_policy_inputs(
         PolicyWorkspaceSource::Supplied(workspace) => Some(workspace),
         PolicyWorkspaceSource::Root | PolicyWorkspaceSource::HostSession(_) => None,
     };
+    let policy_config = AnalyzerConfig::default();
+    let mut reused_host_workspace = None;
     let owned_analyzer = match workspace_source {
         _ if !needs_workspace => None,
         PolicyWorkspaceSource::Supplied(_) => None,
-        // Policy evaluation analyzes under one configuration whatever the
-        // host, so a session's workspace is built again over the same project
-        // and store under the policy configuration (#3735).
-        PolicyWorkspaceSource::HostSession(session) => Some({
+        PolicyWorkspaceSource::HostSession(session) => {
             let _scope =
                 brokk_bifrost_analysis::profiling::scope("policy.registration.host_session");
-            session
-                .rebuild_with_config(owned_policy_analyzer_config())
-                .map_err(|error| {
-                    PolicyCoordinatorError::new(format!(
-                        "failed to build the policy workspace over the host session at {}: \
-                         {error}",
-                        root.display()
-                    ))
-                })?
-        }),
+            // Workspace content identities hash the complete configuration's
+            // Debug representation. SemanticArtifactKey's configuration is
+            // narrower (intrafile lowering defaults), so it cannot establish
+            // that the host's workspace projection answers this policy request.
+            let defaults_fingerprint =
+                ConfigurationFingerprint::hash_bytes(format!("{policy_config:?}").as_bytes());
+            let host = session
+                .config()
+                .map(|config| {
+                    ConfigurationFingerprint::hash_bytes(format!("{config:?}").as_bytes())
+                })
+                .unwrap_or(defaults_fingerprint);
+            let reuse = host == defaults_fingerprint;
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!(
+                    "policy.host_configuration reused={reuse} host={host:?} defaults={defaults_fingerprint:?}"
+                )
+            });
+            if reuse {
+                reused_host_workspace = Some(session);
+                None
+            } else {
+                Some(
+                    session
+                        .rebuild_with_config(policy_config)
+                        .map_err(|error| {
+                            PolicyCoordinatorError::new(format!(
+                                "failed to build the policy workspace over the host session at {}: \
+                                 {error}",
+                                root.display()
+                            ))
+                        })?,
+                )
+            }
+        }
         PolicyWorkspaceSource::Root => {
             let project = owned_policy_project(root).map_err(|error| {
                 PolicyCoordinatorError::new(format!(
@@ -2801,17 +2821,18 @@ fn evaluate_prepared_policy_inputs(
             Some({
                 let _scope =
                     brokk_bifrost_analysis::profiling::scope("policy.registration.owned_analyzer");
-                WorkspaceAnalyzer::build_persisted(project, owned_policy_analyzer_config())
-                    .map_err(|error| {
-                        PolicyCoordinatorError::new(format!(
-                            "failed to build the analyzer workspace at {}: {error}",
-                            root.display()
-                        ))
-                    })?
+                WorkspaceAnalyzer::build_persisted(project, policy_config).map_err(|error| {
+                    PolicyCoordinatorError::new(format!(
+                        "failed to build the analyzer workspace at {}: {error}",
+                        root.display()
+                    ))
+                })?
             })
         }
     };
-    let workspace = supplied_workspace.or(owned_analyzer.as_ref());
+    let workspace = supplied_workspace
+        .or(reused_host_workspace)
+        .or(owned_analyzer.as_ref());
     let workspace_has_analyzable_files =
         workspace.is_some_and(|workspace| !workspace.analyzer().analyzed_files().is_empty());
     let uncancelled = CancellationToken::default();
@@ -2820,7 +2841,7 @@ fn evaluate_prepared_policy_inputs(
     let workspace_activation = {
         let _scope =
             brokk_bifrost_analysis::profiling::scope("policy.registration.workspace_activation");
-        match owned_analyzer.as_ref() {
+        match reused_host_workspace.or(owned_analyzer.as_ref()) {
             Some(_) if packs_load_failure.is_some() => Some(None),
             Some(analyzer_workspace) => {
                 match activate_owned_policy_workspace(
@@ -3377,6 +3398,10 @@ fn evaluate_prepared_policy_inputs(
     // comparison that only that phase produces.
     let range = resolve_changed_range(
         options.range(),
+        root,
+        diff_baseline
+            .as_ref()
+            .map(|outcome| outcome.baseline.resolved_commit.as_str()),
         workspace,
         diff_baseline
             .as_ref()
@@ -4313,8 +4338,11 @@ fn reuse_persisted_diff_baseline(
     }
     let requested_policy_set_digest = policy_set_digest(policies);
     let policy_set_matches = evaluation.policy_set_digest == requested_policy_set_digest;
-    let aggregate_unreliable =
-        (policy_set_matches && evaluation.aggregate_unreliable) || !unqualified.is_empty();
+    let aggregate_unreliable = if policy_set_matches {
+        evaluation.aggregate_unreliable
+    } else {
+        !unqualified.is_empty()
+    };
     let unreliable_detail = policy_set_matches
         .then(|| evaluation.unreliable_detail.clone())
         .flatten();
@@ -4353,21 +4381,22 @@ enum ChangedRangeResolution {
     /// The request named no range.
     Unrequested,
     /// The analyzed workspace files the range names.
-    Files(Vec<ProjectFile>),
+    Files(Vec<PolicyChangedFile>),
     /// The request could not be resolved, so its runs are whole-workspace.
     Unresolved(String),
 }
 
 /// Resolve `request` against the head workspace.
 ///
-/// A range is file-level: `ChangedFacts` names the changed files and carries
-/// no hunks or line ranges, so a changed file scopes all of its sinks. A
-/// diff range reads `comparison`, the base comparison's changed facts, and is
-/// unresolved when that comparison is missing or incomplete: a smaller set
+/// A diff range reads the exact base blobs and the analyzer's indexed head
+/// buffers. Zero-context hunks narrow the changed files from `comparison`.
+/// The range is unresolved when that comparison is missing or incomplete: a smaller set
 /// could hide a changed sink, so the run must say it is whole-workspace rather
 /// than guess.
 fn resolve_changed_range(
     request: &PolicyRangeRequest,
+    root: &Path,
+    revision: Option<&str>,
     workspace: Option<&WorkspaceAnalyzer>,
     comparison: Option<&ChangedFacts>,
 ) -> ChangedRangeResolution {
@@ -4384,6 +4413,7 @@ fn resolve_changed_range(
                     .analyzed_files()
                     .into_iter()
                     .filter(|file| wanted.contains(rel_path_string(file).as_str()))
+                    .map(|file| PolicyChangedFile { file, hunks: None })
                     .collect(),
             )
         }
@@ -4403,17 +4433,45 @@ fn resolve_changed_range(
             let Some(workspace) = workspace else {
                 return ChangedRangeResolution::Files(Vec::new());
             };
-            ChangedRangeResolution::Files(
+            let hunks = (|| -> Result<Vec<PolicyChangedFile>, String> {
+                let subtree =
+                    resolve_revision_subtree(root, revision.expect("diff comparison has a base"))?;
+                let base_blobs = subtree
+                    .blobs()
+                    .iter()
+                    .map(|(path, oid)| (path.as_ref(), *oid))
+                    .collect::<HashMap<_, _>>();
                 workspace
                     .analyzer()
                     .analyzed_files()
                     .into_iter()
                     .filter(|file| {
-                        let rel_path = rel_path_string(file);
-                        changed_paths.contains(&(language_for_file(file), rel_path.as_str()))
+                        let path = rel_path_string(file);
+                        changed_paths.contains(&(language_for_file(file), path.as_str()))
                     })
-                    .collect(),
-            )
+                    .map(|file| {
+                        let path = rel_path_string(&file);
+                        let base = match base_blobs.get(path.as_str()) {
+                            Some(oid) => subtree
+                                .source(*oid)
+                                .ok_or_else(|| format!("base source unavailable for {path}"))?,
+                            None => String::new(),
+                        };
+                        let head = workspace
+                            .analyzer()
+                            .indexed_source(&file)
+                            .ok_or_else(|| format!("indexed head source unavailable for {path}"))?;
+                        Ok(PolicyChangedFile {
+                            hunks: Some(changed_buffer_ranges(&base, &head)?),
+                            file,
+                        })
+                    })
+                    .collect()
+            })();
+            match hunks {
+                Ok(files) => ChangedRangeResolution::Files(files),
+                Err(reason) => ChangedRangeResolution::Unresolved(reason),
+            }
         }
     }
 }
@@ -4469,6 +4527,8 @@ impl PolicyDiffBaselineOutcome {
         }
     }
 }
+
+const MISSING_BASE_POLICY_DETAIL: &str = "the base report has no run for this loaded policy";
 
 /// Base-revision evaluation summary consumed by the diff join.
 ///
@@ -4634,6 +4694,7 @@ fn evaluate_policy_diff_baseline(
             base.workspace(),
             &base_analyzer_config,
             WorkspaceActivationSources {
+                activation_receipt: None,
                 catalog_root: head_root,
                 workspace_model_root: Some(export.root()),
                 config: base_packs.as_ref(),
@@ -4761,7 +4822,7 @@ fn evaluate_policy_diff_baseline(
                 return PolicyDiffUnqualifiedPolicy::new(
                     policy_id,
                     "missing",
-                    "the base report has no run for this loaded policy",
+                    MISSING_BASE_POLICY_DETAIL,
                     Vec::new(),
                 );
             };
@@ -4833,6 +4894,11 @@ fn base_evaluation_publication(
     policies: &[&LoadedPolicy],
     baseline: &PolicyDiffBaseline,
 ) -> Option<PolicyEvaluationRow> {
+    // Execution termination depends on time or host conditions absent from
+    // the key. Retention truncation is deterministic under its keyed budget.
+    if report.execution().termination().is_some() {
+        return None;
+    }
     let runs = report
         .runs()
         .iter()
@@ -4840,9 +4906,22 @@ fn base_evaluation_publication(
         .collect::<HashMap<_, _>>();
     let mut policy_rows = policies
         .iter()
-        .filter_map(|policy| {
+        .map(|policy| {
             let policy_id = &policy.definition().metadata.id;
-            let run = runs.get(policy_id)?;
+            let Some(run) = runs.get(policy_id) else {
+                return PolicyEvaluationPolicyRow {
+                    policy_id: policy_id.to_string(),
+                    source_hash: policy.source_hash().to_string(),
+                    semantic_hash: policy.semantic_hash().to_string(),
+                    completion: "missing".to_string(),
+                    completion_detail: "{\"type\":\"missing\"}".to_string(),
+                    qualified: false,
+                    qualification_detail: MISSING_BASE_POLICY_DETAIL.to_string(),
+                    diagnostics: Vec::new(),
+                    identities: Vec::new(),
+                    units: Vec::new(),
+                };
+            };
             let findings = baseline.identities.get(policy_id);
             let units = if findings.is_some() {
                 incremental
@@ -4860,7 +4939,7 @@ fn base_evaluation_publication(
             } else {
                 base_run_unqualified_detail(report, run)
             };
-            Some(PolicyEvaluationPolicyRow {
+            PolicyEvaluationPolicyRow {
                 policy_id: policy_id.to_string(),
                 source_hash: policy.source_hash().to_string(),
                 semantic_hash: policy.semantic_hash().to_string(),
@@ -4876,7 +4955,7 @@ fn base_evaluation_publication(
                     .map(|finding| *finding.as_bytes())
                     .collect(),
                 units,
-            })
+            }
         })
         .collect::<Vec<_>>();
     policy_rows.sort_by(|left, right| left.policy_id.cmp(&right.policy_id));
@@ -5459,9 +5538,14 @@ fn owned_policy_project(root: &Path) -> std::io::Result<FilesystemProject> {
     // The project and its listing live for one owned policy-evaluation snapshot.
     // A later evaluation constructs a fresh cache, while repeated analyzer
     // queries in this evaluation reuse the same tracked-plus-ignore-aware set.
-    let listing = Arc::new(WorkspaceFileListingCache::new(
-        root.to_path_buf().normalize(),
-    ));
+    //
+    // `with_cached_listing` canonicalizes the project root and asserts the
+    // listing was built from that same spelling, so the cache must be built
+    // from the canonical root. A lexical `.normalize()` alone keeps platform
+    // spellings that differ from `canonicalize` -- `/var` versus `/private/var`
+    // on macOS, an 8.3 short name on Windows -- and trips the assertion.
+    let root = root.canonicalize()?.normalize();
+    let listing = Arc::new(WorkspaceFileListingCache::new(root.clone()));
     FilesystemProject::with_cached_listing(root, listing)
 }
 
@@ -6054,7 +6138,6 @@ mod tests {
     use std::fs;
 
     use brokk_bifrost_analysis::analyzer::DependencyPackActivationOutcome;
-    use brokk_bifrost_analysis::analyzer::DispatchHierarchyExpansion;
     use brokk_bifrost_analysis::analyzer::Language;
     use brokk_bifrost_analysis::analyzer::packs_document::parse_workspace_packs_config;
     use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -6077,6 +6160,241 @@ mod tests {
 
     fn evaluation_options() -> PolicyEvaluationOptions {
         crate::test_support::evaluation_options("2026-07-27")
+    }
+
+    #[test]
+    #[hardwon(
+        "#4994: base evaluation rows failed the completion CHECK for newer completion labels"
+    )]
+    fn every_policy_completion_round_trips_through_the_store_writer() {
+        use crate::finding::PolicyCapability;
+        use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("policy-cache.db");
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let digest = "a".repeat(64);
+        let key = PolicyEvaluationRowKey {
+            base_tree_oid: "b".repeat(40),
+            options_digest: digest.clone(),
+            configuration_fingerprint: digest.clone(),
+            active_model_set_hash: digest.clone(),
+            engine_epoch: digest.clone(),
+        };
+        let completions = [
+            PolicyRunCompletion::Complete,
+            PolicyRunCompletion::ProvenSubset { codes: Vec::new() },
+            PolicyRunCompletion::ProvenBySummary,
+            PolicyRunCompletion::Inconclusive {
+                reasons: vec![PolicyIncompleteReason::ReportRetentionBudget],
+            },
+            PolicyRunCompletion::NotRun {
+                unavailable_capabilities: vec![UnavailablePolicyCapability {
+                    label: "qualified-call-locator-zero".to_string(),
+                    reason: "no exact identity".to_string(),
+                }],
+                selected_by: PolicySelectionProvenance::ExplicitPolicyId,
+            },
+            PolicyRunCompletion::Unsupported {
+                capability: PolicyCapability::TaintEvaluation,
+            },
+            PolicyRunCompletion::Failed {
+                reasons: vec![PolicyFailureReason::InvalidExecutionPlan],
+            },
+        ];
+        let policies = completions
+            .iter()
+            .map(|completion| {
+                let qualified = completion.is_exhaustive();
+                PolicyEvaluationPolicyRow {
+                    policy_id: format!("test.{}", completion.label()),
+                    source_hash: digest.clone(),
+                    semantic_hash: digest.clone(),
+                    completion: completion.label().to_string(),
+                    completion_detail: serde_json::to_string(completion).unwrap(),
+                    qualified,
+                    qualification_detail: if qualified {
+                        String::new()
+                    } else {
+                        "unqualified".to_string()
+                    },
+                    diagnostics: Vec::new(),
+                    identities: Vec::new(),
+                    units: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        store
+            .publish_policy_evaluation(PolicyEvaluationRow {
+                key: key.clone(),
+                resolved_commit: "c".repeat(40),
+                policy_set_digest: digest,
+                unreliable_detail: None,
+                aggregate_unreliable: true,
+                base_content_identity: [1; 32],
+                unqualified_policy_ids: policies
+                    .iter()
+                    .filter(|p| !p.qualified)
+                    .map(|p| p.policy_id.clone())
+                    .collect(),
+                policies: policies.clone(),
+            })
+            .unwrap();
+        drop(store);
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let loaded = store.policy_evaluation_for_key(&key).unwrap().unwrap();
+        for expected in policies {
+            let actual = loaded
+                .policies
+                .iter()
+                .find(|p| p.policy_id == expected.policy_id)
+                .unwrap();
+            assert_eq!(actual.completion, expected.completion);
+            assert_eq!(actual.completion_detail, expected.completion_detail);
+            assert_eq!(actual.qualified, expected.qualified);
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#4994: absent base runs were omitted from publication and could not replay their verdict"
+    )]
+    fn missing_base_run_replays_and_terminated_base_is_not_published() {
+        let root = tempfile::tempdir().unwrap();
+        init_git_workspace(root.path());
+        fs::write(root.path().join("app.ts"), "export function target() {}\n").unwrap();
+        commit_everything(root.path(), "base");
+        let workspace = WorkspaceAnalyzer::build_persisted(
+            Arc::new(owned_policy_project(root.path()).unwrap()),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        let store = BatchUnitStore::of(Some(&workspace));
+        let catalogs = Arc::new(
+            TaintCatalogRegistry::new_for_workspace(
+                root.path().to_path_buf(),
+                CatalogRegistryLimits::default(),
+            )
+            .unwrap(),
+        );
+        let mut registry = PolicyRegistry::new_for_workspace(
+            root.path().to_path_buf(),
+            catalogs,
+            PolicyRegistryLimits::default(),
+        )
+        .unwrap();
+        let source = match_policy("test.missing", "Missing");
+        let policy = registry
+            .register_policy_bytes_with_analyzer(
+                PolicySourceIdentity::new("policies/missing.rqlp"),
+                source.as_bytes(),
+                workspace.analyzer(),
+            )
+            .unwrap();
+        let policies = [policy];
+        let changed = ChangedFacts::between(&workspace, &workspace);
+        let inputs = WorkspaceUnitInputs::of(&workspace, None);
+        let incremental = PolicyIncrementalContext::new(
+            store.units(),
+            &workspace,
+            &changed,
+            inputs,
+            IncrementalBaseState::Evaluated,
+            UnitSnapshots::of(workspace_snapshot(&workspace).unwrap()),
+        );
+        let subtree = resolve_revision_subtree(root.path(), "HEAD").unwrap();
+        let key = base_evaluation_key(
+            &evaluation_options(),
+            None,
+            PolicyBatchBudget::default(),
+            PolicyRegistryLimits::default(),
+            inputs,
+        );
+        let report = PolicyReportBuilder::new(PolicyBatchBudget::default(), 0)
+            .unwrap()
+            .finish()
+            .unwrap();
+        // Missing evidence can accompany an unreliable batch or a batch whose
+        // selection deliberately does not make an absent capability fatal.
+        for aggregate_unreliable in [false, true] {
+            let baseline = PolicyDiffBaseline {
+                requested_revision: "HEAD".to_string(),
+                resolved_commit: subtree.commit_id().to_string(),
+                identities: HashMap::new(),
+                unqualified_policies: vec![PolicyDiffUnqualifiedPolicy::new(
+                    policy.definition().metadata.id.clone(),
+                    "missing",
+                    MISSING_BASE_POLICY_DETAIL,
+                    Vec::new(),
+                )],
+                unreliable_detail: aggregate_unreliable
+                    .then(|| "base registration failed".to_string()),
+                aggregate_unreliable,
+            };
+            let row = base_evaluation_publication(
+                &incremental,
+                key.clone(),
+                subtree.tree_id(),
+                &report,
+                &policies,
+                &baseline,
+            )
+            .unwrap();
+            assert_eq!(row.policies.len(), 1);
+            assert!(!row.policies[0].qualified);
+            assert!(row.policies[0].identities.is_empty());
+            store.publish_evaluation(&row);
+            let replay = reuse_persisted_diff_baseline(
+                root.path(),
+                &workspace,
+                "HEAD",
+                &policies,
+                &store,
+                &key,
+            )
+            .unwrap();
+            assert_eq!(replay.state, IncrementalBaseState::Reused);
+            assert_eq!(
+                replay.baseline.unqualified_policies,
+                baseline.unqualified_policies
+            );
+            assert_eq!(
+                replay.baseline.aggregate_unreliable,
+                baseline.aggregate_unreliable
+            );
+            assert_eq!(
+                replay.baseline.unreliable_detail,
+                baseline.unreliable_detail
+            );
+            assert!(replay.baseline.identities.is_empty());
+
+            let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 0).unwrap();
+            builder
+                .set_execution(
+                    PolicyExecutionMetadata::try_new(
+                        0,
+                        Vec::new(),
+                        Some(PolicyExecutionTermination::DeadlineExceeded),
+                        Some(PolicyExecutionStage::PolicyEvaluation),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let terminated = builder.finish().unwrap();
+            assert!(
+                base_evaluation_publication(
+                    &incremental,
+                    key.clone(),
+                    subtree.tree_id(),
+                    &terminated,
+                    &policies,
+                    &baseline
+                )
+                .is_none()
+            );
+        }
     }
 
     #[test]
@@ -6695,7 +7013,12 @@ pub fn run() {
         assert_eq!(sink_files(&ranged), ["src/a.rs"]);
         let scope = ranged.scope().expect("a range-scoped run states its scope");
         assert_eq!(scope.kind(), PolicyRunScopeKind::ChangedRange);
-        assert_eq!(scope.examined_files(), ["src/a.rs"]);
+        assert!(
+            scope
+                .examined_procedures()
+                .iter()
+                .all(|procedure| procedure.path() == "src/a.rs")
+        );
         assert!(scope.widened().is_empty());
     }
 
@@ -8604,12 +8927,59 @@ pub fn run() {
     /// The base of a `--diff-base` run must be analyzed the way the head was.
     /// The analyzer configuration selects dependency discovery, dispatch
     /// expansion and per-language behavior, and it is folded into every content
-    /// identity a build publishes, so a base that built with a configuration of
-    /// its own would answer a different question than the head it is joined
-    /// with. The head here is host-supplied and carries a configuration neither
-    /// the defaults nor the coordinator's owned configuration would produce.
+    /// identity a build publishes, so the base must use the same configuration
+    /// as the host-supplied head.
     #[test]
-    fn the_diff_base_analyzer_is_built_with_the_head_configuration() {
+    #[hardwon(
+        "d0ce89824e27: a warm policy request rebuilt and reprojected the host analyzer although its configuration was unchanged"
+    )]
+    fn host_policy_requests_reuse_the_default_analyzer_and_diff_base_configuration() {
+        // Capture the existing production profiling scopes in an isolated
+        // process: timing is read once, and other tests must not share its flag.
+        const CHILD: &str = "BIFROST_HOST_CONFIG_PROFILE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args([
+                "--exact",
+                "coordinator::tests::host_policy_requests_reuse_the_default_analyzer_and_diff_base_configuration",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("BIFROST_TIMING", "1")
+            .output()
+            .expect("profile host policy requests");
+            let stderr = String::from_utf8(output.stderr).expect("UTF-8 profile");
+            assert!(output.status.success(), "{stderr}");
+            for request in ["cold", "warm"] {
+                let trace = stderr
+                    .split_once(&format!("HOST_CONFIG_BEGIN {request}\n"))
+                    .expect("request begins")
+                    .1
+                    .split_once(&format!("HOST_CONFIG_END {request}\n"))
+                    .expect("request ends")
+                    .0;
+                assert_eq!(
+                    trace
+                        .lines()
+                        .filter(|line| line.trim_end().ends_with("BEGIN WorkspaceAnalyzer::build"))
+                        .count(),
+                    0,
+                    "{request}: {trace}"
+                );
+                assert!(
+                    trace.contains("policy.host_configuration reused=true"),
+                    "{request}: {trace}"
+                );
+                assert!(
+                    !trace.contains("WorkspaceBuildSnapshot::resolve_identities"),
+                    "{trace}"
+                );
+                assert!(!trace.contains("gitblob::dirty_worktree_paths"), "{trace}");
+            }
+            return;
+        }
         let workspace = tempfile::tempdir().expect("workspace");
         init_git_workspace(workspace.path());
         fs::write(
@@ -8624,18 +8994,38 @@ pub fn run() {
         );
         commit_everything(workspace.path(), "base");
 
-        let mut head_config = owned_policy_analyzer_config();
-        head_config.dispatch_hierarchy_expansion = DispatchHierarchyExpansion::CONCRETE_OVERRIDES;
-        assert_ne!(
-            head_config,
-            AnalyzerConfig::default(),
-            "the fixture only means something if the head configuration is not the default"
-        );
         let project: Arc<dyn Project> =
-            Arc::new(FilesystemProject::new(workspace.path()).expect("head project"));
-        let head = WorkspaceAnalyzer::build_persisted(project, head_config.clone())
-            .expect("head analyzer");
-        assert_eq!(head.config(), Some(&head_config));
+            Arc::new(FilesystemProject::new(workspace.path()).expect("host project"));
+        let host = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+            .expect("default host analyzer");
+        let inputs = [PolicyEvaluationInput::workspace_file(PathBuf::from(
+            "policies/diff.rqlp",
+        ))];
+        let options = PolicyEvaluationOptions::new(
+            PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+        );
+        let evaluate_host = |request: &str, host: &WorkspaceAnalyzer| {
+            eprintln!("HOST_CONFIG_BEGIN {request}");
+            let outcome = evaluate_policy_inputs_for_host_session(
+                workspace.path(),
+                &inputs,
+                host,
+                &options,
+                None,
+            )
+            .expect("host policy evaluation");
+            eprintln!("HOST_CONFIG_END {request}");
+            assert_eq!(outcome.report().runs().len(), 1, "{:?}", outcome.report());
+            assert_eq!(
+                outcome.report().runs()[0].completion(),
+                &PolicyRunCompletion::Complete
+            );
+            assert_eq!(outcome.report().runs()[0].findings().len(), 1);
+            outcome
+        };
+        let cold = evaluate_host("cold", &host);
+        let warm = evaluate_host("warm", &host);
+        assert_eq!(canonical_report_bytes(&cold), canonical_report_bytes(&warm));
 
         // The whole host-supplied diff path still runs and joins.
         let gating_date = PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date");
@@ -8647,7 +9037,7 @@ pub fn run() {
             &[PolicyEvaluationInput::workspace_file(PathBuf::from(
                 "policies/diff.rqlp",
             ))],
-            &head,
+            &host,
             &brokk_bifrost_flow::FlowWorkspaceState::new(),
             &diff_options,
             None,
@@ -8671,12 +9061,12 @@ pub fn run() {
         let (base, base_config) = build_diff_base_workspace(
             &export,
             workspace.path(),
-            &head,
+            &host,
             &CancellationToken::default(),
         )
         .expect("base analyzer workspace");
-        assert_eq!(base_config, head_config);
-        assert_eq!(base.workspace().config(), head.config());
+        assert_eq!(base_config, AnalyzerConfig::default());
+        assert_eq!(base.workspace().config(), host.config());
     }
 
     #[test]
@@ -8779,7 +9169,7 @@ pub fn run() {
         commit_everything(workspace.path(), "base");
         let project: Arc<dyn Project> =
             Arc::new(FilesystemProject::new(workspace.path()).expect("head project"));
-        let head = WorkspaceAnalyzer::build_persisted(project, owned_policy_analyzer_config())
+        let head = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
             .expect("head analyzer");
         let gating_date = PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date");
         let diff_options = PolicyEvaluationOptions::new(gating_date)

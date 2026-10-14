@@ -52,6 +52,9 @@ pub(crate) struct JsTsParsedFile<'source> {
     parsed: ParsedFile,
     source_text: &'source str,
     pub source: PrimarySourceFactCollector<'source>,
+    #[cfg(debug_assertions)]
+    structural_parent_by_unit: HashMap<CodeUnit, Option<CodeUnit>>,
+    code_unit_by_node: HashMap<usize, CodeUnit>,
     declaration_by_unit: HashMap<CodeUnit, SourceDeclarationId>,
     declaration_links: HashSet<(SourceDeclarationId, CodeUnit)>,
     imports: Vec<SourceImportFact>,
@@ -64,11 +67,18 @@ pub(crate) struct JsTsParsedFile<'source> {
 }
 
 impl<'source> JsTsParsedFile<'source> {
-    fn new(source: &'source str, root: Node<'source>) -> Self {
+    fn new_with_lexical_bindings(
+        source: &'source str,
+        root: Node<'source>,
+        lexical_bindings: crate::syntax::JsTsLexicalBindingIndex,
+    ) -> Self {
         Self {
             parsed: ParsedFile::new(String::new()),
             source_text: source,
             source: PrimarySourceFactCollector::new(source),
+            #[cfg(debug_assertions)]
+            structural_parent_by_unit: HashMap::default(),
+            code_unit_by_node: HashMap::default(),
             declaration_by_unit: HashMap::default(),
             declaration_links: HashSet::default(),
             imports: Vec::new(),
@@ -76,9 +86,9 @@ impl<'source> JsTsParsedFile<'source> {
             js_ts: JsTsSourceFacts::default(),
             captured_declarations: HashSet::default(),
             types: crate::type_source::JsTsTypeCollector::default(),
-            // Program bindings are forward visible. Build their lexical
-            // index once while the primary tree is live.
-            lexical_bindings: crate::syntax::JsTsLexicalBindingIndex::build(root, source),
+            // Program bindings are forward visible. The adapter may also use
+            // this same source-time index while preparing its declaration walk.
+            lexical_bindings,
             declaration_scopes: crate::scope_source::JsTsDeclarationScopeIndex::new(root, source),
         }
     }
@@ -297,6 +307,47 @@ impl<'source> JsTsParsedFile<'source> {
         parent: Option<CodeUnit>,
         top_level: Option<CodeUnit>,
     ) {
+        let declaration_node = if node.kind() == "export_statement" {
+            node.child_by_field_name("declaration")
+                .or_else(|| node.child_by_field_name("value"))
+                .unwrap_or(node)
+        } else {
+            node
+        };
+        if matches!(
+            declaration_node.kind(),
+            "function_declaration"
+                | "generator_function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "class"
+                | "method_definition"
+                | "variable_declarator"
+        ) {
+            self.code_unit_by_node
+                .insert(declaration_node.id(), unit.clone());
+        }
+        if let Some(name) = name
+            && let Some(parent) = self.declaration_scopes.parent(name)
+            && parent.kind() == "variable_declarator"
+        {
+            self.code_unit_by_node.insert(parent.id(), unit.clone());
+        }
+        #[cfg(debug_assertions)]
+        {
+            match self.structural_parent_by_unit.get(&unit) {
+                Some(previous_parent) => debug_assert_eq!(
+                    previous_parent, &parent,
+                    "JS/TS code unit acquired a second structural parent: unit={unit:?}, previous={previous_parent:?}, new={parent:?}"
+                ),
+                None => {
+                    self.structural_parent_by_unit
+                        .insert(unit.clone(), parent.clone());
+                }
+            }
+        }
         self.capture_declaration(&unit, node, name);
         self.parsed
             .add_code_unit(unit, node, source, parent, top_level);
@@ -305,6 +356,59 @@ impl<'source> JsTsParsedFile<'source> {
     pub fn add_definition_lookup_unit(&mut self, unit: CodeUnit, node: Node<'_>, source: &str) {
         self.capture_declaration(&unit, node, declaration_name(node));
         self.parsed.add_definition_lookup_unit(unit, node, source);
+    }
+
+    pub(crate) fn local_binding_fq(
+        &self,
+        node: Node<'_>,
+        binder: Node<'_>,
+        name: &str,
+    ) -> Option<brokk_bifrost_core::analyzer::fq_name::FqName> {
+        use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
+
+        let binding_scope = self
+            .lexical_bindings
+            .binding_scope_at(name, binder.start_byte())?;
+        let owner = self
+            .declaration_scopes
+            .declaration_owner_chain(node)
+            .into_iter()
+            .find_map(|owner_node| {
+                self.code_unit_by_node
+                    .get(&owner_node.id())
+                    .map(|unit| (owner_node, unit))
+            });
+        let (base, owner_id) = owner.map_or_else(
+            || {
+                (
+                    brokk_bifrost_core::analyzer::fq_name::FqName::new(),
+                    self.declaration_scopes.root().id(),
+                )
+            },
+            |(owner_node, unit)| (unit.fq().clone(), owner_node.id()),
+        );
+
+        let mut path = Vec::new();
+        let mut current = Some(node);
+        while let Some(ancestor) = current {
+            if ancestor.id() == owner_id {
+                break;
+            }
+            path.push(ancestor);
+            current = self.declaration_scopes.parent(ancestor);
+        }
+        path.reverse();
+        let mut fq = base;
+        for scope in path {
+            let Some((kind, ordinal)) = self.declaration_scopes.scope_segment(scope) else {
+                continue;
+            };
+            if kind == "block" && scope.id() != binding_scope.node_id {
+                continue;
+            }
+            fq.push(segment_interner().intern(&format!("{kind}_{ordinal}"), SegmentKind::Nested));
+        }
+        Some(fq.with_pushed(segment_interner().intern(name, SegmentKind::Member)))
     }
 
     pub fn add_import_syntaxes(&mut self, syntaxes: Vec<crate::imports::JsTsImportSyntax<'_>>) {
@@ -548,6 +652,23 @@ pub(crate) fn parse_primary<'source>(
     source: &'source str,
     tree: &'source Tree,
     spec: &crate::structural::JsTsStructuralSpec,
+    event: impl FnMut(&mut JsTsParsedFile<'source>, PrimaryEvent<'source>),
+) -> ParsedFile {
+    let root = tree.root_node();
+    parse_primary_with_lexical_bindings(
+        source,
+        tree,
+        spec,
+        crate::syntax::JsTsLexicalBindingIndex::build(root, source),
+        event,
+    )
+}
+
+pub(crate) fn parse_primary_with_lexical_bindings<'source>(
+    source: &'source str,
+    tree: &'source Tree,
+    spec: &crate::structural::JsTsStructuralSpec,
+    lexical_bindings: crate::syntax::JsTsLexicalBindingIndex,
     mut event: impl FnMut(&mut JsTsParsedFile<'source>, PrimaryEvent<'source>),
 ) -> ParsedFile {
     let root = tree.root_node();
@@ -561,7 +682,7 @@ pub(crate) fn parse_primary<'source>(
         usize::MAX,
         None,
     );
-    let mut parsed = JsTsParsedFile::new(source, root);
+    let mut parsed = JsTsParsedFile::new_with_lexical_bindings(source, root, lexical_bindings);
     let mut module_value_declarators = Vec::new();
     let module_object_exports =
         crate::graph::extractor::collect_module_object_exports(root, source);

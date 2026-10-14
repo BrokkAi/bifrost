@@ -1076,14 +1076,15 @@ impl MountRebaser {
     pub(crate) fn register_context_owned_semantic(
         &mut self,
         semantic: SemanticId,
+        content_digest: [u8; 32],
         names: &dyn SharedNameInterner,
     ) {
-        // The interner keys on a 32-byte digest, which is what a shared name
-        // is interned by. A context-owned reason is not a name any blob
-        // published, so what it needs is a key no blob's name can collide
-        // with; its own eight bytes in an otherwise zero digest are that.
-        let mut key = [0; 32];
-        key[24..].copy_from_slice(&semantic.as_bytes());
+        // This private interner key is derived from the reason's content in a
+        // separate domain. It cannot inherit the context's encounter order.
+        let key = brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+            b"bifrost-resolution-context-reason-interner:v1",
+            &content_digest,
+        );
         let name = names.intern(key);
         assert!(
             !name.is_interned(),
@@ -2591,7 +2592,22 @@ pub(crate) trait ResolutionIdentityTranslation {
     fn operation_local_reason(
         &self,
         reason: &super::model::ResolutionIncompleteReason,
-    ) -> super::model::ResolutionIncompleteReason;
+    ) -> super::model::ResolutionIncompleteReason {
+        use super::model::ResolutionIncompleteReason as Reason;
+        match reason {
+            Reason::CyclicPrefixDependency(id) => {
+                Reason::CyclicPrefixDependency(self.semantic(*id))
+            }
+            Reason::ReceiverBudgetExhausted(id) => {
+                Reason::ReceiverBudgetExhausted(self.semantic(*id))
+            }
+            Reason::TimeBudgetExceeded(id) => Reason::TimeBudgetExceeded(self.semantic(*id)),
+            Reason::UnmountedFile { fragment } => Reason::UnmountedFile {
+                fragment: self.fragment(*fragment),
+            },
+            other => panic!("only an operation-local reason reaches this arm: {other:?}"),
+        }
+    }
 }
 
 fn required_identity_mapping<Key, Value>(

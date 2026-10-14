@@ -19,6 +19,8 @@ pub(crate) struct SelectedIncludeBindingPair<'a> {
     pub(crate) origin_host: &'a SelectedResolutionMountRecord,
     pub(crate) original_identity: CandidatePathIdentity,
     pub(crate) original: &'a PartialPath,
+    pub(crate) path_content: [u8; 32],
+    pub(crate) destination_content: [u8; 32],
     pub(crate) end_kind: BindingNodeKind,
 }
 
@@ -77,11 +79,13 @@ impl SelectedResolutionStage<'_, '_> {
         definition_host: &SelectedResolutionMountRecord,
         definition: SemanticId,
         definition_node: BindingNodeId,
+        reference_content: [u8; 32],
+        definition_content: [u8; 32],
         cancellation: &CancellationToken,
     ) -> Result<Option<()>> {
         let mut hash = CanonicalHasher::new(b"bifrost-selected-textual-macro-head:v1");
-        hash.field("reference", &reference.as_bytes());
-        hash.field("definition", &definition.as_bytes());
+        hash.field("reference", &reference_content);
+        hash.field("definition", &definition_content);
         let source_identity = ResolutionPathIdentity::new(hash.finish());
         let boundary_identity = ResolutionNodeIdentity::new(source_identity.digest());
         let mut hash = CanonicalHasher::new(b"bifrost-selected-textual-macro-target:v1");
@@ -187,6 +191,8 @@ impl SelectedResolutionStage<'_, '_> {
         original_identity: CandidatePathIdentity,
         original: &PartialPath,
         end_kind: BindingNodeKind,
+        path_content: [u8; 32],
+        destination_content: [u8; 32],
         cancellation: &CancellationToken,
     ) -> Result<Option<()>> {
         self.admit_include_binding_pairs(
@@ -197,6 +203,8 @@ impl SelectedResolutionStage<'_, '_> {
                 original_identity,
                 original,
                 end_kind,
+                path_content,
+                destination_content,
             }],
             cancellation,
         )
@@ -244,11 +252,13 @@ impl SelectedResolutionStage<'_, '_> {
             original_identity,
             original,
             end_kind,
+            path_content,
+            destination_content,
         } = pair;
         assert_eq!(original_identity.fragment(), origin_host.fragment_id());
         let mut hash = CanonicalHasher::new(b"bifrost-selected-include-binding:v1");
-        hash.field("path", &original_identity.path().as_bytes());
-        hash.field("scope", &destination.as_bytes());
+        hash.field("path", path_content);
+        hash.field("scope", destination_content);
         let source_identity = ResolutionPathIdentity::new(hash.finish());
         let boundary_identity = ResolutionNodeIdentity::new(source_identity.digest());
         let mut hash = CanonicalHasher::new(b"bifrost-selected-include-continuation:v1");

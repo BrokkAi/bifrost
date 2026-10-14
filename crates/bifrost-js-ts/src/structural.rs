@@ -2,9 +2,9 @@
 
 use brokk_bifrost_core::analyzer::common::try_node_source_text as node_text;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child, nearest_ancestor, node_range,
-    unquoted_string_content_span,
+    CalleeSpineStep, attach_positional_argument_roles, attach_role_with_derived_name,
+    attach_terminal_callee, field_name_in_parent, first_named_child, nearest_ancestor, node_range,
+    terminal_callee_leaf, unquoted_string_content_span,
 };
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
@@ -470,6 +470,21 @@ fn js_ts_is_inside_signed_numeric_wrapper<'tree>(
                 .and_then(js_ts_numeric_target)
                 .is_some_and(|argument| argument.id() == node.id())
     })
+}
+
+/// Grammar steps for the shared call-callee spine. A value expression has no step.
+pub fn callee_spine_step(kind: &str) -> Option<CalleeSpineStep> {
+    use CalleeSpineStep::{Field, Name};
+    match kind {
+        "identifier"
+        | "property_identifier"
+        | "private_property_identifier"
+        | "type_identifier" => Some(Name),
+        "member_expression" | "nested_identifier" => Some(Field("property")),
+        "nested_type_identifier" | "qualified_identifier" | "generic_type" => Some(Field("name")),
+        "instantiation_expression" => Some(Field("function")),
+        _ => None,
+    }
 }
 
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
@@ -991,7 +1006,11 @@ impl JsTsStructuralSpec {
                     "function"
                 };
                 if let Some(function) = node.child_by_field_name(callee_field) {
-                    attach_terminal_callee(sink, function, expression_name_node(function));
+                    attach_terminal_callee(
+                        sink,
+                        function,
+                        terminal_callee_leaf(function, callee_spine_step),
+                    );
                     if function.kind() == "member_expression"
                         && let Some(object) = function.child_by_field_name("object")
                     {

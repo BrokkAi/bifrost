@@ -53,6 +53,17 @@ struct JvmDemandLanguage<'a, 'store, 'input> {
 }
 
 impl JvmDemandLanguage<'_, '_, '_> {
+    fn root_bridge_candidate(
+        &self,
+        bridge: &SelectedRootBridgeDescriptor,
+    ) -> Result<CandidatePathIdentity> {
+        bridge.candidate_identity(
+            &self.operation.ready.context_identities,
+            &self.operation.ready.lexical_source(),
+            self.cancellation,
+        )
+    }
+
     fn source_demand(&self, endpoint: &EndpointSignature) -> Result<Option<JvmSourceDemand>> {
         let lexical = self.operation.ready.lexical_source();
         let symbols = endpoint.symbols().fixed();
@@ -209,7 +220,9 @@ impl JvmDemandLanguage<'_, '_, '_> {
                 .mount_table()
                 .mount_by_ordinal(self.caller)?
                 .semantic_language();
-            let gaps = if !language_implicit_root_providers(language).is_empty() {
+            let gaps = if !language_implicit_root_providers(language).is_empty()
+                || (language == Language::Java && !implicit_root_reference)
+            {
                 let Some((_, gaps)) = self.file_context(self.caller)? else {
                     return Ok(None);
                 };
@@ -416,10 +429,50 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
                     .insert(endpoint.clone(), completion.clone())
                     .is_none()
             );
+            let discharges = match source.caller_scoped_source {
+                Some(JvmCallerScopedSource::Import { token, demand }) => {
+                    let source_mount = self
+                        .operation
+                        .mount_table()
+                        .mount_by_ordinal(source.mount)?;
+                    let Some(mut recipes) = self.operation.jvm_lookup_recipes(
+                        source_mount.fragment(),
+                        [demand],
+                        self.cancellation,
+                    )?
+                    else {
+                        return Ok(LanguageClosure {
+                            completion: cancelled_completion(),
+                            closed: false,
+                            discharges: None,
+                        });
+                    };
+                    let root_lookup = recipes
+                        .pop()
+                        .expect("a selected caller import demand has one lookup recipe");
+                    let identities = self
+                        .caller_scoped_gaps
+                        .as_ref()
+                        .expect("caller import gaps were loaded")
+                        .iter()
+                        .filter(|gap| gap.source_token == token && gap.lookup == root_lookup)
+                        .filter_map(|gap| gap.nominal_type_identity)
+                        .collect::<Vec<_>>();
+                    assert!(
+                        identities.len() <= 1,
+                        "one selected JVM import token has at most one unindexed nominal type"
+                    );
+                    identities.first().copied().map(|identity| {
+                        DemandClosureDischarges::with_operation_local_placeholders([])
+                            .with_selected_targets([identity])
+                    })
+                }
+                Some(JvmCallerScopedSource::ImplicitRootReference { .. }) | None => None,
+            };
             return Ok(LanguageClosure {
                 completion,
                 closed: true,
-                discharges: None,
+                discharges,
             });
         }
         let qualified_blueprint;
@@ -668,9 +721,9 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
                     &self.operation.ready.shared_names(),
                 );
                 has_import_route = !root_bridges.is_empty() || !package_bridges.is_empty();
-                existing_import_bridge_ids.extend(root_bridges.iter().map(|bridge| {
-                    bridge.candidate_identity(&self.operation.ready.context_identities)
-                }));
+                for bridge in &root_bridges {
+                    existing_import_bridge_ids.insert(self.root_bridge_candidate(bridge)?);
+                }
                 for package_bridge in package_bridges {
                     if let Some(bridge) = package_bridge.qualified_root_reference_bridge(
                         *token,
@@ -683,7 +736,7 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
                     }
                 }
                 if let Some(reference) = source_reference_semantic {
-                    let mut prefix_bridges = root_bridges
+                    let prefix_bridges = root_bridges
                         .iter()
                         .chain(import_root_bridges.iter())
                         .filter(|bridge| {
@@ -696,12 +749,16 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
                         })
                         .cloned()
                         .collect::<Vec<_>>();
-                    prefix_bridges.sort_by_key(|bridge| {
-                        bridge.candidate_identity(&self.operation.ready.context_identities)
-                    });
-                    prefix_bridges.dedup_by_key(|bridge| {
-                        bridge.candidate_identity(&self.operation.ready.context_identities)
-                    });
+                    let mut keyed = prefix_bridges
+                        .into_iter()
+                        .map(|bridge| Ok((self.root_bridge_candidate(&bridge)?, bridge)))
+                        .collect::<Result<Vec<_>>>()?;
+                    keyed.sort_unstable_by_key(|(candidate, _)| *candidate);
+                    keyed.dedup_by_key(|(candidate, _)| *candidate);
+                    let prefix_bridges = keyed
+                        .into_iter()
+                        .map(|(_, bridge)| bridge)
+                        .collect::<Vec<_>>();
                     if !prefix_bridges.is_empty() {
                         let Some((targets, completion)) =
                             self.jvm_root_bridge_prefix_targets(prefix_bridges)?
@@ -725,13 +782,17 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
                     }
                 }
                 if !import_root_bridges.is_empty() {
-                    let context_identities = &self.operation.ready.context_identities;
                     let existing = self.arena.borrow();
-                    import_root_bridges.retain(|bridge| {
-                        let candidate = bridge.candidate_identity(context_identities);
-                        !existing_import_bridge_ids.contains(&candidate)
+                    let mut retained = Vec::with_capacity(import_root_bridges.len());
+                    for bridge in import_root_bridges {
+                        let candidate = self.root_bridge_candidate(&bridge)?;
+                        if !existing_import_bridge_ids.contains(&candidate)
                             && !existing.paths.contains_key(&candidate)
-                    });
+                        {
+                            retained.push(bridge);
+                        }
+                    }
+                    import_root_bridges = retained;
                 }
                 import_gap_reasons.extend(
                     scoped_gaps
@@ -794,22 +855,26 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
                         terminal_route_reasons,
                     ));
             }
-            let context_identities = &self.operation.ready.context_identities;
             let existing = self.arena.borrow();
-            import_root_bridges.retain(|bridge| {
-                let candidate = bridge.candidate_identity(context_identities);
-                !existing_import_bridge_ids.contains(&candidate)
+            let mut retained = Vec::with_capacity(import_root_bridges.len());
+            for bridge in import_root_bridges {
+                let candidate = self.root_bridge_candidate(&bridge)?;
+                if !existing_import_bridge_ids.contains(&candidate)
                     && !existing.paths.contains_key(&candidate)
-            });
-            let publication_bridges = publication
-                .bridges
-                .into_iter()
-                .filter(|bridge| {
-                    let candidate = bridge.candidate_identity(context_identities);
-                    !existing_import_bridge_ids.contains(&candidate)
-                        && !existing.paths.contains_key(&candidate)
-                })
-                .collect::<Vec<_>>();
+                {
+                    retained.push(bridge);
+                }
+            }
+            import_root_bridges = retained;
+            let mut publication_bridges = Vec::with_capacity(publication.bridges.len());
+            for bridge in publication.bridges {
+                let candidate = self.root_bridge_candidate(&bridge)?;
+                if !existing_import_bridge_ids.contains(&candidate)
+                    && !existing.paths.contains_key(&candidate)
+                {
+                    publication_bridges.push(bridge);
+                }
+            }
             drop(existing);
             if publication.complete
                 && (!has_import_route || !publication.selected_targets.is_empty())

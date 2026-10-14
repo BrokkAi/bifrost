@@ -1,0 +1,41 @@
+{
+  "created_at": "<TIMESTAMP>",
+  "engine": {
+    "build_identity": "fixture-build",
+    "executable_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version": "9.9.0"
+  },
+  "failure": {
+    "class": "unqualified",
+    "message": "newest otherwise-complete candidate 1.0.0 failed behavior qualification",
+    "retryable": false
+  },
+  "inventory": {
+    "fetched_at": "<TIMESTAMP>",
+    "fetched_online": true,
+    "index_sha256": "811a3340e41bb168dcdcc742390bbe5d87132f873094842d9fd9635701045e2e"
+  },
+  "outcome_schema_version": 1,
+  "rejections": [
+    {
+      "detail": "a selected release declares failed behavior qualification",
+      "pack_id": "bifrost.public.rules",
+      "reason": "qualification-behavior-failed",
+      "release_version": "1.0.0",
+      "tag": "rules/v1.0.0"
+    }
+  ],
+  "request": {
+    "dependencies": [],
+    "pack_id": "bifrost.public.rules",
+    "repository": "https://github.com/BrokkAi/bifrost-packs",
+    "request_schema_version": 1,
+    "selection": {
+      "allowed_versions": "*",
+      "channel": "stable",
+      "mode": "preferred"
+    }
+  },
+  "selection": null,
+  "status": "failed"
+}

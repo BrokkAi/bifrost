@@ -11,7 +11,6 @@ use super::{
     parse_tree_for_language, ruby_is_call_method_identifier, scala::scala_postfix_method_node,
 };
 use crate::analyzer::common::language_for_file;
-use brokk_bifrost_core::analyzer::tree_walk::last_named_field_child as last_named_child_by_field;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallSignatureContext {
@@ -59,6 +58,8 @@ pub(crate) enum ExactCallReferenceGap {
     /// `proc.(value)` invokes the value held by the receiver. Resolving its
     /// target requires value/heap information rather than a method-name lookup.
     RubyCallableObject,
+    /// The callee is a value expression, not a declaration name.
+    CallOfValue,
 }
 
 pub(crate) fn call_reference_ranges_in_tree(
@@ -120,9 +121,17 @@ pub(crate) fn exact_call_reference_for_call(
                     ));
                 }
                 let callee = callee_node_for_call(node, language)?;
-                return call_reference_leaf(callee, language)
-                    .map(node_range)
-                    .map(ExactCallReference::Resolvable);
+                return Some(match call_reference_leaf(callee, language) {
+                    Some(leaf) => ExactCallReference::Resolvable(node_range(leaf)),
+                    None if matches!(
+                        language,
+                        Language::Go | Language::Java | Language::Kotlin | Language::Scala
+                    ) =>
+                    {
+                        return None;
+                    }
+                    None => ExactCallReference::Unsupported(ExactCallReferenceGap::CallOfValue),
+                });
             }
         }
         let parent = node.parent()?;
@@ -130,6 +139,34 @@ pub(crate) fn exact_call_reference_for_call(
             return None;
         }
         node = parent;
+    }
+}
+
+/// Map a reverse site's whole-call span or exact callee span to the same
+/// cache key used by forward dispatch. An arbitrary operand inside a call
+/// cannot qualify: the site's range must equal the call or its callee leaf.
+pub(crate) fn exact_call_reference_for_reverse_site(
+    tree: &Tree,
+    language: Language,
+    site: &Range,
+) -> Option<Range> {
+    if let Some(ExactCallReference::Resolvable(range)) =
+        exact_call_reference_for_call(tree, language, site)
+    {
+        return Some(range);
+    }
+    let mut node = tree
+        .root_node()
+        .named_descendant_for_byte_range(site.start_byte, site.end_byte)?;
+    loop {
+        if is_call_expression_node(node, language)
+            && let Some(ExactCallReference::Resolvable(range)) =
+                exact_call_reference_for_call(tree, language, &node_range(node))
+            && (range.start_byte, range.end_byte) == (site.start_byte, site.end_byte)
+        {
+            return Some(range);
+        }
+        node = node.parent()?;
     }
 }
 
@@ -532,9 +569,14 @@ fn scala_terminal_callee_leaf(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn call_reference_leaf(node: Node<'_>, language: Language) -> Option<Node<'_>> {
-    if language == Language::Cpp {
-        return cpp_terminal_callee_leaf(node);
+    if !matches!(
+        language,
+        Language::Go | Language::Java | Language::Kotlin | Language::Scala
+    ) {
+        return terminal_callee_leaf(node, language);
     }
+    // #5019 follow-up: Go and JVM resolution are being rewritten concurrently.
+    // Preserve their existing descendant selection until that work owns the spine.
     if node.named_child_count() == 0 {
         return is_call_reference_candidate(node, language).then_some(node);
     }
@@ -555,39 +597,22 @@ fn call_reference_leaf(node: Node<'_>, language: Language) -> Option<Node<'_>> {
     best
 }
 
-/// Follow only the structured C/C++ callee spine. In particular, do not walk
-/// every descendant of qualified or templated callables: doing so can select a
-/// namespace qualifier, receiver, or template argument instead of the name
-/// that dispatches.
-fn cpp_terminal_callee_leaf(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        node = match node.kind() {
-            "identifier"
-            | "field_identifier"
-            | "type_identifier"
-            | "operator_name"
-            | "operator_cast"
-            | "destructor_name"
-            | "literal_operator_name"
-            | "primitive_type" => return Some(node),
-            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
-                last_named_child_by_field(node, "name")?
-            }
-            "dependent_name" | "template_function" | "template_method" | "template_type" => {
-                node.child_by_field_name("name")?
-            }
-            "field_expression" => node.child_by_field_name("field")?,
-            "parenthesized_expression" => only_named_child(node)?,
-            "pointer_expression" => node
-                .child_by_field_name("argument")
-                .or_else(|| only_named_child(node))?,
-            _ => return None,
-        };
-    }
-}
-
-fn only_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    crate::analyzer::tree_walk::single_named_child_matching(node, |_| true)
+/// Exact dispatch and structural call facts share the same callee spine.
+fn terminal_callee_leaf(node: Node<'_>, language: Language) -> Option<Node<'_>> {
+    use brokk_bifrost_core::analyzer::structural::adapter_helpers::terminal_callee_leaf as follow_spine;
+    let hook = match language {
+        Language::Cpp => brokk_bifrost_cpp::structural::callee_spine_step,
+        Language::Python => brokk_bifrost_python::structural::callee_spine_step,
+        Language::JavaScript | Language::TypeScript => {
+            brokk_bifrost_js_ts::structural::callee_spine_step
+        }
+        Language::Rust => brokk_bifrost_rust::structural::callee_spine_step,
+        Language::CSharp => brokk_bifrost_csharp::structural::callee_spine_step,
+        Language::Php => brokk_bifrost_php::structural::callee_spine_step,
+        Language::Ruby => brokk_bifrost_ruby::structural::callee_spine_step,
+        _ => return None,
+    };
+    follow_spine(node, hook)
 }
 
 fn contains_call_expression_node(node: Node<'_>, language: Language) -> bool {
@@ -862,7 +887,8 @@ fn cpp_call_reference_candidate(node: Node<'_>) -> bool {
     let mut ancestor = node.parent();
     while let Some(current) = ancestor {
         if is_call_expression_node(current, Language::Cpp) {
-            return callee_node_for_call(current, Language::Cpp).and_then(cpp_terminal_callee_leaf)
+            return callee_node_for_call(current, Language::Cpp)
+                .and_then(|callee| terminal_callee_leaf(callee, Language::Cpp))
                 == Some(node);
         }
         ancestor = current.parent();

@@ -32,6 +32,16 @@ impl Default for CodeQueryFlowCarrierSymbol {
     }
 }
 
+fn fixture_external_callee_key() -> CodeQueryExternalCalleeKey {
+    CodeQueryExternalCalleeKey {
+        language: "java".to_owned(),
+        owner: "com.acme.AcmeHttpClient".to_owned(),
+        member: "send".to_owned(),
+        has_receiver: true,
+        parameter_count: 1,
+    }
+}
+
 /// Serialize one instance of every canonical result variant.
 ///
 /// The schema comparison makes a newly added variant fail this fixture path
@@ -170,7 +180,20 @@ pub fn code_query_result_fixtures_json() -> Value {
             value: Default::default(),
         },
         CodeQueryResultValue::ProcedureEffect {
-            value: Default::default(),
+            value: Box::new(CodeQueryProcedureEffect {
+                witness_available: true,
+                witness_steps: 1,
+                witness_hops: vec![CodeQueryProcedureEffectWitness {
+                    callee_procedure_id: "fixture-external-graph-procedure".to_owned(),
+                    target_id: "fixture-dispatch-target".to_owned(),
+                    proof: "unproven",
+                    dispatch_complete: false,
+                    site_coverage: "open",
+                    external_callee_key: Some(fixture_external_callee_key()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
         },
         CodeQueryResultValue::CallableSignature {
             value: Default::default(),
@@ -213,7 +236,15 @@ pub fn code_query_result_fixtures_json() -> Value {
             value: Default::default(),
         },
         CodeQueryResultValue::DispatchTarget {
-            value: Default::default(),
+            value: Box::new(CodeQueryDispatchTarget {
+                target_id: "fixture-dispatch-target".to_owned(),
+                proof: "unproven",
+                completeness: "partial",
+                coverage: "open",
+                dispatch: "may_dispatch",
+                external_callee_key: Some(fixture_external_callee_key()),
+                ..Default::default()
+            }),
         },
         CodeQueryResultValue::MemberFamily {
             value: Default::default(),

@@ -1874,20 +1874,24 @@ pub(super) fn resolve_scan_usages_target(
         true,
         &selector_matches_exact_form,
     );
-    // JS/TS module-surface extraction deliberately publishes two identities
-    // for an exported object literal: the real declaration keeps its file
-    // path segment, while the definition-lookup-only surface keeps the
-    // source-written receiver spelling. Prefer the latter for a location
-    // selector that names that source-written spelling. A full file-anchored
-    // selector still matches the real declaration in the first pass.
+    // Lookup-only units also need the location-pinned suffix match below.
+    // Seek the selector's terminal identifier in this file, rather than its
+    // full FQ: a source-written receiver can omit the creating binding's scope
+    // (#3864). Exact matches still precede suffix matches, including module
+    // surfaces whose source spelling differs from their declaration identity.
     let lookup_only_candidates = if matching_units.is_empty()
         && let Some(symbol) = selector
     {
+        let language = language_for_file(&file);
+        let name = parse_symbol_path_fq(language, symbol, segment_interner());
         let declarations = analyzer.location_declarations(&file);
-        let lookup = AnalyzerDefinitionLookup::new(analyzer, language_for_file(&file));
-        lookup
-            .fqn(symbol)
+        let lookup = AnalyzerDefinitionLookup::new(analyzer, language);
+        name.last()
             .into_iter()
+            .flat_map(|segment| {
+                let identifier = segment_interner().resolve(segment).0;
+                lookup.file_identifier(&file, identifier)
+            })
             .filter(|unit| {
                 unit.source() == &file
                     && unit.is_field()
@@ -8211,37 +8215,51 @@ mod tests {
     }
 
     fn scan_with(analyzer: &RustAnalyzer, cancellation: CancellationToken) -> ScanUsagesResult {
-        scan_usages_by_reference_with_cancellation(
-            analyzer,
-            ScanUsagesByReferenceParams {
-                symbols: vec!["collect_it".to_string()],
-                include_tests: true,
-                paths: None,
-                include_same_owner: false,
-            },
-            cancellation,
-        )
+        // Interrupted scans pin a deterministic proven set at one worker.
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                scan_usages_by_reference_with_cancellation(
+                    analyzer,
+                    ScanUsagesByReferenceParams {
+                        symbols: vec!["collect_it".to_string()],
+                        include_tests: true,
+                        paths: None,
+                        include_same_owner: false,
+                    },
+                    cancellation,
+                )
+            })
     }
 
     fn scan_location_with(
         analyzer: &RustAnalyzer,
         cancellation: CancellationToken,
     ) -> ScanUsagesResult {
-        scan_usages_by_location_with_cancellation(
-            analyzer,
-            ScanUsagesByLocationParams {
-                targets: vec![ScanUsagesTarget {
-                    path: "src/target.rs".to_string(),
-                    line: 1,
-                    column: None,
-                    symbol: None,
-                }],
-                include_tests: true,
-                paths: None,
-                include_same_owner: false,
-            },
-            cancellation,
-        )
+        // Interrupted scans pin a deterministic proven set at one worker.
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                scan_usages_by_location_with_cancellation(
+                    analyzer,
+                    ScanUsagesByLocationParams {
+                        targets: vec![ScanUsagesTarget {
+                            path: "src/target.rs".to_string(),
+                            line: 1,
+                            column: None,
+                            symbol: None,
+                        }],
+                        include_tests: true,
+                        paths: None,
+                        include_same_owner: false,
+                    },
+                    cancellation,
+                )
+            })
     }
 
     fn assert_partial_scan_retains_proven_hits(

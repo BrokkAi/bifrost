@@ -404,6 +404,7 @@ struct ClassSetSummaryLookupKey {
     entry: StableEntryFact,
     dispatch_reads: StableDigest,
     root_surface: StableDigest,
+    owner_storage_language_key: crate::analyzer::semantic::StorageLanguageKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1024,6 +1025,9 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
         procedure: &ProcedureHandle,
         snapshot: &ValueFlowInput<ValueFlowSnapshot>,
     ) -> Option<ClassSetProcedureSurfaceKey> {
+        let owner_storage_language_key = self
+            .workspace
+            .semantic_artifact_storage_language_key(procedure.artifact().key())?;
         let identity = ProcedureSummaryIdentity::new(
             procedure.artifact().key().clone(),
             procedure.semantics().locator().declaration().clone(),
@@ -1036,6 +1040,7 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
         Some(ClassSetProcedureSurfaceKey {
             procedure_lineage: *identity.read_lineage_fingerprint().as_bytes(),
             owner_rel_path: procedure.artifact().key().path().as_str().to_owned(),
+            owner_storage_language_key,
             language: procedure.artifact().key().language().language(),
             schema_version: identity.schema().get(),
             local_structure_digest: *class_set_local_structure_digest(snapshot).ok()?.as_bytes(),
@@ -1754,6 +1759,7 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
         let key = ClassSetSummaryFamilyKey {
             procedure_lineage: surface_header.key.procedure_lineage,
             owner_rel_path: surface_header.key.owner_rel_path.clone(),
+            owner_storage_language_key: surface_header.key.owner_storage_language_key.clone(),
             language: surface_header.key.language,
             schema_version: surface_header.key.schema_version,
             semantics_digest: *SummarySemanticsVersion::hash_bytes(CLASS_SET_SUMMARY_SEMANTICS)
@@ -2092,6 +2098,11 @@ fn class_set_procedure_surface(
     let attachment = workspace
         .semantic_artifact_store_attachment(procedure.artifact().key())
         .map_err(|error| StoreError::new(format!("capturing class-set surface source: {error}")))?;
+    let Some(owner_storage_language_key) =
+        workspace.semantic_artifact_storage_language_key(procedure.artifact().key())
+    else {
+        return Ok(None);
+    };
     let owner_blob_oid = attachment
         .as_ref()
         .map_or_else(|| "runtime-only".to_owned(), |row| row.blob_oid.clone());
@@ -2109,6 +2120,7 @@ fn class_set_procedure_surface(
             key: ClassSetProcedureSurfaceKey {
                 procedure_lineage: *identity.read_lineage_fingerprint().as_bytes(),
                 owner_rel_path: owner.rel_path,
+                owner_storage_language_key,
                 language: owner.language,
                 schema_version: identity.schema().get(),
                 local_structure_digest: owner.local_structure_digest,
@@ -3091,6 +3103,12 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             let Some(store) = &self.store else {
                 return false;
             };
+            let Some(storage_language_key) = self
+                .workspace
+                .semantic_artifact_storage_language_key(prepared.semantic.key().artifact())
+            else {
+                return false;
+            };
             match store.contains_class_set_summary_procedure(
                 *prepared
                     .semantic
@@ -3098,6 +3116,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                     .identity()
                     .read_lineage_fingerprint()
                     .as_bytes(),
+                &storage_language_key,
             ) {
                 Ok(present) => present,
                 Err(error) => {
@@ -3609,6 +3628,9 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
     ) -> Option<ClassSetSummaryLookupKey> {
         let prepared = self.procedures.get(procedure)?;
         let surface = self.surfaces.get(procedure)?;
+        let owner_storage_language_key = self
+            .workspace
+            .semantic_artifact_storage_language_key(procedure.artifact().key())?;
         let root_surface = StableDigest::from_array(*surface.surface_digest());
         if self.type_plan.is_summary_cut(procedure)
             && self
@@ -3632,6 +3654,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             entry,
             dispatch_reads: read_set_digest(reads).digest(),
             root_surface,
+            owner_storage_language_key,
         })
     }
 
@@ -5185,6 +5208,7 @@ fn restore_persisted_summary(
         || header.root_surface_digest != *expected.root_surface.as_bytes()
         || header.direct_calls_digest != *expected.contract.direct_calls.as_bytes()
         || header.attachment.rel_path != procedure.artifact().path().as_str()
+        || header.attachment.storage_language_key != expected.owner_storage_language_key
         || header.attachment.language != procedure.artifact().language().language()
     {
         return Err(StoreError::new(
@@ -9317,6 +9341,7 @@ mod tests {
                             procedures["wrapper"].semantics().locator().declaration(),
                         )
                         .as_bytes(),
+                    &crate::analyzer::semantic::StorageLanguageKey::from_adapter("python"),
                 )
                 .expect("persisted wrapper probe"),
             "the cold state must publish through SQLite"

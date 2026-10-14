@@ -164,6 +164,26 @@ pub fn create_cli_tool_service(
     SearchToolsService::new_manual_scoped_persisted_for_project(project, AnalyzerConfig::default())
 }
 
+/// Opt-in diagnostic counterpart for one whole-root `query_code` invocation.
+/// It installs the receipt before the service eagerly activates semantic models.
+pub fn create_cli_tool_service_with_activation_receipt(
+    root: PathBuf,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    sources: &[String],
+    overlays: Vec<GitHistoryOverlay>,
+    receipt: Arc<crate::analyzer::semantic_model::ActivationReceipt>,
+) -> Result<SearchToolsService, String> {
+    if tool_name != "query_code"
+        || !sources.is_empty()
+        || !overlays.is_empty()
+        || SearchToolsService::tool_is_workspace_independent(tool_name, arguments)
+    {
+        return Err("activation receipts require a whole-root query_code invocation".to_string());
+    }
+    SearchToolsService::new_one_shot_with_activation_receipt(root, receipt)
+}
+
 pub fn resolve_sources(root: &Path, inputs: &[String]) -> Result<Vec<PathBuf>, String> {
     let workspace_files = collect_workspace_files(root).map_err(|err| {
         format!(

@@ -704,11 +704,12 @@ impl LoweredMemberScopeProperty {
 /// `owner_scope_head` repeats the selected owner's normalized member-scope
 /// entry point intentionally: a resolved member can seed the next qualified
 /// lookup without reconstructing a scope ID or reading source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoweredMemberOwnerProperty {
     definition: SemanticId,
     owner_definition: SemanticId,
     owner_scope_head: Option<BindingNodeId>,
+    member_name: Box<str>,
     kind: ResolutionMemberKind,
     access: ResolutionMemberAccess,
     qualifier_compatibility: ResolutionMemberQualifierCompatibility,
@@ -717,10 +718,11 @@ pub struct LoweredMemberOwnerProperty {
 }
 
 impl LoweredMemberOwnerProperty {
-    pub const fn new(
+    pub fn new(
         definition: SemanticId,
         owner_definition: SemanticId,
         owner_scope_head: BindingNodeId,
+        member_name: impl Into<Box<str>>,
         kind: ResolutionMemberKind,
         access: ResolutionMemberAccess,
         qualifier_compatibility: ResolutionMemberQualifierCompatibility,
@@ -729,6 +731,7 @@ impl LoweredMemberOwnerProperty {
             definition,
             owner_definition,
             owner_scope_head: Some(owner_scope_head),
+            member_name: member_name.into(),
             kind,
             access,
             qualifier_compatibility,
@@ -743,6 +746,10 @@ impl LoweredMemberOwnerProperty {
 
     pub const fn owner_definition(&self) -> SemanticId {
         self.owner_definition
+    }
+
+    pub fn member_name(&self) -> &str {
+        &self.member_name
     }
 
     pub const fn owner_scope_head(&self) -> BindingNodeId {
@@ -760,9 +767,11 @@ impl LoweredMemberOwnerProperty {
     pub const fn external_visibility(&self) -> Option<DeclaredVisibility> {
         self.external_visibility
     }
-    pub const fn external(
+    #[allow(clippy::too_many_arguments)]
+    pub fn external(
         definition: SemanticId,
         owner_definition: SemanticId,
+        member_name: impl Into<Box<str>>,
         kind: ResolutionMemberKind,
         access: ResolutionMemberAccess,
         qualifier_compatibility: ResolutionMemberQualifierCompatibility,
@@ -773,6 +782,7 @@ impl LoweredMemberOwnerProperty {
             definition,
             owner_definition,
             owner_scope_head: None,
+            member_name: member_name.into(),
             kind,
             access,
             qualifier_compatibility,
@@ -1346,6 +1356,7 @@ pub struct LoweredCallableSignatureProperty {
     type_parameter_count: u32,
     parameters: Box<[LoweredCallableParameterProperty]>,
     parameter_lists: Box<[u32]>,
+    contextual_parameter_lists: Box<[u32]>,
     parameter_applicability: Box<[LoweredCallableParameterApplicability]>,
     extension_receiver: Option<SemanticId>,
     result_types: Box<[LoweredCallableResultTypeProperty]>,
@@ -1556,6 +1567,7 @@ impl LoweredCallableSignatureProperty {
             definition,
             type_parameter_count,
             parameter_lists: Box::new([0]),
+            contextual_parameter_lists: Box::default(),
             parameter_applicability: parameters
                 .iter()
                 .map(|parameter| {
@@ -1620,6 +1632,7 @@ impl LoweredCallableSignatureProperty {
                     self.parameter_applicability.clone(),
                     self.extension_receiver,
                 )
+                .with_contextual_parameter_lists(self.contextual_parameter_lists.clone())
         })
     }
 
@@ -1638,6 +1651,10 @@ impl LoweredCallableSignatureProperty {
     /// Explicit parameter-list ordinals, including empty lists.
     pub fn parameter_lists(&self) -> &[u32] {
         &self.parameter_lists
+    }
+
+    pub fn contextual_parameter_lists(&self) -> &[u32] {
+        &self.contextual_parameter_lists
     }
 
     /// Label and default facts in the same global ordinal order as
@@ -1680,6 +1697,18 @@ impl LoweredCallableSignatureProperty {
         self.parameter_lists = parameter_lists;
         self.parameter_applicability = parameter_applicability.into_boxed_slice();
         self.extension_receiver = extension_receiver;
+        self
+    }
+
+    pub fn with_contextual_parameter_lists(mut self, lists: impl Into<Box<[u32]>>) -> Self {
+        let lists = lists.into();
+        assert!(lists.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            lists
+                .iter()
+                .all(|ordinal| self.parameter_lists.contains(ordinal))
+        );
+        self.contextual_parameter_lists = lists;
         self
     }
 
@@ -2704,8 +2733,12 @@ impl LoweredTypedFragment {
                 );
             }
             assert!(
-                projection_outputs.contains(&(obligation.callee_reference, obligation.result_slot)),
-                "call applicability obligation requires its result binding projection"
+                projection_outputs.contains(&(obligation.callee_reference, obligation.result_slot))
+                    || self
+                        .transfers
+                        .iter()
+                        .any(|transfer| { transfer.rule.target_slot() == obligation.result_slot }),
+                "call applicability obligation requires its result producer"
             );
             assert!(
                 obligation.completion.contains_reason(
@@ -3600,11 +3633,18 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
 
     let parameters_by_callable = normalized_callable_parameters(facts, &index);
     let mut parameter_lists_by_callable = HashMap::<ResolutionSiteId, Vec<u32>>::default();
+    let mut contextual_lists_by_callable = HashMap::<ResolutionSiteId, Vec<u32>>::default();
     for list in &facts.callable_parameter_lists {
         parameter_lists_by_callable
             .entry(list.callable)
             .or_default()
             .push(list.list_ordinal);
+        if list.contextual {
+            contextual_lists_by_callable
+                .entry(list.callable)
+                .or_default()
+                .push(list.list_ordinal);
+        }
     }
     for (&callable, parameters) in &parameters_by_callable {
         let lists = parameter_lists_by_callable.entry(callable).or_default();
@@ -3795,6 +3835,11 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                     .unwrap_or_default(),
                 parameter_applicability,
                 extension_receivers_by_callable.remove(&callable),
+            )
+            .with_contextual_parameter_lists(
+                contextual_lists_by_callable
+                    .remove(&callable)
+                    .unwrap_or_default(),
             ),
         );
     }
@@ -3805,6 +3850,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
          {result_type_parameters_by_callable:?} {result_owner_type_parameters_by_callable:?}"
     );
     assert!(parameter_lists_by_callable.is_empty());
+    assert!(contextual_lists_by_callable.is_empty());
     assert!(parameter_semantics_by_position.is_empty());
     assert!(extension_receivers_by_callable.is_empty());
     assert!(
@@ -4030,6 +4076,7 @@ fn lower_definition_properties_with_index(
             identities.source_definition_semantic(fact.member),
             owner_definition,
             owner_scope_head,
+            index.name(index.definition_identifier(fact.member).name),
             fact.kind,
             fact.access,
             fact.qualifier_compatibility,
@@ -4461,8 +4508,11 @@ impl<'facts> TypedFactIndex<'facts> {
                 assert!(
                     facts.binding_projections.iter().any(|projection| {
                         projection.reference == call.callee && projection.output == call.result
-                    }),
-                    "supported call lacks its result projection: {call:?}"
+                    }) || facts
+                        .type_transfers
+                        .iter()
+                        .any(|transfer| transfer.output == call.result),
+                    "supported call lacks its result producer: {call:?}"
                 );
             }
             let result = self.slot(call.result);
@@ -5044,8 +5094,12 @@ fn transfer_accepts_output_role(
         ResolutionTypeTransferKind::Receiver => ResolutionTypeSlotRole::Receiver,
         ResolutionTypeTransferKind::Argument => ResolutionTypeSlotRole::Argument,
         ResolutionTypeTransferKind::Return => ResolutionTypeSlotRole::ReturnValue,
-        ResolutionTypeTransferKind::UnaryIndirection | ResolutionTypeTransferKind::AddressOf => {
-            ResolutionTypeSlotRole::ExpressionValue
+        ResolutionTypeTransferKind::UnaryIndirection => ResolutionTypeSlotRole::ExpressionValue,
+        ResolutionTypeTransferKind::AddressOf => {
+            return matches!(
+                output,
+                ResolutionTypeSlotRole::ExpressionValue | ResolutionTypeSlotRole::CallResult
+            );
         }
     };
     output == expected
@@ -5765,9 +5819,10 @@ fn qualified_route_sort_key(
 
 fn member_owner_sort_key(
     row: &LoweredMemberOwnerProperty,
-) -> (SemanticId, u8, u8, u8, SemanticId, BindingNodeId) {
+) -> (SemanticId, String, u8, u8, u8, SemanticId, BindingNodeId) {
     (
         row.definition,
+        row.member_name().to_owned(),
         member_kind_rank(row.kind),
         member_access_rank(row.access),
         qualifier_compatibility_rank(row.qualifier_compatibility),
@@ -5946,6 +6001,7 @@ const fn supertype_kind_rank(kind: ResolutionSupertypeKind) -> u8 {
         ResolutionSupertypeKind::Interface => 1,
         ResolutionSupertypeKind::GoInterfaceElement => 2,
         ResolutionSupertypeKind::ImplicitSuperclass => 3,
+        ResolutionSupertypeKind::SelfType => 4,
     }
 }
 
@@ -6774,6 +6830,7 @@ mod tests {
                     row.definition(),
                     row.owner_definition(),
                     row.owner_scope_head(),
+                    row.member_name(),
                     row.kind(),
                     row.access(),
                     row.qualifier_compatibility(),

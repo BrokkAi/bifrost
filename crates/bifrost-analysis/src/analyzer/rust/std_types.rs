@@ -233,19 +233,19 @@ impl RustTypeProofResolver for FactoryRustTypeProofResolver<'_> {
     }
 }
 
-struct SelectedRustTypeProofResolver<'analyzer, 'factory, 'operation, 'cancellation> {
+struct SelectedRustTypeProofResolver<'analyzer, 'factory, 'selection, 'operation, 'cancellation> {
     analyzer: &'analyzer dyn IAnalyzer,
     factory: &'factory super::native_points::RustDefinitionOperationFactory<'analyzer>,
     operation: RefCell<
         &'operation mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
             'analyzer,
-            'factory,
+            'selection,
         >,
     >,
     cancellation: Option<&'cancellation crate::CancellationToken>,
 }
 
-impl RustTypeProofResolver for SelectedRustTypeProofResolver<'_, '_, '_, '_> {
+impl RustTypeProofResolver for SelectedRustTypeProofResolver<'_, '_, '_, '_, '_> {
     fn resolve(
         &self,
         query: BoundedReceiverQuery<'_>,
@@ -282,7 +282,7 @@ impl RustTypeProofResolver for SelectedRustTypeProofResolver<'_, '_, '_, '_> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_external_call_identity<'analyzer, 'factory>(
+fn resolve_external_call_identity<'analyzer, 'factory, 'selection>(
     analyzer: &'analyzer dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -293,7 +293,7 @@ fn resolve_external_call_identity<'analyzer, 'factory>(
     mut operation: Option<
         &mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
             'analyzer,
-            'factory,
+            'selection,
         >,
     >,
     cancellation: Option<&crate::CancellationToken>,
@@ -1731,7 +1731,7 @@ pub(crate) fn rust_method_receiver_owner(
     rust_method_receiver_owner_with_proof(&proof, file, source, method)
 }
 
-pub(crate) fn rust_method_receiver_owner_with_operation<'analyzer, 'factory>(
+pub(crate) fn rust_method_receiver_owner_with_operation<'analyzer, 'factory, 'selection>(
     analyzer: &'analyzer dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -1739,7 +1739,7 @@ pub(crate) fn rust_method_receiver_owner_with_operation<'analyzer, 'factory>(
     factory: &'factory super::native_points::RustDefinitionOperationFactory<'analyzer>,
     operation: &mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
         'analyzer,
-        'factory,
+        'selection,
     >,
     cancellation: Option<&crate::CancellationToken>,
 ) -> Option<(RustReceiverOwner, usize)> {

@@ -144,14 +144,15 @@ impl FactEvaluation<'_, '_> {
             return Ok(Some(answer));
         }
 
-        let reason = service_reason(
+        let reason = canonical_service_reason(
+            self.session,
             &*self.hierarchy,
             b"go-interface-call-dynamic-dispatch",
             &[
-                obligation.callee_reference().as_bytes().as_slice(),
-                owner.as_bytes().as_slice(),
+                CanonicalIdentityPart::identity(obligation.callee_reference()),
+                CanonicalIdentityPart::identity(owner),
             ],
-        );
+        )?;
         let completion = answer.completion().combine(&incomplete(reason));
         Ok(Some(answer_with_completion(answer, completion)))
     }
@@ -322,11 +323,12 @@ impl FactEvaluation<'_, '_> {
         }
         let (targets, witnesses, mut completion) = answer.into_parts();
         if unresolved {
-            completion = completion.combine(&incomplete(service_reason(
+            completion = completion.combine(&incomplete(canonical_service_reason(
+                self.session,
                 &*self.hierarchy,
                 b"go-interface-method-signature-unproven",
-                &[self.root.as_bytes().as_slice()],
-            )));
+                &[CanonicalIdentityPart::identity(self.root)],
+            )?));
         }
         Ok(Some(ResolutionAnswer::new(
             targets
@@ -682,14 +684,15 @@ impl FactEvaluation<'_, '_> {
             }
             if unavailable {
                 completion = completion.combine(&ResolutionCompletion::incomplete([
-                    ResolutionIncompleteReason::UnsupportedSemantic(service_reason(
+                    ResolutionIncompleteReason::UnsupportedSemantic(canonical_service_reason(
+                        self.session,
                         &*self.hierarchy,
                         b"go-promotion-frontier-unavailable",
                         &[
-                            reference.as_bytes().as_slice(),
-                            lookup.as_bytes().as_slice(),
+                            CanonicalIdentityPart::identity(reference),
+                            CanonicalIdentityPart::identity(lookup),
                         ],
-                    )),
+                    )?),
                 ]));
             }
             if matches!(receiver, ResolutionSlotValue::TypeObject(_))
@@ -704,18 +707,15 @@ impl FactEvaluation<'_, '_> {
                 }));
             }
             if selected.len() > 1 {
-                completion = completion.combine(&ResolutionCompletion::incomplete([
+                let precedence = ResolutionCompletion::incomplete([
                     ResolutionIncompleteReason::InconsistentPrecedence(reference),
-                ]));
-                let has_method = selected
-                    .iter()
-                    .any(|member| member.kind == ResolutionMemberKind::Method);
+                ]);
+                completion = completion.combine(&precedence);
                 return Ok(Some(GoMemberSearch {
-                    // An ambiguous method promotion is not a callable target,
-                    // even when every path reaches the same declaration.
-                    // Keep field candidates so definition lookup can report
-                    // the exact declarations reached through those paths.
-                    members: if has_method { Vec::new() } else { selected },
+                    // Preserve every promotion witness while precedence stays
+                    // ambiguous. Consumers may report candidates but cannot
+                    // select a unique callable target.
+                    members: selected,
                     rejected: Vec::new(),
                     completion,
                 }));
@@ -738,14 +738,15 @@ impl FactEvaluation<'_, '_> {
                         .receiver_indirection_supported(member.target, member.value)
                 {
                     completion = completion.combine(&ResolutionCompletion::incomplete([
-                        ResolutionIncompleteReason::UnsupportedSemantic(service_reason(
+                        ResolutionIncompleteReason::UnsupportedSemantic(canonical_service_reason(
+                            self.session,
                             &*self.hierarchy,
                             b"go-pointer-method-requires-addressable-receiver",
                             &[
-                                reference.as_bytes().as_slice(),
-                                member.target.as_bytes().as_slice(),
+                                CanonicalIdentityPart::identity(reference),
+                                CanonicalIdentityPart::identity(member.target),
                             ],
-                        )),
+                        )?),
                     ]));
                     return Ok(Some(GoMemberSearch {
                         members: Vec::new(),
@@ -759,14 +760,15 @@ impl FactEvaluation<'_, '_> {
                         .go_receiver_eligible(member.target, member.value)
                 {
                     completion = completion.combine(&ResolutionCompletion::incomplete([
-                        ResolutionIncompleteReason::UnsupportedSemantic(service_reason(
+                        ResolutionIncompleteReason::UnsupportedSemantic(canonical_service_reason(
+                            self.session,
                             &*self.hierarchy,
                             b"go-pointer-method-requires-addressable-receiver",
                             &[
-                                reference.as_bytes().as_slice(),
-                                member.target.as_bytes().as_slice(),
+                                CanonicalIdentityPart::identity(reference),
+                                CanonicalIdentityPart::identity(member.target),
                             ],
-                        )),
+                        )?),
                     ]));
                     return Ok(Some(GoMemberSearch {
                         members: Vec::new(),
@@ -801,6 +803,10 @@ impl FactEvaluation<'_, '_> {
                         unavailable = true;
                         continue;
                     };
+                    if !self.charge_owner_expansion(path.value.ty().identity()) {
+                        self.cancellation_observed = true;
+                        return Ok(None);
+                    }
                     self.demand_slot(slot);
                     let Some(state) = states.get(&slot) else {
                         // This snapshot predates the slot demand above. The
@@ -862,14 +868,15 @@ impl FactEvaluation<'_, '_> {
             }
             if unavailable {
                 completion = completion.combine(&ResolutionCompletion::incomplete([
-                    ResolutionIncompleteReason::UnsupportedSemantic(service_reason(
+                    ResolutionIncompleteReason::UnsupportedSemantic(canonical_service_reason(
+                        self.session,
                         &*self.hierarchy,
                         b"go-promotion-frontier-unavailable",
                         &[
-                            reference.as_bytes().as_slice(),
-                            lookup.as_bytes().as_slice(),
+                            CanonicalIdentityPart::identity(reference),
+                            CanonicalIdentityPart::identity(lookup),
                         ],
-                    )),
+                    )?),
                 ]));
                 break;
             }

@@ -198,7 +198,8 @@ fn source_blocks_for_resolved_units_with_budget(
             &mut render_cache,
             source_budget,
         )?;
-        if source_blocks.is_empty() && is_scala_object_like(code_unit) {
+        if source_blocks.is_empty() && is_scala_object_like(code_unit) && !code_unit.is_synthetic()
+        {
             module_units.push(code_unit.clone());
         } else {
             blocks.extend(source_blocks);

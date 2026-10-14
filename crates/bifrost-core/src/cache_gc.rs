@@ -23,6 +23,26 @@ pub const GC_AUTO_BLOB_THRESHOLD: i64 = 5000;
 pub const GC_MIN_INTERVAL_SECS: i64 = 6 * 3600;
 const GC_CLAIM_TTL_SECS: i64 = 3600;
 
+/// Periodic GC and epoch invalidation delete headers no version row binds;
+/// the children cascade. Foreground withdrawal retains these content-addressed
+/// headers so a later build can rebind them by digest. Shared headers stay.
+pub const DELETE_UNBOUND_SUMMARIES_SQL: &str = "DELETE FROM resolution_unit_summaries
+     WHERE NOT EXISTS (SELECT 1 FROM resolution_unit_summary_versions AS versions
+                       WHERE versions.summary_id = resolution_unit_summaries.summary_id)";
+
+// A topology is bound by a crate version row or by a Rust summary version row
+// (`rust_resolution_unit_summary_versions.topology_id` has no cascade), so the
+// sweep must spare both. Periodic GC and epoch invalidation withdraw summary
+// versions before sweeping. Foreground projection retirement retains topologies
+// alongside unbound content-addressed summaries for later reuse.
+pub const DELETE_UNBOUND_TOPOLOGIES_SQL: &str =
+    "DELETE FROM rust_crate_topologies WHERE NOT EXISTS (
+         SELECT 1 FROM rust_crate_versions AS versions
+         WHERE versions.topology_id = rust_crate_topologies.topology_id)
+       AND NOT EXISTS (
+         SELECT 1 FROM rust_resolution_unit_summary_versions AS summary_versions
+         WHERE summary_versions.topology_id = rust_crate_topologies.topology_id)";
+
 const DELETE_ANALYZER_CANDIDATE_SQL: &str = "DELETE FROM blobs
      WHERE blob_oid = ?1 AND lang = ?2 AND generation = ?3
        AND NOT EXISTS (
@@ -756,6 +776,11 @@ fn sweep_with_claim(
             .filter(|(oid, _, _)| !live.contains(oid))
             .collect::<Vec<_>>()
     };
+    // #4994: orphan topologies retain blobs through non-cascading FKs in
+    // rust_crate_container_members/container_sources. Sweep summaries first,
+    // then topologies, before collecting the blobs they no longer reference.
+    tx.execute(DELETE_UNBOUND_SUMMARIES_SQL, [])?;
+    tx.execute(DELETE_UNBOUND_TOPOLOGIES_SQL, [])?;
     let analyzer_dropped = delete_analyzer_candidates(&tx, &dead_analyzer)?;
     tx.commit()?;
     drop(build_lock);

@@ -18,6 +18,12 @@ pub(crate) enum SelectedRustReverseBatchOutcome {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RustReverseRequest {
+    References,
+    CallSites,
+}
+
 #[cfg(test)]
 fn test_reverse_source_does_not_own_sql_reader() -> ! {
     unreachable!("test reverse source does not own a selected SQL reader")
@@ -57,6 +63,7 @@ pub(crate) trait SelectedRustReverseQueries {
         &mut self,
         targets: &[CodeUnit],
         candidates: &[RustReverseCandidateSet],
+        request: RustReverseRequest,
     ) -> Result<SelectedRustReverseBatchOutcome>;
 
     fn rust_cfg_activation_for_caller_under_site_cfg(

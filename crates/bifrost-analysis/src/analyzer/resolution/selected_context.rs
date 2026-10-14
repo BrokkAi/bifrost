@@ -11,6 +11,7 @@ mod package;
 pub(crate) use go_import::SelectedGoImportBindingDescriptor;
 pub(crate) use package::SelectedPackageBridgeDescriptor;
 
+use super::canonical_identity::{CanonicalIdentityDescriptor, CanonicalIdentityPart};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -130,6 +131,8 @@ pub(crate) enum SelectedRootPathHalf {
         /// The source position at which a positional import takes effect
         /// (Scala). Within one blob, imports are consumed in this order.
         activation: Option<u32>,
+        /// The root import's choice point and rank, reused by selected member bridges.
+        precedence: Box<[PrecedenceStep]>,
         /// Structural anchor from the source-owned root import.
         /// The common lowerer supplies this typed fact; keeping it in the
         /// selected half prevents bare and absolute routes from colliding.
@@ -295,6 +298,7 @@ pub(crate) fn classify_selected_root_path_half(
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             activation: path.root_import_activation(),
+            precedence: path.precedence().to_vec().into_boxed_slice(),
             anchor,
             anchor_semantic,
             token: end[end.len() - 2].symbol(),
@@ -772,7 +776,9 @@ fn is_jvm_language(language: Language) -> bool {
 /// compile time.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SelectedContextIdentities {
-    numbers: Arc<std::sync::Mutex<crate::hash::HashMap<[u8; 32], u64>>>,
+    presumed_go_imports:
+        Arc<std::sync::Mutex<HashMap<SemanticId, super::UnindexedExternalFrontier>>>,
+    numbers: Arc<std::sync::Mutex<super::CanonicalIdentityNumbers>>,
     /// The stable name and evidence of each named incompleteness reason this
     /// context minted, by identity number, so an answer carrying the reason
     /// can say what it is. Bounded like `numbers`: one entry per reason the
@@ -827,14 +833,55 @@ impl SelectedContextIdentities {
         Self::default()
     }
 
+    pub(crate) fn record_presumed_go_import(
+        &self,
+        definition: SemanticId,
+        provider: super::UnindexedExternalFrontier,
+    ) {
+        assert!(
+            provider.member.is_none(),
+            "an import frontier has no member yet"
+        );
+        let previous = self
+            .presumed_go_imports
+            .lock()
+            .expect("presumed Go imports are not poisoned")
+            .insert(definition, provider.clone());
+        assert!(previous.is_none_or(|previous| previous == provider));
+    }
+
+    pub(crate) fn has_presumed_go_imports(&self) -> bool {
+        !self
+            .presumed_go_imports
+            .lock()
+            .expect("presumed Go imports are not poisoned")
+            .is_empty()
+    }
+
+    pub(crate) fn presumed_go_import(
+        &self,
+        definition: SemanticId,
+    ) -> Option<super::UnindexedExternalFrontier> {
+        self.presumed_go_imports
+            .lock()
+            .expect("presumed Go imports are not poisoned")
+            .get(&definition)
+            .cloned()
+    }
+
     /// Whether this request has minted any selected-context identities yet.
     /// A cached context can be restored only into an unused identity space so
     /// its stable numbers cannot collide with values minted by this request.
     pub(crate) fn is_empty(&self) -> bool {
-        self.numbers
+        self.presumed_go_imports
             .lock()
-            .expect("the selected context's identity table is not poisoned")
+            .expect("presumed Go imports are not poisoned")
             .is_empty()
+            && self
+                .numbers
+                .lock()
+                .expect("the selected context's identity table is not poisoned")
+                .is_empty()
             && self
                 .named_reasons
                 .lock()
@@ -898,6 +945,7 @@ impl SelectedContextIdentities {
     /// own identity table independently.
     pub(crate) fn isolated_clone(&self) -> Self {
         Self {
+            presumed_go_imports: Arc::new(std::sync::Mutex::new(self.presumed_go_imports.lock().expect("presumed Go imports are not poisoned").clone())),
             numbers: Arc::new(std::sync::Mutex::new(
                 self.numbers
                     .lock()
@@ -979,6 +1027,14 @@ impl SelectedContextIdentities {
             "cached context identities restore only into an unused request"
         );
         let other = other.isolated_clone();
+        *self
+            .presumed_go_imports
+            .lock()
+            .expect("presumed Go imports are not poisoned") = other
+            .presumed_go_imports
+            .lock()
+            .expect("presumed Go imports are not poisoned")
+            .clone();
         *self
             .numbers
             .lock()
@@ -1122,17 +1178,34 @@ impl SelectedContextIdentities {
             )
     }
 
+    pub(crate) fn contains_operation_number(&self, number: u64) -> bool {
+        number
+            .checked_sub(super::model::CONTEXT_OPERATION_BASE)
+            .and_then(|number| self.content_digest(number))
+            .is_some()
+    }
+
     fn number(&self, digest: [u8; 32]) -> u64 {
         let mut numbers = self
             .numbers
             .lock()
             .expect("the selected context's identity table is not poisoned");
-        let next = u64::try_from(numbers.len()).expect("a context's identity count fits u64");
-        *numbers.entry(digest).or_insert(next)
+        numbers.number(digest)
+    }
+
+    pub(crate) fn content_digest(&self, number: u64) -> Option<[u8; 32]> {
+        self.numbers
+            .lock()
+            .expect("the selected context's identity table is not poisoned")
+            .digest(number)
     }
 
     pub(crate) fn semantic(&self, digest: [u8; 32]) -> SemanticId {
         SemanticId::context_local(self.number(digest))
+    }
+
+    pub(crate) fn node(&self, digest: [u8; 32]) -> BindingNodeId {
+        BindingNodeId::context_local(self.number(digest))
     }
 
     pub(crate) fn path(&self, digest: [u8; 32]) -> PartialPathId {
@@ -1411,6 +1484,27 @@ impl SelectedContextIdentities {
         }
     }
 
+    pub(crate) fn record_jvm_unindexed_import_owner(&self, identity: SemanticId, owner_fqn: &str) {
+        assert!(
+            identity.shared_name_id().is_some(),
+            "an unindexed import type has one request-shared identity"
+        );
+        let owner = super::ExternalOwnerIdentity {
+            provider_id: Arc::from("jvm-unindexed-import"),
+            owner_fqn: Arc::from(owner_fqn),
+        };
+        let previous = self
+            .jvm
+            .jvm_external_owners
+            .lock()
+            .expect("external owner coordinates are not poisoned")
+            .insert(identity, owner.clone());
+        assert!(
+            previous.is_none_or(|previous| previous == owner),
+            "one unindexed JVM import identity has one owner FQN"
+        );
+    }
+
     pub(crate) fn jvm_external_provider_type_identity(
         &self,
         source_boundary: SemanticId,
@@ -1501,6 +1595,7 @@ pub(crate) struct SelectedResolutionContextInputs {
 /// Candidate bodies and indexes remain in the selected request's SQL rows.
 pub(crate) struct SelectedContextPathPublication {
     pub(crate) token: SelectedContextPathToken,
+    pub(crate) context_digest: [u8; 32],
     pub(crate) contextual_reverse_inventory_completion: ResolutionCompletion,
     pub(crate) go_package_inventory_complete: Option<bool>,
     pub(crate) go_package_inventory_fragments: HashMap<BindingFragmentId, bool>,
@@ -1512,6 +1607,11 @@ pub(crate) struct SelectedContextPathPublication {
         Box<[(BindingFragmentId, ResolutionSemanticIdentity)]>,
 }
 
+// A transient return value: the ready payload is moved out immediately during
+// blueprint construction, so boxing it would add an allocation to every
+// publication. The larger variant carries the publication's digest and
+// identities inline, which is cheaper here than an indirection.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum SelectedContextPathPublicationOutcome {
     Ready(SelectedContextPathPublication),
     Cancelled {
@@ -2284,6 +2384,7 @@ pub(crate) struct SelectedRootBridgeDescriptor {
     /// A token-only destination remains useful for open/unsupported routes.
     target_definition: Option<BindingNodeId>,
     precedence: Option<PrecedenceStep>,
+    candidate_origin_rank: Option<u32>,
     /// A member scope the route lands in instead of a root export.
     ///
     /// The Rust crate route publishes this for `Foo::frobnicate()` where `Foo`
@@ -2340,8 +2441,18 @@ impl SelectedRootBridgeDescriptor {
     ) -> Self {
         let label = |what: &str, ordinal: u32| {
             let mut bytes = what.as_bytes().to_vec();
-            bytes.extend_from_slice(&source_fragment.ordinal().to_be_bytes());
-            bytes.extend_from_slice(&target_fragment.ordinal().to_be_bytes());
+            bytes.extend_from_slice(
+                &super::fact_lowering::fixture_names::identity_content_digest(
+                    source_fragment.into(),
+                )
+                .expect("source fixture fragment has canonical content"),
+            );
+            bytes.extend_from_slice(
+                &super::fact_lowering::fixture_names::identity_content_digest(
+                    target_fragment.into(),
+                )
+                .expect("target fixture fragment has canonical content"),
+            );
             bytes.extend_from_slice(&ordinal.to_be_bytes());
             bytes
         };
@@ -2582,6 +2693,7 @@ impl SelectedRootBridgeDescriptor {
             target_export_token,
             target_definition: None,
             precedence: None,
+            candidate_origin_rank: None,
             target_member_scope: None,
             prefix_reference,
             route,
@@ -2599,11 +2711,19 @@ impl SelectedRootBridgeDescriptor {
     pub(crate) fn candidate_identity(
         &self,
         identities: &SelectedContextIdentities,
-    ) -> CandidatePathIdentity {
-        CandidatePathIdentity::new(
+        source: &dyn BatchResolutionFragmentSource,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<CandidatePathIdentity> {
+        Ok(CandidatePathIdentity::new(
             self.source_fragment,
-            identities.path(bridge_digest(b"bifrost-selected-root-bridge-path:v1", self)),
-        )
+            identities.path(bridge_digest(
+                b"bifrost-selected-root-bridge-path:v1",
+                self,
+                identities,
+                source,
+                cancellation,
+            )?),
+        ))
     }
 
     pub(crate) const fn source_language(&self) -> Language {
@@ -2634,8 +2754,13 @@ impl SelectedRootBridgeDescriptor {
         self.target_definition
     }
 
-    pub(super) fn with_precedence(mut self, precedence: Option<PrecedenceStep>) -> Self {
+    pub(crate) fn with_precedence(mut self, precedence: Option<PrecedenceStep>) -> Self {
         self.precedence = precedence;
+        self
+    }
+
+    pub(crate) fn with_candidate_origin_rank(mut self, rank: Option<u32>) -> Self {
+        self.candidate_origin_rank = rank;
         self
     }
 
@@ -2786,7 +2911,13 @@ impl SelectedContextOverlay {
         let mut additions = self.added_candidate_paths.to_vec();
         let mut shared = self.shared_semantic_identities.to_vec();
         for bridge in bridges {
-            let Some(path) = bridge.compile(identities, cancellation, &session) else {
+            let Some(path) = bridge.compile(
+                identities,
+                &super::engine::PreloadedFragmentSource::new([], []),
+                cancellation,
+                &session,
+            )?
+            else {
                 return Ok(false);
             };
             additions.push(path);
@@ -2817,7 +2948,13 @@ impl SelectedContextOverlay {
         let mut additions = self.added_candidate_paths.to_vec();
         let mut shared = self.shared_semantic_identities.to_vec();
         for bridge in bridges {
-            let Some(path) = bridge.compile(identities, cancellation, &session) else {
+            let Some(path) = bridge.compile(
+                identities,
+                &super::engine::PreloadedFragmentSource::new([], []),
+                cancellation,
+                &session,
+            )?
+            else {
                 return Ok(false);
             };
             additions.push(path);
@@ -2864,6 +3001,7 @@ impl SelectedContextOverlay {
 
 /// Compile exact selected root bridges. Cancellation publishes no partial overlay.
 pub(crate) fn compile_selected_context_overlay(
+    source: &dyn BatchResolutionFragmentSource,
     identities: &SelectedContextIdentities,
     bridges: &[SelectedRootBridgeDescriptor],
     names: &dyn SharedNameInterner,
@@ -2871,6 +3009,7 @@ pub(crate) fn compile_selected_context_overlay(
     cancellation: &CancellationToken,
 ) -> StoreResult<SelectedContextOverlayCompilation> {
     compile_selected_context_overlay_with_session(
+        source,
         identities,
         bridges,
         names,
@@ -2881,6 +3020,7 @@ pub(crate) fn compile_selected_context_overlay(
 }
 
 pub(crate) fn compile_selected_context_overlay_in_session(
+    source: &dyn BatchResolutionFragmentSource,
     identities: &SelectedContextIdentities,
     bridges: &[SelectedRootBridgeDescriptor],
     names: &dyn SharedNameInterner,
@@ -2889,6 +3029,7 @@ pub(crate) fn compile_selected_context_overlay_in_session(
     session: &ResolutionSession,
 ) -> StoreResult<SelectedContextOverlayCompilation> {
     compile_selected_context_overlay_with_session(
+        source,
         identities,
         bridges,
         names,
@@ -2899,6 +3040,7 @@ pub(crate) fn compile_selected_context_overlay_in_session(
 }
 
 fn compile_selected_context_overlay_with_session(
+    source: &dyn BatchResolutionFragmentSource,
     identities: &SelectedContextIdentities,
     bridges: &[SelectedRootBridgeDescriptor],
     names: &dyn SharedNameInterner,
@@ -2975,7 +3117,7 @@ fn compile_selected_context_overlay_with_session(
             }
             shared.insert(recipe.identity(names));
         }
-        let candidate = compile_bridge(identities, bridge, names);
+        let candidate = compile_bridge(source, identities, bridge, names, cancellation)?;
         // Topology retains every import/profile justification. Compilation
         // projects those records onto executable relations: the same exact
         // source token, route and authorized endpoint need execute only once.
@@ -3144,6 +3286,7 @@ pub(crate) struct SelectedRootBridgeProjection {
 /// an already admitted producer. Completion remains part of the path body even
 /// though the stable derivation identity deliberately does not hash it.
 pub(crate) fn compile_selected_root_bridge(
+    source: &dyn BatchResolutionFragmentSource,
     identities: &SelectedContextIdentities,
     bridge: &SelectedRootBridgeDescriptor,
     names: &dyn SharedNameInterner,
@@ -3165,12 +3308,18 @@ pub(crate) fn compile_selected_root_bridge(
         }
         recipes.push((recipe.semantic(names), recipe.clone()));
     }
-    let (candidate, path) = compile_bridge(identities, bridge, names);
+    let (candidate, path) = compile_bridge(source, identities, bridge, names, cancellation)?;
     if cancellation.is_cancelled() {
         return Ok(None);
     }
     Ok(Some(SelectedRootBridgeProjection {
-        identity: bridge_digest(b"bifrost-selected-root-bridge-path:v1", bridge),
+        identity: bridge_digest(
+            b"bifrost-selected-root-bridge-path:v1",
+            bridge,
+            identities,
+            source,
+            cancellation,
+        )?,
         lexical: super::fact_lowering::LoweredResolutionFragment::new(
             bridge.source_fragment(),
             bridge.source_language(),
@@ -3192,16 +3341,27 @@ pub(crate) fn compile_selected_root_bridge(
 }
 
 fn compile_bridge(
+    source: &dyn BatchResolutionFragmentSource,
     identities: &SelectedContextIdentities,
     bridge: &SelectedRootBridgeDescriptor,
     names: &dyn SharedNameInterner,
-) -> (CandidatePathIdentity, PartialPath) {
-    let path_digest = bridge_digest(b"bifrost-selected-root-bridge-path:v1", bridge);
+    cancellation: &CancellationToken,
+) -> StoreResult<(CandidatePathIdentity, PartialPath)> {
+    let path_digest = bridge_digest(
+        b"bifrost-selected-root-bridge-path:v1",
+        bridge,
+        identities,
+        source,
+        cancellation,
+    )?;
     let path = identities.path(path_digest);
     let tail = identities.stack_variable(bridge_digest(
         b"bifrost-selected-root-bridge-tail:v1",
         bridge,
-    ));
+        identities,
+        source,
+        cancellation,
+    )?);
     let route = std::iter::once(bridge.source_import_anchor())
         .chain(bridge.prefix_reference())
         .chain(bridge.route().iter().map(|recipe| recipe.semantic(names)))
@@ -3210,7 +3370,7 @@ fn compile_bridge(
             bridge.source_demand().semantic(names),
         ])
         .collect::<Vec<_>>();
-    let (end_node, export, precedence, witness) =
+    let (end_node, export, mut precedence, witness) =
         match (bridge.target_definition, bridge.target_member_scope) {
             // The trait's member scope answers the lookup the route already
             // carries, so the bridge ends holding that one symbol and the
@@ -3243,7 +3403,17 @@ fn compile_bridge(
                 Vec::new(),
             ),
         };
-    (
+    if let Some(rank) = bridge.candidate_origin_rank {
+        let semantic = precedence
+            .first()
+            .map_or(bridge.source_import_token(), |step| step.semantic);
+        precedence.push(PrecedenceStep {
+            tier: PrecedenceTier::CandidateOriginRank,
+            ordinal: rank,
+            semantic,
+        });
+    }
+    Ok((
         CandidatePathIdentity::new(bridge.source_fragment(), path),
         PartialPath::new(
             EndpointSignature::new(
@@ -3260,106 +3430,167 @@ fn compile_bridge(
             witness,
             bridge.completion().clone(),
         ),
-    )
+    ))
 }
 
-fn bridge_digest(domain: &[u8], bridge: &SelectedRootBridgeDescriptor) -> [u8; 32] {
-    let mut hasher = CanonicalHasher::new(domain);
-    hasher.field("source_fragment", &bridge.source_fragment().as_bytes());
+fn bridge_digest(
+    domain: &[u8],
+    bridge: &SelectedRootBridgeDescriptor,
+    identities: &SelectedContextIdentities,
+    source: &dyn BatchResolutionFragmentSource,
+    cancellation: &CancellationToken,
+) -> StoreResult<[u8; 32]> {
+    let digest = |key| {
+        super::canonical_identity::selected_identity_content_digest(
+            identities,
+            source,
+            key,
+            cancellation,
+        )
+    };
+    let mut hasher = CanonicalIdentityDescriptor::new(domain, digest);
+    hasher.field(
+        "source_fragment",
+        CanonicalIdentityPart::identity(bridge.source_fragment()),
+    )?;
     hasher.field(
         "source_language",
-        bridge.source_language().config_label().as_bytes(),
-    );
+        CanonicalIdentityPart::Label(bridge.source_language().config_label()),
+    )?;
     hasher.field(
         "source_import_token",
-        &bridge.source_import_token().as_bytes(),
-    );
+        CanonicalIdentityPart::identity(bridge.source_import_token()),
+    )?;
     hasher.field(
         "anchor",
-        match bridge.anchor() {
+        CanonicalIdentityPart::Content(match bridge.anchor() {
             ResolutionRootImportAnchor::Lexical => b"lexical",
             ResolutionRootImportAnchor::Absolute => b"absolute",
-        },
-    );
-    hasher.field("target_fragment", &bridge.target_fragment().as_bytes());
+        }),
+    )?;
+    hasher.field(
+        "target_fragment",
+        CanonicalIdentityPart::identity(bridge.target_fragment()),
+    )?;
     hasher.field(
         "target_language",
-        bridge.target_language().config_label().as_bytes(),
-    );
+        CanonicalIdentityPart::Label(bridge.target_language().config_label()),
+    )?;
     hasher.field(
         "target_export_token",
-        &bridge.target_export_token().as_bytes(),
-    );
+        CanonicalIdentityPart::identity(bridge.target_export_token()),
+    )?;
     if let Some(definition) = bridge.target_definition {
-        hasher.field("target_definition", &definition.as_bytes());
+        hasher.field(
+            "target_definition",
+            CanonicalIdentityPart::identity(definition),
+        )?;
+    }
+    if let Some(rank) = bridge.candidate_origin_rank {
+        hasher.field(
+            "candidate_origin_rank",
+            CanonicalIdentityPart::Content(&rank.to_le_bytes()),
+        )?;
     }
     if let Some(precedence) = bridge.precedence {
-        hasher.field("precedence_tier", precedence.tier.label().as_bytes());
-        hasher.field("precedence_ordinal", &precedence.ordinal.to_le_bytes());
-        hasher.field("precedence_semantic", &precedence.semantic.as_bytes());
+        hasher.field(
+            "precedence_tier",
+            CanonicalIdentityPart::Label(precedence.tier.label()),
+        )?;
+        hasher.field(
+            "precedence_ordinal",
+            CanonicalIdentityPart::Content(&precedence.ordinal.to_le_bytes()),
+        )?;
+        hasher.field(
+            "precedence_semantic",
+            CanonicalIdentityPart::identity(precedence.semantic),
+        )?;
     }
     if let Some(scope_head) = bridge.target_member_scope {
-        hasher.field("target_member_scope", &scope_head.as_bytes());
+        hasher.field(
+            "target_member_scope",
+            CanonicalIdentityPart::identity(scope_head),
+        )?;
     }
     if let Some(prefix) = bridge.prefix_reference() {
-        hasher.field("prefix_reference", &prefix.as_bytes());
+        hasher.field("prefix_reference", CanonicalIdentityPart::identity(prefix))?;
     }
     hasher.field(
         "namespace",
-        bridge
-            .source_demand()
-            .namespace()
-            .identity_label()
-            .as_bytes(),
-    );
+        CanonicalIdentityPart::Label(bridge.source_demand().namespace().identity_label()),
+    )?;
     for segment in bridge.route() {
-        hasher.field("route", &segment.name_digest());
+        hasher.field(
+            "route",
+            CanonicalIdentityPart::Content(&segment.name_digest()),
+        )?;
     }
-    hasher.field("source_demand", &bridge.source_demand().name_digest());
-    hasher.field("target_demand", &bridge.target_demand().name_digest());
+    hasher.field(
+        "source_demand",
+        CanonicalIdentityPart::Content(&bridge.source_demand().name_digest()),
+    )?;
+    hasher.field(
+        "target_demand",
+        CanonicalIdentityPart::Content(&bridge.target_demand().name_digest()),
+    )?;
     if let Some(evidence) = bridge.jvm_evidence() {
         hasher.field(
             "jvm_source_namespace",
-            evidence.source_namespace.identity_label().as_bytes(),
-        );
+            CanonicalIdentityPart::Label(evidence.source_namespace.identity_label()),
+        )?;
         hasher.field(
             "jvm_target_namespace",
-            evidence.target_namespace.identity_label().as_bytes(),
-        );
-        hasher.field("jvm_dependency_identity", &evidence.dependency_identity);
+            CanonicalIdentityPart::Label(evidence.target_namespace.identity_label()),
+        )?;
+        hasher.field(
+            "jvm_dependency_identity",
+            CanonicalIdentityPart::Content(&evidence.dependency_identity),
+        )?;
         hasher.field(
             "jvm_target_declaration",
-            &evidence.target_declaration.as_bytes(),
-        );
+            CanonicalIdentityPart::identity(evidence.target_declaration),
+        )?;
         hasher.field(
             "jvm_target_definition",
-            &evidence.target_definition.as_bytes(),
-        );
+            CanonicalIdentityPart::identity(evidence.target_definition),
+        )?;
         hasher.field(
             "jvm_visibility",
-            match evidence.visibility {
+            CanonicalIdentityPart::Content(match evidence.visibility {
                 SelectedJvmBridgeVisibility::Public => b"public".as_slice(),
                 SelectedJvmBridgeVisibility::Protected => b"protected".as_slice(),
                 SelectedJvmBridgeVisibility::Package => b"package".as_slice(),
                 SelectedJvmBridgeVisibility::Open => b"open".as_slice(),
-            },
-        );
+            }),
+        )?;
         match evidence.provenance {
             SelectedJvmBridgeProvenance::StructuredPackageType {
                 source_package,
                 target_package,
             } => {
-                hasher.field("jvm_provenance", b"structured_package_type");
-                hasher.field("jvm_source_package", &source_package.as_bytes());
-                hasher.field("jvm_target_package", &target_package.as_bytes());
+                hasher.field(
+                    "jvm_provenance",
+                    CanonicalIdentityPart::Content(b"structured_package_type"),
+                )?;
+                hasher.field(
+                    "jvm_source_package",
+                    CanonicalIdentityPart::identity(source_package),
+                )?;
+                hasher.field(
+                    "jvm_target_package",
+                    CanonicalIdentityPart::identity(target_package),
+                )?;
             }
             SelectedJvmBridgeProvenance::AliasFact { alias } => {
-                hasher.field("jvm_provenance", b"alias_fact");
-                hasher.field("jvm_alias", &alias.as_bytes());
+                hasher.field(
+                    "jvm_provenance",
+                    CanonicalIdentityPart::Content(b"alias_fact"),
+                )?;
+                hasher.field("jvm_alias", CanonicalIdentityPart::identity(alias))?;
             }
         }
     }
-    hasher.finish()
+    Ok(hasher.finish())
 }
 
 fn poll_context_work(cancellation: &CancellationToken, work: &mut usize) -> bool {
@@ -3511,6 +3742,7 @@ mod tests {
             let blueprint =
                 SelectedFactOperationBlueprint::from_publication(SelectedContextPathPublication {
                     token: SelectedContextPathToken::new(1),
+                    context_digest: [0; 32],
                     contextual_reverse_inventory_completion: inventory,
                     go_package_inventory_complete: None,
                     go_package_inventory_fragments: HashMap::default(),
@@ -3534,7 +3766,13 @@ mod tests {
                 rebaser.register_shared_semantic(identity);
             }
             for &reason in blueprint.context_owned_gap_identities() {
-                rebaser.register_context_owned_semantic(reason, names);
+                rebaser.register_context_owned_semantic(
+                    reason,
+                    blueprint
+                        .context_owned_semantic_digest(reason)
+                        .expect("fixture reason content"),
+                    names,
+                );
             }
             // The reason keeps the runtime value the completion carries and
             // takes an id no blob published, so a keyed read it reaches
@@ -3961,7 +4199,7 @@ mod tests {
         expected = "a cross-language selected root bridge needs explicit JVM identity and access evidence"
     )]
     fn matching_spelling_cannot_construct_a_cross_language_bridge() {
-        let fragment = BindingFragmentId::at_ordinal(0);
+        let fragment = BindingFragmentId::for_test(b"cross-language-matching-spelling-source");
         let source =
             ResolutionLookupSemanticRecipe::new(Language::Java, ResolutionNamespace::Type, "Same");
         let target = ResolutionLookupSemanticRecipe::new(
@@ -3974,7 +4212,7 @@ mod tests {
             Language::Java,
             ResolutionSiteId::new(1),
             ResolutionRootImportAnchor::Absolute,
-            BindingFragmentId::at_ordinal(1),
+            BindingFragmentId::for_test(b"cross-language-matching-spelling-target"),
             Language::Kotlin,
             ResolutionScopeId::new(0),
             Vec::new(),
@@ -4015,6 +4253,7 @@ mod tests {
         );
         let identities = SelectedContextIdentities::new();
         let compiled = compile_selected_context_overlay(
+            &super::super::PreloadedFragmentSource::from_lowered_fragments([]),
             &identities,
             std::slice::from_ref(&bridge),
             crate::analyzer::resolution::test_shared_names(),
@@ -4073,6 +4312,7 @@ mod tests {
 
         let projection_session = ResolutionSession::bounded(Default::default(), None);
         let projection = compile_selected_root_bridge(
+            &super::super::PreloadedFragmentSource::from_lowered_fragments([]),
             &identities,
             &bridge,
             crate::analyzer::resolution::test_shared_names(),
@@ -4105,6 +4345,7 @@ mod tests {
         let repeated_session = ResolutionSession::bounded(Default::default(), None);
         for _ in 0..2 {
             let repeated = compile_selected_root_bridge(
+                &super::super::PreloadedFragmentSource::from_lowered_fragments([]),
                 &identities,
                 &bridge,
                 crate::analyzer::resolution::test_shared_names(),
@@ -4125,6 +4366,7 @@ mod tests {
         cancelled.cancel();
         assert!(
             compile_selected_root_bridge(
+                &super::super::PreloadedFragmentSource::from_lowered_fragments([]),
                 &identities,
                 &bridge,
                 crate::analyzer::resolution::test_shared_names(),
@@ -4140,6 +4382,7 @@ mod tests {
         let compile_set = |bridges: &[SelectedRootBridgeDescriptor]| {
             let SelectedContextOverlayCompilation::Ready(overlay) =
                 compile_selected_context_overlay(
+                    &super::super::PreloadedFragmentSource::from_lowered_fragments([]),
                     &SelectedContextIdentities::new(),
                     bridges,
                     crate::analyzer::resolution::test_shared_names(),
@@ -4196,6 +4439,7 @@ mod tests {
         ] {
             assert!(matches!(
                 compile_selected_context_overlay_in_session(
+                    &super::super::PreloadedFragmentSource::from_lowered_fragments([]),
                     &SelectedContextIdentities::new(),
                     &derivations,
                     crate::analyzer::resolution::test_shared_names(),
@@ -4219,20 +4463,27 @@ mod tests {
             )]);
         assert_eq!(
             compile_bridge(
+                &super::super::PreloadedFragmentSource::from_lowered_fragments([]),
                 &SelectedContextIdentities::new(),
                 &bridge,
-                crate::analyzer::resolution::test_shared_names()
+                crate::analyzer::resolution::test_shared_names(),
+                &CancellationToken::default()
             )
+            .unwrap()
             .0,
             compile_bridge(
+                &super::super::PreloadedFragmentSource::from_lowered_fragments([]),
                 &SelectedContextIdentities::new(),
                 &incomplete,
-                crate::analyzer::resolution::test_shared_names()
+                crate::analyzer::resolution::test_shared_names(),
+                &CancellationToken::default()
             )
+            .unwrap()
             .0
         );
         for derivations in [[bridge.clone(), incomplete.clone()], [incomplete, bridge]] {
             let error = compile_selected_context_overlay(
+                &super::super::PreloadedFragmentSource::from_lowered_fragments([]),
                 &SelectedContextIdentities::new(),
                 &derivations,
                 crate::analyzer::resolution::test_shared_names(),
@@ -4493,21 +4744,27 @@ mod tests {
             ResolutionCompletion::Complete,
         );
         let (_, token_path) = compile_bridge(
+            &super::super::PreloadedFragmentSource::from_lowered_fragments([]),
             &SelectedContextIdentities::new(),
             &bridge,
             crate::analyzer::resolution::test_shared_names(),
-        );
+            &CancellationToken::default(),
+        )
+        .unwrap();
         let composed = token_path
             .concatenate(export_path)
             .expect("canonical bridge and export compose");
         let (_, exact_path) = compile_bridge(
+            &super::super::PreloadedFragmentSource::from_lowered_fragments([]),
             &SelectedContextIdentities::new(),
             &bridge.clone().with_selected_export(
                 crate::analyzer::resolution::test_shared_names(),
                 &export_half,
             ),
             crate::analyzer::resolution::test_shared_names(),
-        );
+            &CancellationToken::default(),
+        )
+        .unwrap();
         assert_eq!(exact_path.start().node(), composed.start().node());
         assert_eq!(
             exact_path.start().symbols().fixed(),
@@ -4534,13 +4791,16 @@ mod tests {
             .concatenate(&incomplete_export)
             .expect("bridge and incomplete export compose");
         let (_, incomplete_exact) = compile_bridge(
+            &super::super::PreloadedFragmentSource::from_lowered_fragments([]),
             &SelectedContextIdentities::new(),
             &bridge.with_selected_export(
                 crate::analyzer::resolution::test_shared_names(),
                 &incomplete_export_half,
             ),
             crate::analyzer::resolution::test_shared_names(),
-        );
+            &CancellationToken::default(),
+        )
+        .unwrap();
         assert_eq!(
             incomplete_exact.completion(),
             incomplete_composed.completion()
@@ -4553,38 +4813,62 @@ mod tests {
             exact_path.concatenate(export_path,).is_err(),
             "an exact endpoint cannot branch through the shared export token again"
         );
-        assert!(
-            halves.contains(&SelectedRootPathHalf::Import {
-                activation: None,
-                identity: halves
-                    .iter()
-                    .find_map(|half| match half {
-                        SelectedRootPathHalf::Import { identity, .. } => Some(*identity),
-                        SelectedRootPathHalf::Reference { .. } => None,
-                        SelectedRootPathHalf::Export { .. } => None,
-                    })
-                    .expect("lowered root import half"),
-                route: vec![lookup_semantic(
-                    crate::analyzer::resolution::test_shared_names(),
-                    Language::Rust,
-                    ResolutionNamespace::Type,
-                    "dep"
-                )]
-                .into_boxed_slice(),
-                source_scope_head: scope_head_node(fragment, root_scope),
-                anchor: ResolutionRootImportAnchor::Lexical,
-                anchor_semantic: root_import_anchor_semantic(
-                    fragment,
-                    ResolutionRootImportAnchor::Lexical,
-                ),
-                token: root_import_token(fragment, import_site, ResolutionNamespace::Type),
-                demand: lookup_semantic(
-                    crate::analyzer::resolution::test_shared_names(),
-                    Language::Rust,
-                    ResolutionNamespace::Type,
-                    "Item"
-                ),
-            })
+        let import_half = halves
+            .iter()
+            .find(|half| matches!(half, SelectedRootPathHalf::Import { .. }))
+            .expect("lowered root import half");
+        let SelectedRootPathHalf::Import {
+            activation,
+            route,
+            source_scope_head,
+            anchor,
+            precedence,
+            anchor_semantic,
+            token,
+            demand,
+            ..
+        } = import_half
+        else {
+            unreachable!();
+        };
+        assert_eq!(*activation, None);
+        assert_eq!(
+            route.as_ref(),
+            &[lookup_semantic(
+                crate::analyzer::resolution::test_shared_names(),
+                Language::Rust,
+                ResolutionNamespace::Type,
+                "dep"
+            )]
+        );
+        assert_eq!(*source_scope_head, scope_head_node(fragment, root_scope));
+        assert_eq!(*anchor, ResolutionRootImportAnchor::Lexical);
+        assert_eq!(
+            precedence
+                .iter()
+                .map(|step| (step.tier, step.ordinal))
+                .collect::<Vec<_>>(),
+            [
+                (PrecedenceTier::LexicalBinding, 1),
+                (PrecedenceTier::LexicalBinding, 1),
+            ]
+        );
+        assert_eq!(
+            *anchor_semantic,
+            root_import_anchor_semantic(fragment, ResolutionRootImportAnchor::Lexical)
+        );
+        assert_eq!(
+            *token,
+            root_import_token(fragment, import_site, ResolutionNamespace::Type)
+        );
+        assert_eq!(
+            *demand,
+            lookup_semantic(
+                crate::analyzer::resolution::test_shared_names(),
+                Language::Rust,
+                ResolutionNamespace::Type,
+                "Item"
+            )
         );
         assert!(
             halves.contains(&SelectedRootPathHalf::Export {

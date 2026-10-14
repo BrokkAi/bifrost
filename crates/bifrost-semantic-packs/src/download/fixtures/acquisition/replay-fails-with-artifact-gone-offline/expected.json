@@ -1,0 +1,29 @@
+{
+  "created_at": "<TIMESTAMP>",
+  "engine": {
+    "build_identity": "fixture-build",
+    "executable_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version": "9.9.0"
+  },
+  "failure": {
+    "class": "offline-cache-miss",
+    "message": "verified artifact rules.tar.gz is not cached for offline use",
+    "retryable": false
+  },
+  "inventory": null,
+  "outcome_schema_version": 1,
+  "rejections": [],
+  "request": {
+    "dependencies": [],
+    "pack_id": "bifrost.public.rules",
+    "repository": "https://github.com/BrokkAi/bifrost-packs",
+    "request_schema_version": 1,
+    "selection": {
+      "manifest_sha256": "258699fe1aac528f1a3ab231087be1a35917e6736cec0fc692c00424d7ebbc90",
+      "mode": "strict",
+      "release_version": "1.0.0"
+    }
+  },
+  "selection": null,
+  "status": "failed"
+}

@@ -13,6 +13,12 @@ Hierarchy recipes return only declarations indexed by the fixture's analyzer. Re
 
 Each page that has fixtures is marked with the date of its last successful end-to-end verification.
 
+## Public ids in these pages
+
+Some results name an entity by a public id: a 256-bit hash of the source content together with the semantic environment, which includes the language adapter version and the semantic IR schema version. Those ids rotate on every adapter or schema bump while the behavior a page teaches stays the same, so a page that embedded one would silently go stale and master would redden after a routine version bump.
+
+These pages therefore spell every such id as `<public-id>` and assert the stable fields instead: the range, provenance, proof, event counts, kinds, paths, symbols and text. The checked-in golden expectations keep the exact ids and cover their derivation; re-bless those with `BIFROST_BLESS=1` after a version bump. The elision is implemented in `tests/suite_cross_language/code_query_tutorials.rs`.
+
 ## Tutorials
 
 - [Library Integration](/code-query-tutorials/library-integration/)

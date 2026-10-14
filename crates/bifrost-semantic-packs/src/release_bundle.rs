@@ -6134,6 +6134,116 @@ trait RepeatedLists {
     }
 
     #[test]
+    #[hardwon(
+        "#5139: recoverable PHP syntax rejects must name their source entry before activation"
+    )]
+    fn php_stub_source_entry_reject_verifies_installs_and_activates() {
+        let fixture = tempdir().unwrap();
+        let source_root = fixture.path().join("php-stubs");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(
+            source_root.join("Malformed.php"),
+            "<?php\nclass Incomplete { public function broken( { }\n",
+        )
+        .unwrap();
+        fs::write(source_root.join("Good.php"), "<?php\nclass Good {}\n").unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let stubs = vec!["Malformed.php".to_owned(), "Good.php".to_owned()];
+        let artifact_sha256 = read_exact_source_set(
+            &source_root,
+            &stubs.iter().map(PathBuf::from).collect::<Vec<_>>(),
+            MAX_SOURCE_SET_FILES,
+            MAX_SOURCE_SET_PATH_DEPTH,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap()
+        .sha256()
+        .to_owned();
+        let spec = fixture.path().join("php-builtin.json");
+        let pinned = pinned_spec(
+            "php-builtin-fixture",
+            "8.3.0",
+            "php",
+            PinnedPackKind::PhpDeclarationStub { stubs },
+            PinnedArtifact {
+                file_name: "php-stubs".to_owned(),
+                sha256: artifact_sha256.clone(),
+                url: Some("https://example.invalid/php-stubs".to_owned()),
+                container: None,
+            },
+            "php",
+            "php",
+            vec![PinnedLookupQuery::Type {
+                name: "Good".to_owned(),
+            }],
+        );
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let output = fixture.path().join("bundle");
+        let bundle = generate_release_bundle(
+            &output,
+            &[BundleInput {
+                spec_path: spec,
+                artifact_path: source_root,
+            }],
+        )
+        .unwrap();
+
+        let pack_rejects = &bundle.rejects.packs[0];
+        assert_eq!(pack_rejects.completeness, Completeness::Partial);
+        assert_eq!(
+            pack_rejects.rejects,
+            vec![ReleaseReject {
+                severity: ReleaseRejectSeverity::Warning,
+                code: "php.source.syntax".to_owned(),
+                location: Some(format!("php-stub+sha256:{artifact_sha256}!/Malformed.php")),
+                source_entry: Some("Malformed.php".to_owned()),
+                declaration: None,
+                message: "PHP declaration source contains syntax errors".to_owned(),
+            }]
+        );
+        assert_eq!(pack_rejects.suppressed_rejects, 0);
+        assert_eq!(verify_release_bundle(&output).unwrap(), bundle);
+
+        let accounting = extraction_accounting(&pack_rejects.rejects, 0);
+        assert!(accounting.warning_only_and_fully_accounted());
+        assert!(accounting.gaps.is_empty());
+        assert_eq!(accounting.source_entries.len(), 1);
+        assert_eq!(accounting.source_entries[0].source_entry, "Malformed.php");
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let installed = install_release_bundle(&output, &catalog).unwrap();
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            catalog
+                .extraction_accounting(&installed[0].manifest_digest)
+                .unwrap(),
+            Some(accounting)
+        );
+        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
+            &catalog,
+            &package_activation_request("php", "php", "php", "php", "8.3.0", None, None),
+            &CancellationToken::default(),
+        ) else {
+            panic!("source-entry-accounted PHP stub pack must activate");
+        };
+        assert_eq!(active.types_named("Good").records.len(), 1);
+        assert!(active.extraction_gaps().is_empty());
+        assert!(active.gapped("Malformed.php").is_none());
+
+        let mut anonymous = bundle.rejects.clone();
+        anonymous.packs[0].rejects[0].source_entry = None;
+        fs::write(output.join("rejects.json"), json_bytes(&anonymous).unwrap()).unwrap();
+        fs::remove_file(output.join("SHA256SUMS")).unwrap();
+        write_checksums(&output, &bundle.index).unwrap();
+        let error = verify_release_bundle(&output).unwrap_err();
+        assert!(
+            error.to_string().contains("not activation-ready")
+                && error.to_string().contains("source_entries=0"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn verifier_rejects_tampered_content_addressed_asset() {
         let fixture = tempdir().unwrap();
         let asset = ReleaseAsset {

@@ -5,10 +5,11 @@ use super::selected_projection::{RustSelectedReferenceFile, rust_selected_usage_
 use crate::CancellationToken;
 use crate::analyzer::resolution::ResolutionCompletion;
 use crate::analyzer::store::resolution_operation::{
-    RustReverseCandidateSet, RustReverseConfirmation, SelectedResolutionContextMetrics,
-    SelectedResolutionOperation, SelectedResolutionOperationInput,
-    SelectedResolutionOperationOpenOutcome, SelectedResolutionOperationOutcome,
-    SelectedRustReverseBatchOutcome, SelectedRustReverseQueries, SelectedRustTargetReferences,
+    RustReverseCandidateSet, RustReverseConfirmation, RustReverseRequest,
+    SelectedResolutionContextMetrics, SelectedResolutionOperation,
+    SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
+    SelectedResolutionOperationOutcome, SelectedRustReverseBatchOutcome,
+    SelectedRustReverseQueries, SelectedRustTargetReferences,
 };
 use crate::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
 use crate::analyzer::store::resolution_selection::SelectedResolutionLanguage;
@@ -165,11 +166,15 @@ impl RustSelectedReverseQueries for RustReverseProjection<'_, '_> {
         let Some(candidates) = self.queries.candidate_sets(targets)? else {
             return Ok(None);
         };
-        let answers = match self.queries.references_to(targets, &candidates)? {
-            SelectedRustReverseBatchOutcome::Ready(answers) => answers,
-            SelectedRustReverseBatchOutcome::Unavailable(_)
-            | SelectedRustReverseBatchOutcome::Cancelled => return Ok(None),
-        };
+        let answers =
+            match self
+                .queries
+                .references_to(targets, &candidates, RustReverseRequest::CallSites)?
+            {
+                SelectedRustReverseBatchOutcome::Ready(answers) => answers,
+                SelectedRustReverseBatchOutcome::Unavailable(_)
+                | SelectedRustReverseBatchOutcome::Cancelled => return Ok(None),
+            };
         let mut results = Vec::with_capacity(answers.len());
         for answer in answers {
             let target = answer.target.clone();
@@ -197,11 +202,15 @@ impl RustSelectedReverseQueries for RustReverseProjection<'_, '_> {
         targets: &[CodeUnit],
         candidates: &[RustReverseCandidateSet],
     ) -> Result<Option<Vec<EdgeDerivationResult>>> {
-        let answers = match self.queries.references_to(targets, candidates)? {
-            SelectedRustReverseBatchOutcome::Ready(answers) => answers,
-            SelectedRustReverseBatchOutcome::Unavailable(_)
-            | SelectedRustReverseBatchOutcome::Cancelled => return Ok(None),
-        };
+        let answers =
+            match self
+                .queries
+                .references_to(targets, candidates, RustReverseRequest::References)?
+            {
+                SelectedRustReverseBatchOutcome::Ready(answers) => answers,
+                SelectedRustReverseBatchOutcome::Unavailable(_)
+                | SelectedRustReverseBatchOutcome::Cancelled => return Ok(None),
+            };
         let mut results = Vec::with_capacity(answers.len());
         for answer in answers {
             if self.cancellation.is_cancelled() {
@@ -403,11 +412,12 @@ fn with_rust_selected_reverse_reference_admission<T>(
     rust: &RustAnalyzer,
     admitted_files: Option<&HashSet<ProjectFile>>,
     cancellation: &CancellationToken,
-    confirm: impl for<'confirm_store, 'confirm_input> FnMut(
+    confirm: impl for<'confirm_store, 'confirm_input> Fn(
         &mut SelectedResolutionOperation<'confirm_store, 'confirm_input>,
         &std::path::Path,
         &[&crate::analyzer::resolution::SelectedSemanticLocator],
-    ) -> Result<RustReverseConfirmation>,
+    ) -> Result<RustReverseConfirmation>
+    + Sync,
     run: impl FnOnce(&mut dyn RustSelectedReverseQueries) -> Result<T>,
 ) -> RustSelectedReverseOutcome<T> {
     let _timing = crate::profiling::scope("rust_selected::reverse_queries");
@@ -599,6 +609,77 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    fn reverse_macro_generated_callers_equal_across_worker_counts() {
+        let mut builder = InlineTestProject::with_language(Language::Rust).file(
+            "Cargo.toml",
+            "[package]\nname='parallel_reverse'\nversion='0.1.0'\nedition='2024'\n",
+        );
+        let mut root = "pub fn target() {}\n".to_owned();
+        for index in 0..12 {
+            root.push_str(&format!("mod caller_{index};\n"));
+            builder = builder.file(
+                format!("src/caller_{index}.rs"),
+                format!(
+                    "macro_rules! caller {{ ($name:ident) => {{ pub fn $name() {{ crate::target(); }} }}; }}\ncaller!(generated_{index});\n"
+                ),
+            );
+        }
+        let fixture = builder.file("src/lib.rs", root).build();
+        let project = fixture.project_dyn();
+        let context = crate::analyzer::tree_sitter_analyzer::scoped_store_context(project.as_ref())
+            .expect("disk store for independent confirmation readers");
+        let rust = RustAnalyzer::new_with_config_store_context(
+            project,
+            crate::AnalyzerConfig::default(),
+            context,
+            None,
+        )
+        .expect("build selected Rust fixture");
+        assert!(!rust.inner.analyzer_store().uses_single_connection_reads());
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "target")
+            .expect("fixture target");
+        let run = |width, cancellation: CancellationToken| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .unwrap()
+                .install(|| {
+                    assert_eq!(rayon::current_num_threads(), width);
+                    let outcome =
+                        with_rust_selected_reverse_queries(&rust, &cancellation, |queries| {
+                            queries.inverse_for(std::slice::from_ref(&target))
+                        });
+                    let RustSelectedReverseOutcome::Ready(Some(mut answers)) = outcome else {
+                        panic!("macro caller reverse query did not complete: {outcome:?}");
+                    };
+                    assert_eq!(answers.len(), 1);
+                    let answer = answers.pop().expect("one target");
+                    (answer.edges, answer.completeness)
+                })
+        };
+        let sequential = run(1, CancellationToken::new());
+        let parallel = run(4, CancellationToken::new());
+        assert!(
+            sequential.0.len() >= 12,
+            "each generated caller must be retained: {sequential:?}"
+        );
+        assert_eq!(sequential, parallel);
+        let interrupted = run(4, CancellationToken::soft_deadline_after_checks_for_test(4));
+        assert!(matches!(
+            &interrupted.1,
+            EdgeCompleteness::Incomplete { reasons }
+                if reasons.contains(&EdgeIncompleteReason::TimeBudgetExceeded)
+        ));
+        assert!(
+            interrupted.0.iter().all(|edge| sequential.0.contains(edge)),
+            "an interrupted parallel query retains only proved full-query edges: {interrupted:?}"
+        );
+    }
+
+    #[test]
     #[hardwon(
         "#4926: a budget-bound binding recheck dropped an incoming call site instead of keeping it unproven"
     )]
@@ -639,14 +720,17 @@ mod tests {
                 Some(ReferenceOmission::TimeBudgetExceeded),
             ),
         ] {
-            let mut initially_confirmed_files = HashSet::default();
+            let initially_confirmed_files = std::sync::Mutex::new(HashSet::default());
             let outcome = with_rust_selected_reverse_reference_admission(
                 &rust,
                 None,
                 &cancellation,
                 |operation, root, locators| {
                     let file = locators[0].relative_path();
-                    let initial = initially_confirmed_files.insert(file.to_owned());
+                    let initial = initially_confirmed_files
+                        .lock()
+                        .expect("test confirmation set is not poisoned")
+                        .insert(file.to_owned());
                     if !initial && omitted_file == Some(file) {
                         return Ok(match omission.unwrap() {
                             ReferenceOmission::ReceiverBudget(limit) => {
@@ -966,13 +1050,24 @@ mod tests {
         // just as shared-name growth and reader eviction are attributed above.
         let retained_outside = measurements.map(|row| row.1 - row.4 - row.5 - row.2);
         // Pin the live heap as well as what survives request disposal. The
-        // existing bounded caches are the only retained structures allowed
-        // to grow with the workspace, and both comparisons keep the original
-        // allowances.
+        // existing bounded caches are the only retained structures allowed to
+        // grow with the workspace. Both allowances are a measurement floor, not
+        // a capacity. These byte counts come from the thread-local allocation
+        // counter, and `retained_outside` subtracts bounded-cache and request
+        // releases that the same counter measured, so several KiB move between
+        // runs and platforms even when no request reserves anything: at sha
+        // 8a11695c58 the 32-file warm measurement was 116595 on Windows and
+        // 116531 on Linux, while the 4-file warm measurement was 106229 on the
+        // failing Windows run and 115859 on a passing Linux run. A 4 KiB
+        // retained bound sat below that floor and failed on Windows at
+        // equivalent code (issue #5096). The historical defect these
+        // comparisons guard against retained about 5.5 MiB per selected mount,
+        // so 16 KiB still detects it while matching the retained-bytes
+        // allowance the point-latency check already uses.
         let outside_cache = measurements.map(|row| row.1 - row.4 - row.5);
         for [small, large] in [[0, 1], [2, 3]] {
             assert!(
-                retained_outside[large] <= retained_outside[small] + 4096,
+                retained_outside[large] <= retained_outside[small] + 16 * 1024,
                 "workspace growth must not retain inventory with cold or warm process state: {retained_outside:?} from {measurements:?}"
             );
             let files_added = measurements[large].0 - measurements[small].0;
@@ -1853,18 +1948,27 @@ mod tests {
                 .into_iter()
                 .find(|unit| unit.identifier() == "target")
                 .expect("the target declaration");
-            reset_selected_fact_operation_construction_count_for_test();
-            let result =
-                with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
-                    queries.inverse_for(&[target])
-                });
-            let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
-                panic!("reverse must be ready: {result:?}");
-            };
-            (
-                rows[0].edges.len(),
-                selected_fact_operation_construction_count_for_test(),
-            )
+            // The counter is thread-local. Keep dispatch and confirmation
+            // on this pool's sole worker so it observes every point demand.
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap()
+                .install(|| {
+                    reset_selected_fact_operation_construction_count_for_test();
+                    let result = with_rust_selected_reverse_queries(
+                        &rust,
+                        &CancellationToken::new(),
+                        |queries| queries.inverse_for(&[target]),
+                    );
+                    let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+                        panic!("reverse must be ready: {result:?}");
+                    };
+                    (
+                        rows[0].edges.len(),
+                        selected_fact_operation_construction_count_for_test(),
+                    )
+                })
         };
         let one = measure(1);
         let many = measure(8);

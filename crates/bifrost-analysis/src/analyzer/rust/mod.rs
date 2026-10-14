@@ -26,6 +26,7 @@ pub(crate) mod native_points;
 mod native_rename;
 mod native_usages;
 pub use native_usages::RustNativeUsageStrategy;
+pub(crate) mod prefetch;
 mod rustdoc_artifact;
 pub(crate) mod selected_projection;
 pub(crate) mod selected_reverse;
@@ -2119,7 +2120,11 @@ fn expand_rust_imported_external_callee_with_operation_factory(
     )
 }
 
-pub(crate) fn expand_rust_imported_external_callee_with_operation<'analyzer, 'factory>(
+pub(crate) fn expand_rust_imported_external_callee_with_operation<
+    'analyzer,
+    'factory,
+    'selection,
+>(
     analyzer: &'analyzer dyn IAnalyzer,
     file: &ProjectFile,
     _callee_text: &str,
@@ -2128,7 +2133,7 @@ pub(crate) fn expand_rust_imported_external_callee_with_operation<'analyzer, 'fa
     mut operation: Option<
         &mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
             'analyzer,
-            'factory,
+            'selection,
         >,
     >,
 ) -> Option<ImportedExternalCallee> {
@@ -2284,6 +2289,30 @@ impl LanguageSupport for RustSupport {
 
     fn language(&self) -> Language {
         Language::Rust
+    }
+
+    fn prefetch_reverse_call_targets(
+        &self,
+        workspace: &crate::analyzer::WorkspaceAnalyzer,
+        sites: &[crate::analyzer::usages::CallSite],
+        cancellation: &crate::CancellationToken,
+        snapshot: Option<
+            std::sync::Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>,
+        >,
+    ) -> Option<
+        crate::analyzer::store::Result<
+            crate::hash::HashMap<
+                crate::analyzer::ProjectFile,
+                crate::analyzer::usages::call_relations::PrefetchedCallFile,
+            >,
+        >,
+    > {
+        Some(prefetch::prefetch_caller_files(
+            workspace,
+            sites,
+            cancellation,
+            snapshot,
+        ))
     }
 
     fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {

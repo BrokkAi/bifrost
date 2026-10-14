@@ -4,9 +4,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::hash::Hash;
 
-use brokk_bifrost_core::analyzer::canonical_hash::{
-    CanonicalHasher, hash_domain_bytes, write_lower_hex,
-};
+use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::canonical_hash::{hash_domain_bytes, write_lower_hex};
 
 use crate::analyzer::structural::{
     BoundaryStatus, CandidateOutcome, PrecedenceTier, ResolutionCompletionKind,
@@ -16,6 +15,50 @@ use crate::hash::{HashMap, HashSet, set_with_capacity};
 
 use super::completion_reasons::{CompletionReasonUnion, CompletionReasons};
 use super::never_cancelled;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingOrigin {
+    LocalOrInherited,
+    ExplicitImport,
+    WildcardImport,
+    SameCompilationUnitPackage,
+    OtherCompilationUnitPackage,
+    SingleTypeImport,
+    OnDemandImport,
+    SamePackage,
+    StarImport,
+}
+
+/// Lower is stronger. Language-specific order is supplied here; path
+/// comparison remains shared and independent of language.
+pub(crate) const fn binding_origin_rank(language: Language, origin: BindingOrigin) -> Option<u32> {
+    use BindingOrigin as Origin;
+    match language {
+        Language::Scala => match origin {
+            Origin::LocalOrInherited | Origin::SameCompilationUnitPackage => Some(0),
+            Origin::ExplicitImport => Some(1),
+            Origin::WildcardImport | Origin::StarImport => Some(2),
+            Origin::OtherCompilationUnitPackage => Some(3),
+            Origin::SingleTypeImport | Origin::OnDemandImport | Origin::SamePackage => None,
+        },
+        Language::Java => match origin {
+            Origin::LocalOrInherited => Some(0),
+            Origin::SingleTypeImport | Origin::ExplicitImport => Some(1),
+            Origin::SamePackage
+            | Origin::SameCompilationUnitPackage
+            | Origin::OtherCompilationUnitPackage => Some(2),
+            Origin::OnDemandImport | Origin::WildcardImport | Origin::StarImport => Some(3),
+        },
+        Language::Kotlin => match origin {
+            Origin::LocalOrInherited => Some(0),
+            Origin::ExplicitImport => Some(1),
+            Origin::SamePackage | Origin::SameCompilationUnitPackage => Some(2),
+            Origin::WildcardImport | Origin::StarImport | Origin::OnDemandImport => Some(3),
+            Origin::OtherCompilationUnitPackage | Origin::SingleTypeImport => None,
+        },
+        _ => None,
+    }
+}
 
 /// Which of the four spaces one runtime identity's payload lives in, read
 /// from the identity's own top three bits.
@@ -89,6 +132,11 @@ pub(crate) const UNMOUNTED_ORDINAL: u32 = MOUNT_ORDINAL_LIMIT - 1;
 /// and `SelectedResolutionContextSet` asserts at attachment that nothing it
 /// carries lands in the operation's half.
 pub(crate) const CONTEXT_OPERATION_BASE: u64 = 1 << 60;
+
+// Fixture aliases occupy a separate test-only range so real query aliases
+// cannot accidentally claim their content in the demand-local registry.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) const FIXTURE_OPERATION_BASE: u64 = 1 << 59;
 
 macro_rules! numeric_id {
     ($name:ident) => {
@@ -217,19 +265,7 @@ macro_rules! numeric_id {
             /// `b"alpha"` stays readable where a bare counter would not.
             #[cfg(any(test, feature = "test-support"))]
             pub(crate) fn for_test(label: impl AsRef<[u8]>) -> Self {
-                Self::operation_local(test_label_number(label.as_ref()))
-            }
-
-            /// This identity's own bytes, big-endian.
-            ///
-            /// It is eight bytes now rather than thirty-two, and it is still
-            /// the whole of the identity: a hash that used to mix in a digest
-            /// mixes in the number that replaced it, and a reason built from
-            /// one identity is as distinct from another's as the identities
-            /// are. Nothing decodes these bytes; the accessors above are how
-            /// an identity is read.
-            pub(crate) const fn as_bytes(self) -> [u8; 8] {
-                self.0.to_be_bytes()
+                Self::operation_local(FIXTURE_OPERATION_BASE | test_label_number(label.as_ref()))
             }
         }
 
@@ -270,11 +306,15 @@ macro_rules! numeric_id {
 /// fixture wants, and a fixture that needs two distinct values writes two
 /// labels.
 #[cfg(any(test, feature = "test-support"))]
-fn test_label_number(label: &[u8]) -> u64 {
+fn test_label_table() -> &'static std::sync::Mutex<HashMap<Vec<u8>, u64>> {
     static LABELS: std::sync::OnceLock<std::sync::Mutex<HashMap<Vec<u8>, u64>>> =
         std::sync::OnceLock::new();
-    let mut labels = LABELS
-        .get_or_init(|| std::sync::Mutex::new(HashMap::default()))
+    LABELS.get_or_init(|| std::sync::Mutex::new(HashMap::default()))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn test_label_number(label: &[u8]) -> u64 {
+    let mut labels = test_label_table()
         .lock()
         .expect("the fixture label table is not poisoned");
     let next =
@@ -282,10 +322,29 @@ fn test_label_number(label: &[u8]) -> u64 {
     *labels.entry(label.to_vec()).or_insert(next)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn fixture_label_digest(number: u64) -> Option<[u8; 32]> {
+    let labels = test_label_table()
+        .lock()
+        .expect("the fixture label table is not poisoned");
+    let (label, _) = labels.iter().find(|(_, value)| **value == number)?;
+    Some(
+        brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+            b"bifrost-resolution-fixture-label:v1",
+            label,
+        ),
+    )
+}
+
 numeric_id!(BindingNodeId);
 numeric_id!(PartialPathId);
 numeric_id!(SemanticId);
 numeric_id!(StackVariableId);
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn fixture_number_label(number: u64) -> [u8; 8] {
+    number.to_be_bytes()
+}
 
 /// One derivation key: the canonical digest of how a value was derived.
 ///
@@ -364,12 +423,6 @@ impl BindingFragmentId {
 
     pub(crate) const fn ordinal(self) -> u32 {
         self.0
-    }
-
-    /// This fragment's own bytes, big-endian. A hash that used to mix in the
-    /// mount's content digest mixes in its ordinal now.
-    pub(crate) const fn as_bytes(self) -> [u8; 4] {
-        self.0.to_be_bytes()
     }
 }
 
@@ -2074,6 +2127,7 @@ impl TypeTransferRule {
 /// The value alternatives at one point where binding hands work to type flow.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TypedFrontierState {
+    unindexed_external: Box<[UnindexedExternalFrontier]>,
     slot: SemanticId,
     possible_values: Box<[ResolutionSlotValue]>,
     completion: ResolutionCompletion,
@@ -2090,9 +2144,25 @@ impl TypedFrontierState {
         possible_values.dedup();
         Self {
             slot,
+            unindexed_external: Box::new([]),
             possible_values: possible_values.into_boxed_slice(),
             completion,
         }
+    }
+
+    pub(crate) fn unindexed_external(&self) -> &[UnindexedExternalFrontier] {
+        &self.unindexed_external
+    }
+
+    pub(crate) fn with_unindexed_external(
+        mut self,
+        values: impl IntoIterator<Item = UnindexedExternalFrontier>,
+    ) -> Self {
+        let mut values = values.into_iter().collect::<Vec<_>>();
+        values.sort_unstable();
+        values.dedup();
+        self.unindexed_external = values.into_boxed_slice();
+        self
     }
 
     pub const fn slot(&self) -> SemanticId {
@@ -2137,9 +2207,20 @@ impl TypedFrontierState {
         Some(Self {
             slot,
             possible_values,
+            unindexed_external: Box::new([]),
             completion,
         })
     }
+}
+
+/// A request-local external frontier with no authoritative package clause or
+/// nominal type. A member lookup is a structured recipe, not an inventory row.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct UnindexedExternalFrontier {
+    pub(crate) provider_path: std::sync::Arc<str>,
+    /// A nameless provider row is evidence, not package-name authority.
+    pub(crate) provider_package_id: Option<i64>,
+    pub(crate) member: Option<(BindingFragmentId, SemanticId)>,
 }
 
 /// Stable evidence for one selected or rejected semantic candidate.
@@ -2404,7 +2485,7 @@ pub(crate) struct StackEffectAlphaKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct AlphaEndpointKey {
+pub(super) struct AlphaEndpointKey {
     node: BindingNodeId,
     symbols: AlphaSymbolStackKey,
     scopes: AlphaStackKey<BindingNodeId>,
@@ -2447,16 +2528,6 @@ impl StackEffectAlphaKey {
             alpha_endpoints_equal_with_poll(&self.start, &other.start, cancelled)?
                 && alpha_endpoints_equal_with_poll(&self.end, &other.end, cancelled)?,
         )
-    }
-
-    pub(crate) fn canonical_digest_with_poll<P>(&self, cancelled: &mut P) -> Option<[u8; 32]>
-    where
-        P: FnMut() -> bool,
-    {
-        let mut hasher = CanonicalHasher::new(b"bifrost-resolution-stack-effect-alpha-key:v1");
-        hash_alpha_endpoint_with_poll(&mut hasher, b"start", &self.start, cancelled)?;
-        hash_alpha_endpoint_with_poll(&mut hasher, b"end", &self.end, cancelled)?;
-        Some(hasher.finish())
     }
 }
 
@@ -2550,87 +2621,16 @@ where
     stack_patterns_equal_with_poll(&left.fixed, left.tail, &right.fixed, right.tail, cancelled)
 }
 
-fn hash_alpha_endpoint_with_poll<P>(
-    hasher: &mut CanonicalHasher,
-    label: &[u8],
-    endpoint: &AlphaEndpointKey,
+/// An operation-local endpoint key. Binder ordinals describe relationships
+/// within this structure, rather than the allocator's runtime numbers.
+pub(super) fn endpoint_alpha_key_with_poll<P>(
+    endpoint: &EndpointSignature,
     cancelled: &mut P,
-) -> Option<()>
+) -> Option<AlphaEndpointKey>
 where
     P: FnMut() -> bool,
 {
-    hasher.value(label);
-    hasher.value(&endpoint.node.as_bytes());
-    hash_alpha_stack_values_with_poll(
-        hasher,
-        &endpoint.symbols.fixed,
-        endpoint.symbols.tail,
-        cancelled,
-        |hasher, symbol, cancelled| {
-            hasher.value(&symbol.symbol.as_bytes());
-            match symbol.scopes.as_ref() {
-                Some(scopes) => {
-                    hasher.value(b"scoped");
-                    hash_alpha_scope_stack_with_poll(hasher, scopes, cancelled)?;
-                }
-                None => hasher.value(b"unscoped"),
-            }
-            Some(())
-        },
-    )?;
-    hash_alpha_scope_stack_with_poll(hasher, &endpoint.scopes, cancelled)
-}
-
-fn hash_alpha_scope_stack_with_poll<P>(
-    hasher: &mut CanonicalHasher,
-    stack: &AlphaStackKey<BindingNodeId>,
-    cancelled: &mut P,
-) -> Option<()>
-where
-    P: FnMut() -> bool,
-{
-    hash_alpha_stack_values_with_poll(
-        hasher,
-        &stack.fixed,
-        stack.tail,
-        cancelled,
-        |hasher, node, _| {
-            hasher.value(&node.as_bytes());
-            Some(())
-        },
-    )
-}
-
-fn hash_alpha_stack_values_with_poll<T, P, F>(
-    hasher: &mut CanonicalHasher,
-    fixed: &[T],
-    tail: Option<u32>,
-    cancelled: &mut P,
-    mut hash_value: F,
-) -> Option<()>
-where
-    P: FnMut() -> bool,
-    F: FnMut(&mut CanonicalHasher, &T, &mut P) -> Option<()>,
-{
-    hasher.value(&(fixed.len() as u64).to_le_bytes());
-    hash_optional_ordinal(hasher, tail);
-    for value in fixed {
-        if cancelled() {
-            return None;
-        }
-        hash_value(hasher, value, cancelled)?;
-    }
-    Some(())
-}
-
-fn hash_optional_ordinal(hasher: &mut CanonicalHasher, ordinal: Option<u32>) {
-    match ordinal {
-        Some(ordinal) => {
-            hasher.value(b"some");
-            hasher.value(&ordinal.to_le_bytes());
-        }
-        None => hasher.value(b"none"),
-    }
+    AlphaNormalizer::default().endpoint_with_poll(endpoint, cancelled)
 }
 
 #[derive(Default)]

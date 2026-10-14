@@ -58,3 +58,20 @@ pub(crate) fn publish_jvm_declared_type_transfer(
         value_transform,
     ));
 }
+
+/// Accumulate a JVM bound identity into the common multi-input producer family.
+pub(crate) fn publish_jvm_type_union_transfer(
+    facts: &mut FileResolutionFacts,
+    input: ResolutionTypeSlotId,
+    output: ResolutionTypeSlotId,
+) {
+    assert_ne!(input, output);
+    facts.type_transfers.push(ResolutionTypeTransferFact::new(
+        input,
+        output,
+        ResolutionTypeTransferKind::TypeUnion,
+        0,
+        0,
+        ResolutionTypeTransferValueTransform::Preserve,
+    ));
+}

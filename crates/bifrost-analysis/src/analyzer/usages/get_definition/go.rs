@@ -3543,22 +3543,22 @@ fn go_model_package_selector_navigation_outcome(
     if selector.focus_segment == 0 || go_selector_is_call_target(support, selector) {
         return None;
     }
-    let mut members = selector.members.iter().take(selector.focus_segment);
-    let first_member = go_node_text(*members.next()?, source);
-    let mut target = support.external_visible_package_member(package, first_member)?;
-    let mut canonical_reference = format!("{package}.{first_member}");
-    for member in members {
-        let member = go_node_text(*member, source);
-        target.push('.');
-        target.push_str(member);
-        target = support.external_visible_symbol(&target)?;
-        canonical_reference.push('.');
-        canonical_reference.push_str(member);
-    }
+    let members = selector
+        .members
+        .iter()
+        .take(selector.focus_segment)
+        .map(|member| go_node_text(*member, source));
+    let canonical_reference = crate::analyzer::go::package_identity::go_visible_member_path(
+        package,
+        members,
+        |package, member| support.external_visible_package_member(package, member),
+        |target| support.external_visible_symbol(target),
+        || support.scope_step(),
+    )?;
     let mut reference = site.clone();
     // The overlay storage owner is an implementation detail. Keep the exact
     // import-path spelling supplied by the structured import binder.
-    reference.text = canonical_reference;
+    reference.text = canonical_reference.reference_name;
     Some(DefinitionLookupOutcome {
         modeled_definitions: Vec::new(),
         status: DefinitionLookupStatus::NoDefinition,
@@ -8473,6 +8473,7 @@ func use() {
                 max_targets: 16,
                 max_summary_expansions: 4_096,
                 max_scope_nodes: 100_000,
+                max_resolution_rounds: ReceiverAnalysisBudget::default().max_resolution_rounds,
             },
             None,
         );

@@ -214,12 +214,23 @@ fn assert_java_root_parity(fixture: &JavaRootResolutionOperationFixture) -> bool
             .iter()
             .find(|mount| mount.persisted_relative_path() == path)
             .unwrap_or_else(|| panic!("missing selected Java mount {path:?}"));
-        crate::analyzer::resolution::lower_resolution_facts_for_selection(
+        let artifact = crate::analyzer::resolution::lower_resolution_facts_for_selection(
             mount.fragment(),
             &mounted.ready.shared_names(),
             Language::Java,
             facts,
-        )
+        );
+        crate::analyzer::resolution::record_fixture_selected_identity_catalog(
+            artifact.identities(),
+            mounted
+                .ready
+                .inventory
+                .mount_record_by_ordinal(mount.ordinal())
+                .unwrap()
+                .fragment_digest()
+                .as_bytes(),
+        );
+        artifact
     };
     let consumer = artifact_for(JAVA_ROOT_CONSUMER_PATH, &fixture.consumer_facts);
     let provider = artifact_for(JAVA_ROOT_PROVIDER_PATH, &fixture.provider_facts);

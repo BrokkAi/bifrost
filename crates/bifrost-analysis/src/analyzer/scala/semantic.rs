@@ -48,6 +48,10 @@ use super::semantic_adaptation::{
     scala_nominal_types_match, type_identity as scala_type_identity,
 };
 
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
 const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v22";
 
 /// Procedure syntax roles used by source-backed assignment relations. The

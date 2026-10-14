@@ -261,7 +261,7 @@ impl SelectedResolutionStage<'_, '_> {
         }
         let reason_rows = serde_json::to_string(&reason_rows).expect("bridge closure parameters");
         let mut descriptor = CanonicalHasher::new(b"bifrost-selected-stage-bridge:v1");
-        descriptor.field("lexical", &lexical.digest());
+        descriptor.field("lexical", &lexical.digest(host)?);
         descriptor.field("catalog-present", &[u8::from(coordinates.is_some())]);
         if let Some(coordinates) = &coordinates {
             descriptor.field("coordinates", &coordinates.digest());

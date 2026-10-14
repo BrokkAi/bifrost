@@ -436,14 +436,6 @@ fn java_native_incoming_calls_preserve_overload_identity() {
             )
         })
         .collect::<Vec<_>>();
-    assert!(
-        answers
-            .iter()
-            .all(|answer| answer.diagnostics.iter().any(|diagnostic| {
-                diagnostic.reason_kind.as_deref() == Some("native_call_target_ambiguous")
-            })),
-        "multi-target rows must be withheld instead of attached to both overloads: {answers:#?}"
-    );
     for (answer, overload) in answers.iter().zip(&overloads) {
         let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
         let incumbent = crate::analyzer::usages::CallRelationService::incoming_bounded(
@@ -463,25 +455,14 @@ fn java_native_incoming_calls_preserve_overload_identity() {
             .read_source(&fixture.file("src/main/java/model/Overloads.java"))
             .expect("read overload fixture for source adjudication");
         let start = source.find(expected).expect("expected overload call");
-        if expected == "pick(1)" {
-            // A global inverse gap does not erase this exact singleton edge.
-            assert_eq!(answer.sites.len(), 1, "{answer:#?}");
-            let site = &answer.sites[0];
-            assert_eq!(
-                site.callee, *overload,
-                "a proven call keeps its exact overload"
-            );
-            assert_eq!(
-                &source[site.range.start_byte..site.range.end_byte],
-                expected,
-                "the singleton native target belongs to the int call"
-            );
-        } else {
-            assert!(
-                answer.sites.is_empty(),
-                "the multi-target String call must not attach to an overload: {answer:#?}"
-            );
-        }
+        assert_eq!(answer.sites.len(), 1, "{answer:#?}");
+        let site = &answer.sites[0];
+        assert_eq!(site.callee, *overload, "the call keeps its exact overload");
+        assert_eq!(
+            &source[site.range.start_byte..site.range.end_byte],
+            expected,
+            "intrinsic argument mismatch excludes the other overload"
+        );
         for site in &incumbent.sites {
             let legacy_source = fixture
                 .project()
@@ -499,11 +480,8 @@ fn java_native_incoming_calls_preserve_overload_identity() {
             "the source-level argument selects this overload for {overload:?}"
         );
         assert!(
-            answer
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.reason_kind.as_deref()
-                    == Some("native_call_target_ambiguous"))
+            answer.diagnostics.is_empty(),
+            "the intrinsic overload pair is fully decidable: {answer:#?}"
         );
     }
 }

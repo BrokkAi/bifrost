@@ -426,7 +426,7 @@ impl EndpointRows<'_, '_, '_> {
                     route,
                     anchor,
                     anchor_semantic,
-                    activation: _,
+                    ..
                 } => (
                     *identity,
                     *source_scope_head,

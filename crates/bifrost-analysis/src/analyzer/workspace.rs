@@ -5,12 +5,15 @@ use crate::analyzer::dependency_support::resolve_dependency_path as resolve_path
 use crate::analyzer::jvm::external::jdk_home_for_dependency;
 use crate::analyzer::multi_analyzer::{WorkspaceBuildContext, build_language_delegate};
 use crate::analyzer::semantic_model::{
+    ActivationOrigin, ActivationReceipt, ActivationReceiptStage, ActivationReceiptStageStatus,
+};
+use crate::analyzer::semantic_model::{
     DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, DependencyPackAdapter,
     DependencyPackLimits, DependencyPackPreparationOutcome, DependencyResolver,
     DependencyResolverBounds, PendingDependencyPackAcquisition, RuntimeArtifactPublication,
     SemanticModelActivationEvidence, SemanticModelActivationPersistence,
     SemanticModelActivationRequest, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-    SubprocessPolicy, acquire_active_semantic_models_with_runtime_artifacts,
+    SubprocessPolicy, acquire_active_semantic_models_with_runtime_artifacts_observed,
     prepare_compatible_installed_semantic_packs, prepare_dependency_semantic_packs,
     prepare_installed_dependency_packs,
 };
@@ -333,6 +336,8 @@ pub enum WorkspaceAnalyzer {
 /// ecosystem; hosts must opt in by supplying this context.
 #[derive(Clone, Copy)]
 pub struct DependencyPackWorkspaceContext<'a> {
+    /// Optional process-local diagnostic stream; never retained by the workspace.
+    pub activation_receipt: Option<&'a ActivationReceipt>,
     pub catalog: &'a SemanticPackCatalog,
     pub persistence: Option<SemanticModelActivationPersistence<'a>>,
     pub activation: &'a SemanticModelActivationRequest,
@@ -1518,6 +1523,12 @@ impl WorkspaceAnalyzer {
         ) {
             Ok(publication) => publication,
             Err(error) => {
+                if let Some(receipt) = context.activation_receipt {
+                    receipt.record_stage_failure(
+                        ActivationReceiptStage::RuntimeAcquisition,
+                        ActivationReceiptStageStatus::Unavailable,
+                    );
+                }
                 self.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Python]);
                 return DependencyPackActivationOutcome {
                     ecosystems: outcomes,
@@ -1640,6 +1651,12 @@ impl WorkspaceAnalyzer {
         ) {
             Ok(publication) => publication,
             Err(error) => {
+                if let Some(receipt) = context.activation_receipt {
+                    receipt.record_stage_failure(
+                        ActivationReceiptStage::RuntimeAcquisition,
+                        ActivationReceiptStageStatus::Unavailable,
+                    );
+                }
                 self.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Python]);
                 return InstalledDependencyPackActivationOutcome { pending, outcome: DependencyPackActivationOutcome {
                     ecosystems: outcomes,
@@ -1686,6 +1703,16 @@ impl WorkspaceAnalyzer {
                 && publication.dependencies.is_empty()
                 && activation.evidence.is_empty())
         {
+            if let Some(receipt) = context.activation_receipt {
+                receipt.record_stage_failure(
+                    ActivationReceiptStage::DependencyDiscovery,
+                    if cancelled {
+                        ActivationReceiptStageStatus::Cancelled
+                    } else {
+                        ActivationReceiptStageStatus::Unavailable
+                    },
+                );
+            }
             return DependencyPackActivationOutcome {
                 ecosystems: outcomes,
                 runtime: None,
@@ -1697,7 +1724,10 @@ impl WorkspaceAnalyzer {
         activation.evidence.dedup();
         let runtime = {
             let _scope = crate::profiling::scope("semantic_pack.acquire_active");
-            acquire_active_semantic_models_with_runtime_artifacts(
+            let mut frame = context.activation_receipt.map(|receipt| {
+                receipt.begin_activation(ActivationOrigin::WorkspaceDependencyPublication)
+            });
+            acquire_active_semantic_models_with_runtime_artifacts_observed(
                 self.analyzer(),
                 context.catalog,
                 context.persistence,
@@ -1708,6 +1738,7 @@ impl WorkspaceAnalyzer {
                     python_runtime: publication.python_runtime.as_ref(),
                 },
                 context.cancellation,
+                frame.as_mut(),
             )
         };
         let diagnostic_refresh_required =
@@ -2403,6 +2434,9 @@ impl WorkspaceAnalyzer {
             return Ok(None);
         }
         let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
+        let Some(storage_language_key) = self.semantic_artifact_storage_language_key(key) else {
+            return Ok(None);
+        };
         let Some(snapshot) = self.current_program_semantics_artifact_source(&file, usize::MAX)?
         else {
             return Ok(None);
@@ -2424,9 +2458,32 @@ impl WorkspaceAnalyzer {
             crate::analyzer::store::class_set_summaries::ClassSetSummaryAttachment {
                 rel_path: key.path().as_str().to_owned(),
                 blob_oid: blob_oid.to_string(),
+                storage_language_key,
                 language: key.language().language(),
             },
         ))
+    }
+
+    /// Return the exact storage namespace selected by the same per-file
+    /// semantic provider that owns `key`. This is a path/adapter identity
+    /// lookup only; callers that need a current disk owner still use
+    /// [`Self::semantic_artifact_store_attachment`] to bind the key to a
+    /// verified source snapshot and blob identity.
+    pub fn semantic_artifact_storage_language_key(
+        &self,
+        key: &crate::analyzer::semantic::SemanticArtifactKey,
+    ) -> Option<crate::analyzer::semantic::StorageLanguageKey> {
+        let root = self.analyzer().project().root();
+        if key.mount() != crate::analyzer::semantic::WorkspaceMountId::from_root(root) {
+            return None;
+        }
+        let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
+        let active = self.analyzer().active_semantic_model_snapshot();
+        let (delegate, provider) = self.program_semantics_provider_context_for_file(&file)?;
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            delegate, active,
+        );
+        provider.storage_language_key_for_file(&file)
     }
 
     /// Number of files in the project, i.e. an upper bound on the distinct
@@ -3028,6 +3085,7 @@ mod tests {
             &config,
             &[DependencyPackEcosystem::Go],
             DependencyPackWorkspaceContext {
+                activation_receipt: None,
                 catalog: &catalog,
                 persistence: None,
                 activation: &request,
@@ -3536,6 +3594,7 @@ mod tests {
             &config,
             &[DependencyPackEcosystem::Python],
             DependencyPackWorkspaceContext {
+                activation_receipt: None,
                 catalog: &catalog,
                 persistence: None,
                 activation: &request,
@@ -3645,6 +3704,7 @@ mod tests {
             &config,
             &[DependencyPackEcosystem::Go, DependencyPackEcosystem::Python],
             DependencyPackWorkspaceContext {
+                activation_receipt: None,
                 catalog: &catalog,
                 persistence: None,
                 activation: &request,
@@ -3667,6 +3727,7 @@ mod tests {
             .file("main.go", "package main\nfunc main() {}\n")
             .build();
         let mut config = AnalyzerConfig::default();
+        config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::Disabled;
         config.go.dependency_discovery.go_executable = Some(fixture.root().join("absent-go-tool"));
         assert_eq!(
             config.go.dependency_discovery.mode,

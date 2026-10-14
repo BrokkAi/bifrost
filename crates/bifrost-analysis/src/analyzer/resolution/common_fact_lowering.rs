@@ -300,6 +300,7 @@ pub(crate) struct LoweredNamedArgumentLabel {
 pub(crate) struct LoweredCallableParameterList {
     pub(crate) callable: ResolutionSiteId,
     pub(crate) list_ordinal: u32,
+    pub(crate) contextual: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -729,29 +730,33 @@ fn lower_shared_language_facts(
         );
     }
 
-    let mut callable_parameter_lists = facts
-        .callable_parameter_lists
-        .iter()
-        .map(|list: &ResolutionCallableParameterListFact| {
-            assert!(declarations.contains(&list.callable));
-            LoweredCallableParameterList {
-                callable: list.callable,
-                list_ordinal: list.list_ordinal,
-            }
-        })
-        .collect::<BTreeSet<_>>();
+    let mut callable_parameter_lists = BTreeMap::<(ResolutionSiteId, u32), bool>::new();
+    for list in &facts.callable_parameter_lists {
+        assert!(declarations.contains(&list.callable));
+        let previous =
+            callable_parameter_lists.insert((list.callable, list.list_ordinal), list.contextual);
+        assert!(previous.is_none(), "callable parameter lists are unique");
+    }
     for parameter in &facts.callable_parameters {
         assert!(declarations.contains(&parameter.callable));
         assert!(
             sites.contains_key(&parameter.parameter),
             "callable parameters must name a source site, including unnamed parameters"
         );
-        callable_parameter_lists.insert(LoweredCallableParameterList {
-            callable: parameter.callable,
-            list_ordinal: parameter.list_ordinal,
-        });
+        callable_parameter_lists
+            .entry((parameter.callable, parameter.list_ordinal))
+            .or_insert(false);
     }
-    let callable_parameter_lists = callable_parameter_lists.into_iter().collect::<Vec<_>>();
+    let callable_parameter_lists = callable_parameter_lists
+        .into_iter()
+        .map(
+            |((callable, list_ordinal), contextual)| LoweredCallableParameterList {
+                callable,
+                list_ordinal,
+                contextual,
+            },
+        )
+        .collect::<Vec<_>>();
     let mut lists_by_callable = BTreeMap::<ResolutionSiteId, Vec<u32>>::new();
     for list in &callable_parameter_lists {
         lists_by_callable

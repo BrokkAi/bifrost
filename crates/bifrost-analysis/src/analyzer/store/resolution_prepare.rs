@@ -816,8 +816,11 @@ fn prepare_common_rows(
         if cancellation.is_cancelled() {
             return false;
         }
-        rows.callable_parameter_lists
-            .push(row![fact.callable.get(), fact.list_ordinal,]);
+        rows.callable_parameter_lists.push(row![
+            fact.callable.get(),
+            fact.list_ordinal,
+            fact.contextual,
+        ]);
     }
     for fact in &common.shared_language.callable_parameter_semantics {
         if cancellation.is_cancelled() {
@@ -1899,7 +1902,13 @@ fn prepare_typed_rows(
                                 | ResolutionTypeSlotRole::ExpressionValue
                         )
                     )
-                    && target_role == Some(ResolutionTypeSlotRole::ExpressionValue),
+                    && matches!(
+                        target_role,
+                        Some(
+                            ResolutionTypeSlotRole::ExpressionValue
+                                | ResolutionTypeSlotRole::CallResult
+                        )
+                    ),
                 "address-of transfer has inconsistent roles or transform: {rule:?}"
             ),
             ResolutionTypeTransferKind::Unwrap => assert!(
@@ -2059,6 +2068,7 @@ fn prepare_typed_rows(
             keys.semantic(property.definition()),
             keys.semantic(property.owner_definition()),
             keys.node(property.owner_scope_head()),
+            property.member_name(),
             property.kind().label(),
             property.access().label(),
             property.qualifier_compatibility().label(),

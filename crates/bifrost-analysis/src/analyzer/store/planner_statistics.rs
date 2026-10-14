@@ -447,7 +447,9 @@ pub mod pinned_plans {
         )
         .expect("selected Go transient placement pin view");
         conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_SCHEMA_SQL)
-            .expect("selected Rust module placement pin view");
+            .expect("selected Rust module placement pin table");
+        conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL)
+            .expect("selected Rust module placement pin rows");
         conn.execute_batch(crate::analyzer::store::resolution_operation::rust_reverse_rows::GAP_CANDIDATE_SITES_SCHEMA_SQL)
             .expect("selected Rust reverse gap site pin table");
         conn.execute_batch(crate::analyzer::store::resolution_stage::schema_sql())
@@ -1096,6 +1098,31 @@ pub mod pinned_plans {
                 .chain(crate::analyzer::store::resolution_operation::rust_crate_point_sql_pins())
                 .map(|(name, sql, parameters)| pin(name, sql, vec![Value::Null; parameters])),
         );
+        // Four observed reader shapes: ordinary type/value exports, a macro
+        // lookup and a crate-root alias. Use bound values rather than NULL.
+        let targets = concat!(
+            include_str!("resolution_operation/rust_crate_point_targets.sql"),
+            "SELECT topology_id, module_path, name FROM targets"
+        );
+        for (shape, namespace, module, name) in [
+            ("type", "type", "crate", "Item"),
+            ("value", "value", "crate::child", "target"),
+            ("macro", "macro", "crate::child", "chosen"),
+            ("root", "type", "crate", "self"),
+        ] {
+            queries.push(pin(
+                format!("rust_point_targets_{shape}"),
+                targets,
+                vec![
+                    Value::Integer(1),
+                    text(module),
+                    text(namespace),
+                    text(name),
+                    Value::Integer(1),
+                    text(module),
+                ],
+            ));
+        }
         queries.push(pin(
             "rust_crate_module_walk",
             crate::analyzer::store::rust_crates::MODULE_WALK_SQL,
@@ -1190,6 +1217,42 @@ pub mod pinned_plans {
                     integer(i64::from(super::super::source_facts::provenance_code(
                         brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::PrimaryNode,
                     ))),
+                ],
+            ),
+            pin(
+                "rust_reverse_call_arity",
+                reverse::CALL_ARITY_SQL,
+                vec![integer(1), integer(7)],
+            ),
+            pin(
+                "rust_reverse_call_shape",
+                reverse::CALL_SHAPE_SQL,
+                vec![
+                    text("src/lib.rs"), integer(7), text("[[0,1]]"),
+                    integer(super::super::resolution_prepare::resolution_rows::site_kind_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::CallableReference,
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::site_kind_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::MemberReference,
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::namespace_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Callable,
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_ENGINE_RULE_KINDS,
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionEngineRuleKind::ArgumentCoercionFilter,
+                    )),
+                    integer(i64::from(super::super::source_facts::provenance_code(
+                        brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::PrimaryNode,
+                    ))),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::QualifiedReference,
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedCallApplicability,
+                        ),
+                    )),
                 ],
             ),
             pin(
@@ -1778,6 +1841,7 @@ pub mod pinned_plans {
                     digest(5),
                     integer(1),
                     digest(6),
+                    text("python"),
                 ],
             ),
             (
@@ -1802,6 +1866,7 @@ pub mod pinned_plans {
                     digest(1),
                     text("src/app.py"),
                     text("python"),
+                    text("python"),
                     integer(1),
                     digest(2),
                     digest(3),
@@ -1818,6 +1883,7 @@ pub mod pinned_plans {
                 vec![
                     digest(1),
                     text("src/app.py"),
+                    text("python"),
                     text("python"),
                     integer(1),
                     digest(2),
@@ -1858,7 +1924,7 @@ pub mod pinned_plans {
             (
                 "class_set_summary_procedure",
                 CLASS_SET_SUMMARY_PROCEDURE_SQL.as_str(),
-                vec![digest(2)],
+                vec![digest(2), text("python")],
             ),
             (
                 "class_set_summary_dependents_by_lookup",
@@ -3136,6 +3202,389 @@ pub(crate) mod tests {
                     "AUTOMATIC",
                     "TEMP B-TREE",
                 ],
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#4990+#4995: Rust point readers repeated live alignment and dependency closure per lookup"
+    )]
+    fn rust_module_placement_readers_seek_materialized_selection_rows() {
+        use crate::CancellationToken;
+        use crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL;
+        use crate::analyzer::store::resolution_selection::{
+            SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome,
+            SelectedResolutionOverlayMask,
+        };
+        use crate::inline_project::InlineTestProject;
+        use rusqlite::types::Value;
+
+        let project = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname='placements'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nprovider={path='provider'}\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod child; pub mod inline { pub fn target() {} }",
+            )
+            .file(
+                "src/child.rs",
+                "pub fn caller() { crate::inline::target(); }",
+            )
+            .file("provider/Cargo.toml", "[package]\nname='provider'\nversion='0.1.0'\nedition='2021'\n")
+            .file("provider/src/lib.rs", "pub struct Item; #[macro_export] macro_rules! chosen { () => {} }")
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let workspace = {
+            let conn = store.conn.lock().unwrap();
+            super::super::WorkspaceId(
+                conn.query_row(
+                    "SELECT workspace_id FROM workspace_heads WHERE lang='rust'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            )
+        };
+        let snapshots = store
+            .workspace_snapshots_for_current_languages(&workspace, &["rust".into()])
+            .unwrap();
+        // Publication can replace summary rows without moving the workspace
+        // revision. Both reader pools must invalidate that identical selection.
+        store
+            .execute_selection_publication(|conn| -> super::super::Result<()> {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    super::super::unit_summaries::DELETE_LANGUAGE_VERSIONS_SQL,
+                    ["rust"],
+                )?;
+                tx.execute(
+                    super::super::unit_summaries::DELETE_UNBOUND_SUMMARIES_SQL,
+                    [],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+        let mut ordinary = store.read_conn_for_workspace(&snapshots).unwrap();
+        assert_eq!(
+            ordinary
+                .query_row(
+                    "SELECT count(*) FROM selected_rust_unit_summaries",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        {
+            let conn = store.conn.lock().unwrap();
+            store
+                .select_writer_workspace_snapshots(&conn, &snapshots)
+                .unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM selected_rust_unit_summaries",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+        }
+        store.reconcile_rust_crates(&snapshots["rust"]).unwrap();
+        assert_eq!(
+            store
+                .workspace_snapshots_for_current_languages(&workspace, &["rust".into()])
+                .unwrap(),
+            snapshots
+        );
+        assert!(
+            store.writer_selection.lock().unwrap().is_none(),
+            "same-connection publication invalidates the writer fallback"
+        );
+        store
+            .select_workspace_snapshots(&mut ordinary, &snapshots)
+            .unwrap();
+        let published: i64 = ordinary
+            .query_row(
+                "SELECT count(*) FROM selected_rust_unit_summaries",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            published > 0,
+            "unchanged revision sees newly published units"
+        );
+        let counts = store.workspace_selection_counts_for_test();
+        store
+            .select_workspace_snapshots(&mut ordinary, &snapshots)
+            .unwrap();
+        assert_eq!(
+            store.workspace_selection_counts_for_test(),
+            counts,
+            "unchanged publication reuses materialized units"
+        );
+        drop(ordinary);
+        {
+            let conn = store.conn.lock().unwrap();
+            store
+                .select_writer_workspace_snapshots(&conn, &snapshots)
+                .unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM selected_rust_unit_summaries",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                published
+            );
+        }
+        // Reuse, then acquire a different masked selection, then restore it.
+        // The fill runs only after the final input write in each acquisition.
+        for masks in [
+            vec![],
+            vec![],
+            vec![SelectedResolutionOverlayMask::removal(
+                "rust",
+                "src/child.rs",
+            )],
+            vec![],
+        ] {
+            let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
+                .open_selected_resolution_mount_inventory(
+                    &workspace,
+                    &snapshots,
+                    &[SelectedResolutionLanguage::new("rust", Language::Rust)],
+                    &masks,
+                    &CancellationToken::default(),
+                )
+                .unwrap()
+            else {
+                panic!("complete selection");
+            };
+            let conn = selection.connection();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM selected_rust_module_placements",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(count > 0, "selection must publish module placements");
+            // Compare the completed table to the original live SELECT, including
+            // aligned inline scopes. SQL text is a value, not source syntax.
+            let select = SELECTED_MODULE_PLACEMENTS_FILL_SQL
+                .split_once("INSERT INTO temp.selected_rust_module_placements\n")
+                .unwrap()
+                .1
+                .trim_end_matches([';', '\n']);
+            let equal: bool = conn.query_row(&format!(
+                "WITH expected AS ({select}) SELECT NOT EXISTS(SELECT * FROM expected EXCEPT SELECT * FROM selected_rust_module_placements) AND NOT EXISTS(SELECT * FROM selected_rust_module_placements EXCEPT SELECT * FROM expected)"), [], |row| row.get(0)).unwrap();
+            assert!(
+                equal,
+                "materialized placements match completed selection inputs"
+            );
+            let fill = include_str!("rust_selected_units_fill.sql");
+            let units_select = fill
+                .split_once("INSERT INTO temp.selected_rust_unit_summaries\n")
+                .unwrap()
+                .1
+                .split_once(';')
+                .unwrap()
+                .0;
+            let equal: bool = conn.query_row(&format!(
+                "WITH expected AS ({units_select}) SELECT NOT EXISTS(SELECT * FROM expected EXCEPT SELECT * FROM selected_rust_unit_summaries) AND NOT EXISTS(SELECT * FROM selected_rust_unit_summaries EXCEPT SELECT * FROM expected)"), [], |row| row.get(0)).unwrap();
+            assert!(equal, "selected units match the original live predicate");
+            let complete_contexts: bool = conn.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM main.resolution_unit_summary_versions AS v JOIN main.rust_resolution_unit_summary_versions AS r USING(workspace_id,lang,generation,unit_key,valid_from,summary_id) LEFT JOIN main.rust_resolution_unit_summary_contexts AS c USING(summary_id) WHERE c.summary_id IS NULL)", [], |row| row.get(0)).unwrap();
+            assert!(
+                complete_contexts,
+                "published route owners have their context rows"
+            );
+            let (roots, pairs): (i64, i64) = conn.query_row(
+                "SELECT (SELECT count(*) FROM selected_rust_unit_summaries), count(*) FROM selected_rust_unit_closure", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+            assert!(
+                pairs > roots,
+                "fixture must exercise workspace dependency reachability"
+            );
+        }
+        // Statistics installation writes main, so plan against the fixture's
+        // writer after exercising the real read-only selection lifecycle.
+        let conn = store.conn.lock().unwrap();
+        prepare_pin_context(&conn);
+        conn.execute_batch(
+            "DELETE FROM temp.selected_resolution_mounts;
+                            DELETE FROM temp.selected_rust_module_placements;
+                            DELETE FROM temp.selected_rust_unit_closure;
+                            DELETE FROM temp.selected_rust_unit_summaries;
+                            DELETE FROM temp.selected_workspace_revisions;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO temp.selected_workspace_revisions
+                      SELECT workspace_id,lang,generation,revision FROM workspace_heads
+                      WHERE workspace_id=?1 AND lang='rust'",
+            [workspace.as_str()],
+        )
+        .unwrap();
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
+        conn.execute_batch("INSERT INTO temp.selected_resolution_mounts(
+                             mount_ordinal,blob_id,storage_language,semantic_language,persisted_relative_path)
+                           SELECT row_number() OVER (ORDER BY rel_path),blob_id,'rust','rust',rel_path
+                           FROM (SELECT DISTINCT blob_id,rel_path FROM selected_rust_unit_members);").unwrap();
+        conn.execute_batch(SELECTED_MODULE_PLACEMENTS_FILL_SQL)
+            .unwrap();
+        let (blob, key): (i64, Vec<u8>) = conn.query_row(
+            "SELECT placement_blob,unit_key FROM selected_rust_module_placements WHERE container_path='crate'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        conn.execute_batch(crate::analyzer::store::resolution_operation::rust_reverse_rows::GAP_CANDIDATE_SITES_SCHEMA_SQL).unwrap();
+        let (topology, summary): (i64, i64) = conn
+            .query_row(
+                "SELECT topology_id,summary_id FROM selected_rust_unit_summaries WHERE unit_key=?1",
+                [&key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            for shape in ["type", "value", "macro", "root"] {
+                let mut pin = pinned(&format!("rust_point_targets_{shape}"));
+                pin.params[0] = Value::Integer(topology);
+                pin.params[4] = Value::Integer(topology);
+                let plan = explain_pin(&conn, &pin);
+                for (alias, index) in [
+                    ("owner", "selected_rust_unit_summaries_topology"),
+                    ("dependency", "selected_rust_unit_summaries_key"),
+                ] {
+                    assert!(
+                        plan.iter()
+                            .filter(
+                                |row| row.contains(&format!("SEARCH {alias} USING INDEX {index}"))
+                            )
+                            .count()
+                            >= 5,
+                        "{state} {shape}: every recursive arm seeks {alias}: {plan:?}"
+                    );
+                }
+                assert!(
+                    plan.iter().all(|row| !row.contains("AUTOMATIC")),
+                    "{state} {shape}: {plan:?}"
+                );
+            }
+            for (name, params, index) in [
+                (
+                    "rust_point_access_memberships",
+                    vec![Value::Blob(key.clone()), Value::Integer(blob)],
+                    "selected_rust_unit_closure_summary",
+                ),
+                (
+                    "rust_point_modules",
+                    vec![Value::Integer(summary)],
+                    "selected_rust_unit_closure_summary",
+                ),
+                (
+                    "rust_scope_closure_mounts",
+                    vec![Value::Blob(key.clone())],
+                    "selected_rust_unit_closure_summary",
+                ),
+                (
+                    "rust_point_crate",
+                    vec![Value::Blob(key.clone())],
+                    "selected_rust_unit_summaries_key",
+                ),
+                (
+                    "rust_point_file_crates",
+                    vec![Value::Integer(blob), Value::Text("src/lib.rs".into())],
+                    "selected_rust_unit_summaries_summary",
+                ),
+            ] {
+                let mut pin = pinned(name);
+                pin.params = params;
+                let plan = explain_pin(&conn, &pin);
+                if name == "rust_point_modules" {
+                    assert!(
+                        plan.iter().any(|row| row.contains(
+                            "SEARCH cargo USING INDEX selected_rust_unit_summaries_workspace"
+                        )),
+                        "{state} {name}: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().any(|row| row.contains("SEARCH cargo_context")
+                            && (row.contains("summary_id=?")
+                                || row.contains("INTEGER PRIMARY KEY (rowid=?)"))),
+                        "{state} {name}: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().all(|row| !row.contains("SCAN cargo_context")),
+                        "{state} {name}: {plan:?}"
+                    );
+                }
+                assert!(
+                    plan.iter()
+                        .any(|row| row.contains("SEARCH") && row.contains(index)),
+                    "{state} {name}: {plan:?}"
+                );
+                assert!(
+                    plan.iter()
+                        .all(|row| !row.contains("AUTOMATIC") && !row.contains("RECURSIVE STEP")),
+                    "{state} {name}: {plan:?}"
+                );
+            }
+            for name in [
+                "rust_point_access_placements",
+                "rust_point_access_reference_placements",
+                "rust_point_module_placements",
+            ] {
+                let mut pin = pinned(name);
+                pin.params = if name == "rust_point_module_placements" {
+                    vec![Value::Integer(blob), Value::Text("crate".into())]
+                } else {
+                    vec![Value::Blob(key.clone()), Value::Integer(blob), Value::Null]
+                };
+                let plan = explain_pin(&conn, &pin);
+                assert!(
+                    plan.iter().any(|row| row.contains("SEARCH")
+                        && row.contains("selected_rust_module_placements_blob (placement_blob=?")),
+                    "{state} {name} must seek the blob: {plan:?}"
+                );
+                assert!(
+                    plan.iter().all(|row| !row.contains("AUTOMATIC")
+                        && !row.starts_with("SCAN placement")
+                        && !row.contains("SCAN mount")),
+                    "{state} {name}: {plan:?}"
+                );
+                if name == "rust_point_access_placements" {
+                    let seek = plan
+                        .iter()
+                        .position(|row| {
+                            row.contains("selected_rust_module_placements_blob (placement_blob=?")
+                        })
+                        .unwrap();
+                    let graph = plan
+                        .iter()
+                        .position(|row| {
+                            row.contains(
+                                "SEARCH graph USING INDEX selected_rust_unit_closure_topology",
+                            )
+                        })
+                        .unwrap();
+                    assert!(
+                        seek < graph,
+                        "{state} seek placements before the dependency join: {plan:?}"
+                    );
+                }
+            }
+            let plan = explain_pin(&conn, &pinned("rust_reverse_gap_candidate_sites"));
+            assert!(
+                plan.iter()
+                    .any(|row| row
+                        .contains("selected_rust_module_placements_topology (topology_id=?")),
+                "{state} reverse target hosts must seek their topology: {plan:?}"
             );
         }
     }

@@ -57,7 +57,11 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v33";
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v35";
 const RUST_REPEAT_ARRAY_ELEMENT_CAP: u128 = 1024;
 /// Bound on the reference levels peeled from a method receiver while
 /// recovering the written type the call auto-derefs through. Real receiver
@@ -1753,6 +1757,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         ) {
             return (DropBehavior::Trivial, None);
         }
+        // A struct this file proves plain (every field is a primitive or another
+        // plain struct, and the file states no `impl Drop` for it) owns no
+        // destructor, so its own drop glue is trivial and its field expansion
+        // mints no cleanup action. This mirrors `expression_is_definitely_non_dropping`,
+        // which already trusts the same proof when it types a struct literal, and
+        // it keeps a nested plain struct (`LevelOne { b: LevelTwo { c: LevelThree } }`)
+        // from being reported as an unrouted destructor merely because the
+        // ownership classifier cannot prove the struct `Copy` from this file alone.
+        if self.type_is_plain_struct(type_node) {
+            return (DropBehavior::Trivial, None);
+        }
         match self.ownership.drop_impl_method_for_type(type_node) {
             Ok(Some(method)) => {
                 if let Some(target) = self.procedure_targets.get(&method.id()) {
@@ -1769,7 +1784,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )
                 }
             }
-            Ok(None) => match self.ownership.classify_type(type_node) {
+            Ok(None) => match self.ownership.classify_nominal_type_for_drop(type_node) {
                 RustOwnershipClass::ScalarCopy | RustOwnershipClass::AggregateCopy => {
                     (DropBehavior::Trivial, None)
                 }
@@ -1825,6 +1840,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             || self
                 .ownership
                 .resolves_standard_path(path, &["std", "mem", "ManuallyDrop"])
+    }
+
+    /// Whether this file proves the named struct owns no `Drop`.
+    ///
+    /// `plain_structs` is the same proof `expression_is_definitely_non_dropping`
+    /// consults for a struct literal, so the two agree on which values can skip
+    /// cleanup. Only a bare local name qualifies: a scoped path or a generic
+    /// instantiation keeps its own (unproven) drop behavior.
+    fn type_is_plain_struct(&self, type_node: Node<'tree>) -> bool {
+        type_node.kind() == "type_identifier"
+            && self
+                .facts
+                .plain_structs
+                .contains(rust_node_text(type_node, self.source))
     }
 
     fn value_is_manually_drop(&self, value: ValueId) -> bool {
@@ -11005,6 +11034,56 @@ mod semantic_lowering_tests {
             panic!("fixture lowering must complete");
         };
         value
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4975: a Copy struct in unsafe code emitted destructor-omission gaps"
+    )]
+    fn rust_copy_destructor_gaps_ignore_unsafe_mentions_but_keep_unknown_and_macros() {
+        // Qualify the same-file type so the separate bare-name plain-struct
+        // proof does not hide the ownership classifier's unsafe-context gate.
+        let source = r#"
+#[derive(core::marker::Copy, core::clone::Clone)]
+struct Pair(u32);
+fn safe_copy(value: crate::Pair) {}
+unsafe fn unsafe_copy(value: crate::Pair) {}
+unsafe fn unknown(value: Missing) {}
+unsafe fn macro_copy(value: crate::Pair) { opaque!(value); }
+"#;
+        let procedures = lower_fixture(source);
+        assert_eq!(procedures.len(), 4);
+        for (procedure, (name, expected_drop_gaps)) in procedures.iter().zip([
+            ("safe_copy", 0),
+            ("unsafe_copy", 0),
+            ("unknown", 8),
+            ("macro_copy", 0),
+        ]) {
+            let drop_gaps = procedure
+                .gaps
+                .iter()
+                .filter(|gap| {
+                    gap.detail.starts_with("scope exit crosses a destructor")
+                        || gap
+                            .detail
+                            .starts_with("procedure exit crosses a destructor")
+                })
+                .count();
+            assert_eq!(
+                drop_gaps, expected_drop_gaps,
+                "{name}: {:#?}",
+                procedure.gaps
+            );
+            if name == "macro_copy" {
+                assert!(
+                    procedure.gaps.iter().any(|gap| {
+                        gap.kind == SemanticGapKind::Unsupported
+                            && gap.capability == SemanticCapability::Calls
+                    }),
+                    "macro expansion must still carry uncertainty"
+                );
+            }
+        }
     }
 
     #[test]

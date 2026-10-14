@@ -621,7 +621,7 @@ fn native_import_alternatives_share_one_terminal_budget_and_cancellation() {
     };
     // An analyzer's first selected operation charges more receiver-analysis
     // work than its later ones. Measured on this tree at HEAD: cold
-    // (setup_nodes 0, summary_expansions 17, scope_nodes 696), warm
+    // (setup_nodes 0, resolution_rounds 17, scope_nodes 696), warm
     // (0, 15, 673) and identical on every operation after the first. The
     // difference is the R3 typed-frontier reads that the first operation
     // populates. The exact-budget property below is about one steady-state
@@ -642,6 +642,7 @@ fn native_import_alternatives_share_one_terminal_budget_and_cancellation() {
     let exact = ReceiverAnalysisBudget {
         max_scope_nodes: work.scope_nodes,
         max_summary_expansions: work.summary_expansions,
+        max_resolution_rounds: work.resolution_rounds,
         ..ReceiverAnalysisBudget::default()
     };
     assert_eq!(complete_definition(run(exact, None)).definitions.len(), 2);
@@ -667,7 +668,7 @@ fn native_import_alternatives_share_one_terminal_budget_and_cancellation() {
         let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
         match run(exact, Some(cancellation)) {
             BoundedResolution::Cancelled { work } => {
-                cancelled_with_resolution_work |= work.summary_expansions > 0;
+                cancelled_with_resolution_work |= work.resolution_rounds > 0;
             }
             BoundedResolution::Complete { value, .. } => assert_eq!(value.definitions.len(), 2),
             BoundedResolution::Exceeded { limit, .. } => panic!("cancellation exceeded {limit:?}"),

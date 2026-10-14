@@ -522,6 +522,21 @@ pub struct CodeQueryDispatchOutcome {
     pub exceeded_limit: Option<&'static str>,
 }
 
+/// Resolver-owned matching key of an unmaterialized external callable.
+///
+/// This is the same bounded key used to select a modeled graph leaf. It is not
+/// a declaration, artifact-applicability proof, or complete runtime target.
+/// Parameter types are absent, so same-arity overloads remain indistinguishable.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryExternalCalleeKey {
+    pub language: String,
+    pub owner: String,
+    pub member: String,
+    pub has_receiver: bool,
+    pub parameter_count: u32,
+}
+
 /// One bounded dispatch arm of one call site (#1477 M4).
 ///
 /// A row is either a materialized candidate (`boundary_kind` absent) or a
@@ -572,6 +587,11 @@ pub struct CodeQueryDispatchTarget {
     /// materialized candidate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boundary_kind: Option<&'static str>,
+    /// Resolver-owned key, when this arm names an unmaterialized callable.
+    /// Compare this tuple to a witness key without equating their graph and
+    /// dispatch IDs or upgrading the arm's evidence axes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_callee_key: Option<CodeQueryExternalCalleeKey>,
 }
 
 /// The mandatory terminal row for one member's canonical method family
@@ -1633,6 +1653,37 @@ pub struct CodeQueryResultContractFailureUse {
     pub summary_id: Option<String>,
 }
 
+/// One retained typed dispatch hop in a procedure-effect witness.
+///
+/// These are per-hop facts copied from the effect graph. They do not inherit
+/// or reinterpret aggregate row certainty or coverage.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryProcedureEffectWitness {
+    /// Graph procedure identity of the caller.
+    pub caller_procedure_id: String,
+    /// Graph procedure identity of the callee. External modeled leaves use
+    /// their modeled-procedure identity, not a dispatch target identity.
+    pub callee_procedure_id: String,
+    /// Normalized call-shape identity shared with call-effect rows. Dispatch
+    /// operation site ids have a different domain and must not be substituted.
+    pub site_id: String,
+    /// Exact source AST identity shared with dispatch and call-effect rows.
+    pub site_ast_id: String,
+    /// Dispatch-arm identity. Its namespace is separate from graph procedure
+    /// identities, so equality must not be inferred between these fields.
+    pub target_id: String,
+    pub proof: &'static str,
+    pub dispatch_complete: bool,
+    pub site_coverage: &'static str,
+    pub certainty: &'static str,
+    pub execution_timing: &'static str,
+    /// Key copied from the external graph edge at construction, before the
+    /// fixpoint. Absent for source-backed hops; no display-name reconstruction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_callee_key: Option<CodeQueryExternalCalleeKey>,
+}
+
 /// One effect attributed to one procedure, direct or transitive (#2437).
 ///
 /// Computed by a bounded deterministic fixpoint over the procedure's reachable
@@ -1702,6 +1753,11 @@ pub struct CodeQueryProcedureEffect {
     /// The bounded rendered chain, `caller -> ... -> declaring procedure`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness_chain: Option<String>,
+    /// The retained typed dispatch evidence for each witness hop. Aggregate
+    /// row fields such as `certainty` and `coverage` remain separate.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
+    pub witness_hops: Vec<CodeQueryProcedureEffectWitness>,
     /// Whether the chain hit the retained-step bound.
     pub witness_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]

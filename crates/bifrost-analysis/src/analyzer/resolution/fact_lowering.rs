@@ -48,9 +48,9 @@ use super::local_identity::{
     ResolutionPathIdentity, ResolutionSemanticIdentity, ResolutionStackVariableIdentity,
 };
 use super::model::{
-    BindingFragmentId, BindingNodeId, BindingNodeKind, EndpointSignature, PartialPath,
-    PartialPathId, PrecedenceStep, ResolutionCompletion, ResolutionIncompleteReason, SemanticId,
-    StackPattern, StackVariableId, WitnessStep,
+    BindingFragmentId, BindingNodeId, BindingNodeKind, BindingOrigin, EndpointSignature,
+    PartialPath, PartialPathId, PrecedenceStep, ResolutionCompletion, ResolutionIncompleteReason,
+    SemanticId, StackPattern, StackVariableId, WitnessStep, binding_origin_rank,
 };
 use super::{
     binder_namespace_is_declared, closed_endpoint, declaration_namespace_is_declared,
@@ -1190,9 +1190,28 @@ pub(crate) mod fixture_names {
     std::thread_local! {
         static CATALOGS: RefCell<HashMap<u32, std::sync::Arc<ResolutionIdentityCatalog>>> =
             RefCell::new(HashMap::default());
+        static SELECTED_CONTENT: RefCell<HashMap<u32, [u8; 32]>> = RefCell::new(HashMap::default());
+    }
+
+    pub(crate) fn record_selected(catalog: &ResolutionIdentityCatalog, content: [u8; 32]) {
+        record(catalog);
+        SELECTED_CONTENT.with(|contents| {
+            contents
+                .borrow_mut()
+                .insert(catalog.fragment().ordinal(), content);
+        });
+    }
+
+    fn fragment_content(ordinal: u32) -> Option<[u8; 32]> {
+        SELECTED_CONTENT
+            .with(|contents| contents.borrow().get(&ordinal).copied())
+            .or_else(|| super::super::model::fixture_label_digest(u64::from(ordinal)))
     }
 
     pub(crate) fn record(catalog: &ResolutionIdentityCatalog) {
+        SELECTED_CONTENT.with(|contents| {
+            contents.borrow_mut().remove(&catalog.fragment().ordinal());
+        });
         CATALOGS.with(|catalogs| {
             catalogs.borrow_mut().insert(
                 catalog.fragment().ordinal(),
@@ -1207,6 +1226,97 @@ pub(crate) mod fixture_names {
             .unwrap_or_else(|| {
                 panic!("no fixture lowered {fragment}, so nothing numbered its identities")
             })
+    }
+
+    pub(crate) fn identity_content_digest(
+        key: super::super::ResolutionIdentityDigestKey,
+    ) -> Option<[u8; 32]> {
+        use super::super::model::fixture_label_digest;
+        use super::super::{
+            ResolutionIdentityDigestKey as Key, SharedNameInterner, mounted_identity_digest,
+        };
+        let (ordinal, kind, digest) = match key {
+            Key::Fragment(fragment) => return fragment_content(fragment.ordinal()),
+            Key::Semantic(semantic) => {
+                if let Some(name) = semantic.shared_name_id() {
+                    return CATALOGS
+                        .with(|catalogs| {
+                            catalogs.borrow().values().find_map(|catalog| {
+                                catalog
+                                    .semantic_coordinate(semantic)
+                                    .map(|(_, identity)| catalog.identity_hash_bytes(identity))
+                            })
+                        })
+                        .or_else(|| {
+                            super::super::local_identity::test_shared_names().digest_for_id(name)
+                        });
+                }
+                if let Some(number) = semantic.operation_local_number() {
+                    return fixture_label_digest(
+                        number & !super::super::model::FIXTURE_OPERATION_BASE,
+                    );
+                }
+                let ordinal = semantic.ordinal()?;
+                let catalog = CATALOGS.with(|catalogs| catalogs.borrow().get(&ordinal).cloned())?;
+                let (_, identity) = catalog.semantic_coordinate(semantic)?;
+                (
+                    ordinal,
+                    b"semantic".as_slice(),
+                    identity.fragment_local_digest(),
+                )
+            }
+            Key::Node(node) => {
+                if node == BindingNodeId::universal_root() {
+                    return Some(
+                        brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                            b"bifrost-resolution-universal-root:v1",
+                            &[],
+                        ),
+                    );
+                }
+                if let Some(number) = node.operation_local_number() {
+                    return fixture_label_digest(
+                        number & !super::super::model::FIXTURE_OPERATION_BASE,
+                    );
+                }
+                let ordinal = node.ordinal()?;
+                let catalog = CATALOGS.with(|catalogs| catalogs.borrow().get(&ordinal).cloned())?;
+                let (_, identity) = catalog.node_coordinate(node)?;
+                (ordinal, b"node".as_slice(), identity.digest())
+            }
+            Key::Path(path) => {
+                if let Some(number) = path.operation_local_number() {
+                    return fixture_label_digest(
+                        number & !super::super::model::FIXTURE_OPERATION_BASE,
+                    );
+                }
+                let ordinal = path.ordinal()?;
+                let catalog = CATALOGS.with(|catalogs| catalogs.borrow().get(&ordinal).cloned())?;
+                let (_, identity) = catalog
+                    .paths()
+                    .iter()
+                    .find(|(runtime, _)| *runtime == path)?;
+                (
+                    ordinal,
+                    b"path".as_slice(),
+                    if i64::from(path.local_key()?)
+                        < super::super::local_identity::SUPPLEMENTAL_LOCAL_KEY_BASE
+                    {
+                        brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                            b"bifrost-resolution-published-path-position:v1",
+                            &path.local_key()?.to_be_bytes(),
+                        )
+                    } else {
+                        identity.digest()
+                    },
+                )
+            }
+        };
+        Some(mounted_identity_digest(
+            kind,
+            fragment_content(ordinal)?,
+            digest,
+        ))
     }
 
     fn semantic_of(
@@ -2571,7 +2681,7 @@ fn root_import_precedence(
         } else {
             PrecedenceTier::WildcardImport
         };
-        return vec![identities.register_precedence_namespace(
+        let mut precedence = vec![identities.register_precedence_namespace(
             PrecedenceStep {
                 tier,
                 ordinal: 0,
@@ -2579,6 +2689,22 @@ fn root_import_precedence(
             },
             namespace,
         )];
+        let origin = if import.named {
+            BindingOrigin::ExplicitImport
+        } else {
+            BindingOrigin::WildcardImport
+        };
+        if let Some(ordinal) = binding_origin_rank(language, origin) {
+            precedence.push(identities.register_precedence_namespace(
+                PrecedenceStep {
+                    tier: PrecedenceTier::CandidateOriginRank,
+                    ordinal,
+                    semantic: choice,
+                },
+                namespace,
+            ));
+        }
+        return precedence;
     }
     let import_choice =
         identities.semantic(import_choice_identity(import.fact.root_scope, namespace));
@@ -6162,7 +6288,7 @@ pub(crate) fn gap_reason_semantic(
     identities.semantic(gap_reason_semantic_identity(site, origin))
 }
 
-pub(super) fn gap_reason_semantic_identity(
+pub(crate) fn gap_reason_semantic_identity(
     site: ResolutionSiteId,
     origin: LoweringGapOrigin,
 ) -> ResolutionSemanticIdentity {

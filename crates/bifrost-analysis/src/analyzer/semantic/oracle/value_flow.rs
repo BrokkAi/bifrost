@@ -1,9 +1,12 @@
+use std::hash::Hash;
 use std::sync::Arc;
 
+use super::super::ids::{MemoryLocationId, SemanticDigestHasher};
+
 use super::super::ir::{
-    BackingStoreOffset, CaptureSource, EvidenceCompleteness, ExecutionTiming, MemoryLocationKind,
-    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticEffect, SemanticValueKind,
-    ValueFlowKind, ValueHandle, ValueTransfer,
+    BackingStoreOffset, CaptureSource, EvidenceCompleteness, ExecutionTiming, MemoryLocationHandle,
+    MemoryLocationKind, ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticEffect,
+    SemanticValueKind, ValueFlowKind, ValueHandle, ValueTransfer,
 };
 use super::error::{OracleContractError, require_same_procedure};
 use super::limits::OracleLimits;
@@ -15,7 +18,7 @@ use super::relation::{
     CandidateCoverage, OracleRelationHandle, OracleRelationKind, OracleRelationOwner,
     validate_retained_relation_arenas,
 };
-use crate::analyzer::semantic::{ProgramPointId, SemanticGapId, ValueId};
+use crate::analyzer::semantic::{ProgramPointId, SemanticGapId, StableDigest, ValueId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueFlowRelationKind {
@@ -662,6 +665,123 @@ fn validate_capture_flow(
     Ok(())
 }
 
+/// Producer-attested role of a dependency published by a memory operation.
+/// Roles do not establish endpoint resolution, proof, or completeness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemoryRelationRole {
+    Canonical,
+    Alternative,
+    Supplemental,
+}
+
+/// Procedure-local origin carried by an immutable relation-arena record.
+/// Obtain scoped identity through `ValueFlowRelation::memory_operation_key`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MemoryRelationOrigin {
+    point: ProgramPointId,
+    event_index: u32,
+    location: MemoryLocationId,
+    role: MemoryRelationRole,
+}
+
+impl MemoryRelationOrigin {
+    pub(crate) const fn new(
+        point: ProgramPointId,
+        event_index: u32,
+        location: MemoryLocationId,
+        role: MemoryRelationRole,
+    ) -> Self {
+        Self {
+            point,
+            event_index,
+            location,
+            role,
+        }
+    }
+
+    pub const fn role(&self) -> MemoryRelationRole {
+        self.role
+    }
+}
+
+/// Exact query-local memory operation, including its artifact and call context.
+/// This key is not a durable or cross-process identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MemoryOperationKey<'a> {
+    pub point: &'a ProgramPointHandle,
+    pub event_index: u32,
+    pub location: MemoryLocationHandle,
+    pub context: &'a OracleCallContext,
+}
+
+/// Payload for constructing a relation without producer memory authority.
+/// The trusted materializer moves the same payload into a sealed memory row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ValueFlowRelationPayload {
+    pub point: ProgramPointHandle,
+    pub event_index: u32,
+    pub kind: ValueFlowRelationKind,
+    pub transfer: Option<ValueTransfer>,
+    pub source: ValueFlowEndpoint,
+    pub target: ValueFlowEndpoint,
+    pub proof: ProofStatus,
+    pub completeness: EvidenceCompleteness,
+    pub strong_update: bool,
+    pub direct_cell_overwrite: bool,
+}
+
+/// Borrowed view keeps producer and validator hashing the same typed payload.
+#[derive(Hash)]
+struct ValueFlowPayloadRef<'a> {
+    point: &'a ProgramPointHandle,
+    event_index: u32,
+    kind: ValueFlowRelationKind,
+    transfer: &'a Option<ValueTransfer>,
+    source: &'a ValueFlowEndpoint,
+    target: &'a ValueFlowEndpoint,
+    proof: &'a ProofStatus,
+    completeness: &'a EvidenceCompleteness,
+    strong_update: bool,
+    direct_cell_overwrite: bool,
+}
+
+impl ValueFlowPayloadRef<'_> {
+    fn memory_seal(
+        &self,
+        origin: &MemoryRelationOrigin,
+        context: &OracleCallContext,
+    ) -> StableDigest {
+        let mut digest = SemanticDigestHasher::new(b"bifrost-query-local-memory-relation-seal-v1");
+        (context, origin, self).hash(&mut digest);
+        digest.finish_digest()
+    }
+}
+
+impl ValueFlowRelationPayload {
+    fn as_ref(&self) -> ValueFlowPayloadRef<'_> {
+        ValueFlowPayloadRef {
+            point: &self.point,
+            event_index: self.event_index,
+            kind: self.kind,
+            transfer: &self.transfer,
+            source: &self.source,
+            target: &self.target,
+            proof: &self.proof,
+            completeness: &self.completeness,
+            strong_update: self.strong_update,
+            direct_cell_overwrite: self.direct_cell_overwrite,
+        }
+    }
+
+    pub(crate) fn memory_seal(
+        &self,
+        origin: &MemoryRelationOrigin,
+        context: &OracleCallContext,
+    ) -> StableDigest {
+        self.as_ref().memory_seal(origin, context)
+    }
+}
+
 /// One materialized value-flow relation.  Relation IDs provide stable identity
 /// inside this oracle materialization without imposing any weight algebra.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -700,9 +820,126 @@ pub struct ValueFlowRelation {
     /// This is a local write verdict, independent of heap escape certification.
     /// It does not establish complete capture execution or non-escape.
     pub direct_cell_overwrite: bool,
+    // Independent original-row authority survives public payload/id mutation.
+    memory_seal: Option<StableDigest>,
 }
 
 impl ValueFlowRelation {
+    /// Construct an unsealed row. This grants no memory-operation authority.
+    /// A snapshot rejects it at a memory event, even with a borrowed sealed ID.
+    pub fn unsealed(id: OracleRelationHandle, payload: ValueFlowRelationPayload) -> Self {
+        Self {
+            point: payload.point,
+            event_index: payload.event_index,
+            id,
+            kind: payload.kind,
+            transfer: payload.transfer,
+            source: payload.source,
+            target: payload.target,
+            proof: payload.proof,
+            completeness: payload.completeness,
+            strong_update: payload.strong_update,
+            direct_cell_overwrite: payload.direct_cell_overwrite,
+            memory_seal: None,
+        }
+    }
+
+    pub(crate) fn sealed(
+        id: OracleRelationHandle,
+        payload: ValueFlowRelationPayload,
+        seal: StableDigest,
+    ) -> Self {
+        let mut relation = Self::unsealed(id, payload);
+        relation.memory_seal = Some(seal);
+        relation
+    }
+
+    fn as_payload_ref(&self) -> ValueFlowPayloadRef<'_> {
+        ValueFlowPayloadRef {
+            point: &self.point,
+            event_index: self.event_index,
+            kind: self.kind,
+            transfer: &self.transfer,
+            source: &self.source,
+            target: &self.target,
+            proof: &self.proof,
+            completeness: &self.completeness,
+            strong_update: self.strong_update,
+            direct_cell_overwrite: self.direct_cell_overwrite,
+        }
+    }
+
+    /// Return producer origin only while both the original row and immutable
+    /// arena record attest this exact payload, namespace, and call context.
+    pub fn memory_origin(&self) -> Option<&MemoryRelationOrigin> {
+        let original = self.memory_seal?;
+        if self.id.record().kind() != OracleRelationKind::ValueFlow {
+            return None;
+        }
+        let binding = self.id.record().memory_origin_binding()?;
+        let OracleRelationOwner::ProcedureValueFlow { procedure, context } = self.id.owner() else {
+            return None;
+        };
+        if procedure != self.point.procedure() {
+            return None;
+        }
+        let origin = binding.origin();
+        if origin.point != self.point.id() || origin.event_index != self.event_index {
+            return None;
+        }
+        let point = procedure.semantics().point(self.point.id())?;
+        let event = point.events.get(self.event_index as usize)?;
+        let direction_matches = match event.effect {
+            SemanticEffect::MemoryLoad { location, .. } => {
+                location == origin.location
+                    && match origin.role {
+                        MemoryRelationRole::Canonical | MemoryRelationRole::Alternative => {
+                            self.kind == ValueFlowRelationKind::MemoryLoad
+                        }
+                        MemoryRelationRole::Supplemental => matches!(
+                            self.kind,
+                            ValueFlowRelationKind::MemoryLoad
+                                | ValueFlowRelationKind::ContainerCollapse
+                        ),
+                    }
+            }
+            SemanticEffect::MemoryStore { location, .. } => {
+                location == origin.location && self.kind == ValueFlowRelationKind::MemoryStore
+            }
+            _ => false,
+        };
+        if !direction_matches
+            || original != binding.seal()
+            || original != self.as_payload_ref().memory_seal(origin, context)
+        {
+            return None;
+        }
+        Some(origin)
+    }
+
+    pub fn memory_operation_key(&self) -> Option<MemoryOperationKey<'_>> {
+        let origin = self.memory_origin()?;
+        let OracleRelationOwner::ProcedureValueFlow { procedure, context } = self.id.owner() else {
+            return None;
+        };
+        Some(MemoryOperationKey {
+            point: &self.point,
+            event_index: origin.event_index,
+            location: procedure.memory_location_handle(origin.location)?,
+            context,
+        })
+    }
+
+    fn has_valid_memory_authority(&self, effect: &SemanticEffect) -> bool {
+        if matches!(
+            effect,
+            SemanticEffect::MemoryLoad { .. } | SemanticEffect::MemoryStore { .. }
+        ) {
+            self.memory_origin().is_some()
+        } else {
+            self.memory_seal.is_none() && self.id.record().memory_origin_binding().is_none()
+        }
+    }
     /// Whether this dependency also establishes unchanged runtime class.
     /// Element-to-container dependence and language computations are not
     /// class identity. Retain them for value-flow, but not for class copying.
@@ -874,7 +1111,9 @@ impl ValueFlowSnapshot {
                 .events
                 .get(relation.event_index as usize)
                 .ok_or(OracleContractError::InvalidRelationIdentity)?;
-            if !relation_matches_event(&procedure, relation, &event.effect, &mut chains) {
+            if !relation_matches_event(&procedure, relation, &event.effect, &mut chains)
+                || !relation.has_valid_memory_authority(&event.effect)
+            {
                 return Err(OracleContractError::InvalidRelationIdentity);
             }
             if relation.transfer.is_some() && relation.kind != ValueFlowRelationKind::Assignment {
@@ -943,6 +1182,14 @@ impl ValueFlowSnapshot {
 
     pub fn relations(&self) -> &[ValueFlowRelation] {
         &self.relations
+    }
+
+    /// Structural owned arena bytes, counted once even after filtering rows.
+    /// Retained handles keep the entire original bounded arena alive.
+    pub fn retained_arena_bytes(&self) -> usize {
+        self.relations
+            .first()
+            .map_or(0, |relation| relation.id.arena().retained_bytes())
     }
 
     /// Restrict an already validated snapshot to runtime-class identity flow.

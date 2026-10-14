@@ -1342,7 +1342,7 @@ fn rust_row_reverse_answers(
                 let candidates = queries
                     .candidate_sets(targets)?
                     .expect("the fixture's reverse targets have candidate sets");
-                match queries.references_to(targets, &candidates)? {
+                match queries.references_to(targets, &candidates, RustReverseRequest::References)? {
                     SelectedRustReverseBatchOutcome::Ready(answers) => Ok(answers),
                     SelectedRustReverseBatchOutcome::Unavailable(reason) => {
                         panic!("the fixture's reverse batch must be available: {reason:?}")
@@ -4055,8 +4055,10 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
         // M6 cold setup adds 122 fixed schema statements and three stage
         // cleanup statements, and removes one obsolete metadata read. SQLite's
         // schema ROW events are now explicit; aggregate row counts retain them.
-        // Selected module placement adds one TEMP view statement and one
-        // schema ROW event. Returning the selected mount with the export
+        // Materialized module placements replace the TEMP view with a table
+        // and three indexes (+3 schema statements/rows). Fill/clear and the
+        // ordering assertions add five executions and two decoded rows, for
+        // +8/+5 on cold setup only. Returning the selected mount with the export
         // removes one export-source execution/row from every search.
         // The cold search adds six shared-name seeks to the warm search below.
         // Two seed reads now join site/catalog membership: each removes one
@@ -4107,7 +4109,10 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
         // once each: +5 indexed statements and no decoded rows. On the merged
         // line the reductions above (321 cold) carry the probes: 326.
         // M5 summary views add three cold-open statements and rows.
-        (236, 217, 326, 205),
+        // #4995 selected units/closure add +14 statements/+8 rows to shared
+        // cold setup: TEMP schema, fill/clear and the input-order assertion.
+        // Canonical bridge inputs add eight indexed content reads per query.
+        (258, 230, 334, 213),
         "production Rust cold point SQL changed; the crate-key open and row-backed point search have exact statement and decoded-row counts"
     );
     assert_eq!(
@@ -4137,7 +4142,7 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
         // The same eight original-external-binding seeks add +8/0, as cold.
         // On the merged line the reductions above (315 warm) carry the probes
         // too: 320.
-        (5, 4, 320, 199),
+        (5, 4, 328, 207),
         "production Rust warm point SQL changed; exact relational selection verification and requested opening metadata keep the open at five statements while the row-backed search has exact statement and decoded-row counts"
     );
     assert_eq!(
@@ -4147,7 +4152,7 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
             second_warm.1.statement_count(),
             second_warm.1.decoded_rows,
         ),
-        (5, 4, 320, 199),
+        (5, 4, 328, 207),
         "repeated production Rust warm point SQL changed; the repeated retained selection and row-backed search have identical measured counts"
     );
     assert_eq!(cold.2, first_warm.2);
@@ -4247,6 +4252,7 @@ fn measure_production_go_point_sql(
                 .resolve_native_reference_types_bounded_for_go_request(
                     *prepared,
                     None,
+                    None,
                     &locator,
                     ReceiverAnalysisBudget::default(),
                     &cancellation,
@@ -4309,14 +4315,20 @@ fn production_go_point_statement_decoded_row_and_engine_work_is_repeatable() {
         // table and its indexes during cold point setup. The cold open is
         // +3/+3 over the master pin because the shared selection schema now
         // creates the three Rust unit-summary TEMP views (M5 step 2); the Go
-        // search itself is unchanged.
+        // search itself is unchanged. Materialized Rust module placements
+        // add +8 statements/+5 rows to shared cold selection setup only.
+        // #4995 selected units/closure add +14/+8 more to that shared cold
+        // setup. Search and retained warm-open work remain unchanged.
+        // Canonical bridge inputs resolve three content catalog positions once
+        // per selected query (+3 indexed statements and decoded rows).
         let (cold_open, cold_search, warm_open, warm_search) = match kind {
-            ProductionGoPointKind::Definition => ((236, 217), (216, 179), (5, 4), (167, 112)),
-            ProductionGoPointKind::Type => ((236, 217), (234, 175), (5, 4), (185, 108)),
+            ProductionGoPointKind::Definition => ((258, 230), (219, 182), (5, 4), (170, 115)),
+            ProductionGoPointKind::Type => ((258, 230), (237, 178), (5, 4), (188, 111)),
         };
         for measurement in [&cold, &first_warm, &second_warm] {
             assert_eq!(measurement.work.setup_nodes, 0);
-            assert_eq!(measurement.work.summary_expansions, 7);
+            assert_eq!(measurement.work.resolution_rounds, 7);
+            assert_eq!(measurement.work.summary_expansions, 0);
             assert_eq!(measurement.work.scope_nodes, expected_scope_nodes);
         }
         assert_eq!(
@@ -4882,8 +4894,9 @@ fn assert_production_rust_point_scale_measurement(
         measurement.receiver_work,
         ReceiverAnalysisWork {
             setup_nodes: 0,
-            summary_expansions: 10,
+            summary_expansions: 0,
             scope_nodes: expected_scope_nodes,
+            resolution_rounds: 10,
         },
         "production Rust point-scale receiver work changed"
     );
@@ -6719,7 +6732,7 @@ fn selected_rust_caller_bounded_entry_charges_the_point_request_not_its_context(
         work,
         ReceiverAnalysisWork {
             setup_nodes: 0,
-            summary_expansions: 10,
+            summary_expansions: 0,
             // 294, plus 10 steps for the callee signature reads that ask
             // whether an argument decides a generic call's result, is 304.
             // A round whose demanded slots are unchanged reuses the slot
@@ -6729,6 +6742,7 @@ fn selected_rust_caller_bounded_entry_charges_the_point_request_not_its_context(
             // identities before call projections. Java implicit-receiver
             // provenance is skipped for this Rust-only selection.
             scope_nodes: 258,
+            resolution_rounds: 10,
         },
         "the interior's per-mount candidate paging charges the point request; tier-1 candidate and declaration work must remain exact"
     );
@@ -6781,15 +6795,15 @@ fn selected_rust_caller_bounded_entry_charges_the_point_request_not_its_context(
         warm, work,
         "the caller context is preparation, so the first request charges what every later one does"
     );
-    let under_summary = run(ReceiverAnalysisBudget {
-        max_summary_expansions: warm.summary_expansions - 1,
+    let under_rounds = run(ReceiverAnalysisBudget {
+        max_resolution_rounds: warm.resolution_rounds - 1,
         max_scope_nodes: warm.scope_nodes,
         ..ReceiverAnalysisBudget::default()
     });
     assert!(matches!(
-        under_summary,
+        under_rounds,
         BoundedResolution::Exceeded {
-            limit: ReceiverBudgetLimit::SummaryExpansions,
+            limit: ReceiverBudgetLimit::ResolutionRounds,
             ..
         }
     ));
@@ -6797,6 +6811,7 @@ fn selected_rust_caller_bounded_entry_charges_the_point_request_not_its_context(
 
     let exact = run(ReceiverAnalysisBudget {
         max_summary_expansions: warm.summary_expansions,
+        max_resolution_rounds: warm.resolution_rounds,
         max_scope_nodes: warm.scope_nodes,
         ..ReceiverAnalysisBudget::default()
     });
@@ -6809,6 +6824,7 @@ fn selected_rust_caller_bounded_entry_charges_the_point_request_not_its_context(
     ));
     let under = run(ReceiverAnalysisBudget {
         max_summary_expansions: warm.summary_expansions,
+        max_resolution_rounds: warm.resolution_rounds,
         max_scope_nodes: warm.scope_nodes - 1,
         ..ReceiverAnalysisBudget::default()
     });
@@ -7226,15 +7242,26 @@ impl PreloadedOracle {
                     PROVIDER_PATH => &fixture.provider_facts,
                     path => panic!("unexpected parity mount {path:?}"),
                 };
-                (
-                    mount.persisted_relative_path().to_owned(),
-                    crate::analyzer::resolution::lower_resolution_facts_for_selection(
-                        mount.fragment(),
-                        &operation.ready.shared_names(),
-                        Language::Java,
-                        facts,
-                    ),
-                )
+                (mount.persisted_relative_path().to_owned(), {
+                    let artifact =
+                        crate::analyzer::resolution::lower_resolution_facts_for_selection(
+                            mount.fragment(),
+                            &operation.ready.shared_names(),
+                            Language::Java,
+                            facts,
+                        );
+                    crate::analyzer::resolution::record_fixture_selected_identity_catalog(
+                        artifact.identities(),
+                        operation
+                            .ready
+                            .inventory
+                            .mount_record_by_ordinal(mount.ordinal())
+                            .unwrap()
+                            .fragment_digest()
+                            .as_bytes(),
+                    );
+                    artifact
+                })
             })
             .collect::<Vec<_>>();
         let source = lowered
@@ -7560,7 +7587,6 @@ fn real_go_bundle_reopens_without_java_placement_and_matches_preload() {
             .is_some()
     );
     let fragment = mount.fragment();
-    drop(mounted);
 
     let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
         fragment,
@@ -7568,6 +7594,17 @@ fn real_go_bundle_reopens_without_java_placement_and_matches_preload() {
         Language::Go,
         facts,
     );
+    crate::analyzer::resolution::record_fixture_selected_identity_catalog(
+        lowered.identities(),
+        mounted
+            .ready
+            .inventory
+            .mount_record_by_ordinal(mount.ordinal())
+            .unwrap()
+            .fragment_digest()
+            .as_bytes(),
+    );
+    drop(mounted);
     assert!(!lowered.typed().frontiers().is_empty());
     let point_reference = semantic_at(&lowered, point_site, LoweredSemanticRole::Reference);
     let reverse_definition =
@@ -7713,19 +7750,29 @@ fn selected_go_root_context_matches_preload_and_excludes_wrong_route() {
     assert_eq!(mounted.mounts().unwrap().len(), 3);
     let mounts = mounted.mounts().unwrap().to_vec();
     let preload_context = fixture.contexts_for(&mounted);
-    drop(mounted);
 
     let artifact_for = |path: &str, facts: &FileResolutionFacts| {
         let mount = mounts
             .iter()
             .find(|mount| mount.persisted_relative_path() == path)
             .unwrap_or_else(|| panic!("missing selected Go mount {path:?}"));
-        crate::analyzer::resolution::lower_resolution_facts_for_selection(
+        let artifact = crate::analyzer::resolution::lower_resolution_facts_for_selection(
             mount.fragment(),
             crate::analyzer::resolution::test_shared_names(),
             Language::Go,
             facts,
-        )
+        );
+        crate::analyzer::resolution::record_fixture_selected_identity_catalog(
+            artifact.identities(),
+            mounted
+                .ready
+                .inventory
+                .mount_record_by_ordinal(mount.ordinal())
+                .unwrap()
+                .fragment_digest()
+                .as_bytes(),
+        );
+        artifact
     };
     let consumer = artifact_for(GO_ROOT_CONSUMER_PATH, &fixture.consumer_facts);
     let provider = artifact_for(GO_ROOT_PROVIDER_PATH, &fixture.provider_facts);
@@ -7778,6 +7825,7 @@ fn selected_go_root_context_matches_preload_and_excludes_wrong_route() {
             &cancellation,
         )
         .expect("compile independent preloaded Go root context oracle");
+    drop(mounted);
     let expected_point = preload_blueprint
         .resolve_reference(&preload, &preload, reference, &cancellation)
         .expect("preloaded cross-package Go point resolution");
@@ -9269,7 +9317,15 @@ fn generated_head_pair_preserves_actual_ordinary_definition_authority() {
                 &host,
                 definition,
                 definition_node,
-                &live
+                operation
+                    .ready
+                    .identity_content_digest(reference.into(), &live)
+                    .unwrap(),
+                operation
+                    .ready
+                    .identity_content_digest(definition.into(), &live)
+                    .unwrap(),
+                &live,
             )
             .unwrap(),
         Some(())
@@ -12229,4 +12285,97 @@ fn go_definition_package_anchor_seeks_exact_selected_version() {
             );
         }
     }
+}
+
+// A completed answer must remain valid across fresh solve arenas while a
+// smaller budget or cancelled request cannot borrow its completion.
+#[test]
+fn selected_resolution_operation_reuses_typed_roots_with_budget_and_cancellation_boundaries() {
+    let fixture = RustRootResolutionOperationFixture::new();
+    let cancellation = CancellationToken::default();
+    let reference = site_for_identifier(
+        &fixture.consumer_facts,
+        "alias",
+        ResolutionIdentifierRole::Reference,
+        ResolutionNamespace::Value,
+    );
+    let range = fixture
+        .consumer_facts
+        .sites
+        .iter()
+        .find(|site| site.id == reference)
+        .unwrap();
+    let locator = SelectedSemanticLocator::for_reference_range(
+        "rust",
+        RUST_ROOT_CONSUMER_PATH,
+        range.start_byte,
+        range.end_byte,
+    );
+    let mut operation = fixture.open_ready(&cancellation);
+    let mut answers = Vec::new();
+    for _ in 0..3 {
+        let BoundedResolution::Complete {
+            value:
+                SelectedRustCallerReferenceOutcome::Operation(
+                    SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
+                        answer,
+                    )),
+                ),
+            ..
+        } = operation
+            .resolve_rust_reference_for_caller_bounded(
+                Path::new(RUST_ROOT_CONSUMER_PATH),
+                &locator,
+                ReceiverAnalysisBudget::default(),
+                &cancellation,
+                &mut SelectedResolutionContextMetrics,
+                &mut ResolutionBatchMetrics::default(),
+            )
+            .unwrap()
+        else {
+            panic!("the repeated demand must complete");
+        };
+        answers.push(only_rust_point_answer(answer));
+    }
+    assert_eq!(answers[0].resolution, answers[1].resolution);
+    assert_eq!(answers[1].resolution, answers[2].resolution);
+    assert!(operation.ready.operation_demand_state.hits_for_test() > 0);
+    let before = operation.ready.operation_demand_state.hits_for_test();
+    let tiny = operation
+        .resolve_rust_reference_for_caller_bounded(
+            Path::new(RUST_ROOT_CONSUMER_PATH),
+            &locator,
+            ReceiverAnalysisBudget {
+                max_scope_nodes: 0,
+                ..ReceiverAnalysisBudget::default()
+            },
+            &cancellation,
+            &mut SelectedResolutionContextMetrics,
+            &mut ResolutionBatchMetrics::default(),
+        )
+        .unwrap();
+    assert!(matches!(tiny, BoundedResolution::Exceeded { .. }));
+    assert_eq!(
+        operation.ready.operation_demand_state.hits_for_test(),
+        before
+    );
+    let fresh = fixture.open_ready(&cancellation);
+    assert_eq!(fresh.ready.operation_demand_state.hits_for_test(), 0);
+    drop(fresh);
+    cancellation.cancel();
+    let cancelled = operation
+        .resolve_rust_reference_for_caller_bounded(
+            Path::new(RUST_ROOT_CONSUMER_PATH),
+            &locator,
+            ReceiverAnalysisBudget::default(),
+            &cancellation,
+            &mut SelectedResolutionContextMetrics,
+            &mut ResolutionBatchMetrics::default(),
+        )
+        .unwrap();
+    assert!(matches!(cancelled, BoundedResolution::Cancelled { .. }));
+    assert_eq!(
+        operation.ready.operation_demand_state.hits_for_test(),
+        before
+    );
 }

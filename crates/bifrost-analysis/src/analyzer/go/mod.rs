@@ -37,8 +37,8 @@ use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgeFailure, LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    PredeclaredBuiltinQueryStep, StablePackageFunctionValueProof, StructuralReceiverResolver,
-    fqn_bulk_nodes, ready_preflight,
+    ModeledExternalPackageIdentity, PredeclaredBuiltinQueryStep, StablePackageFunctionValueProof,
+    StructuralReceiverResolver, fqn_bulk_nodes, ready_preflight,
 };
 use crate::analyzer::store::LimitedQueryRows;
 #[cfg(test)]
@@ -158,6 +158,33 @@ pub fn persist_live_go_sources_for_test(analyzer: &GoAnalyzer) {
             "persist selected Go source facts for {file}"
         );
     }
+    // Re-persistence withdraws summaries that depended on the replaced blobs.
+    // Reconcile under the same selected snapshot and profile as production.
+    let snapshots = analyzer.inner.selected_workspace_snapshots();
+    let snapshot = snapshots.get("go").expect("selected Go snapshot");
+    let profile = analyzer
+        .native_context_profile()
+        .expect("selected Go native context profile");
+    let store = analyzer.inner.analyzer_store();
+    let context = store
+        .selected_go_context(snapshot, &profile)
+        .expect("read selected Go context")
+        .expect("selected Go package context");
+    let report = store
+        .reconcile_unit_summaries(
+            snapshot,
+            crate::analyzer::store::go_unit_summaries::GoUnitSummaries {
+                context_id: context.context_id,
+                profile,
+            },
+            &crate::CancellationToken::new(),
+        )
+        .expect("reconcile summaries after persisting selected Go sources");
+    assert!(
+        report.failed.is_empty(),
+        "selected Go summary reconciliation failed: {:?}",
+        report.failed
+    );
 }
 
 impl Clone for GoAnalyzer {
@@ -1369,6 +1396,22 @@ fn go_type_skeleton(code_unit: &CodeUnit, skeleton: String) -> String {
 }
 
 impl LanguageSupport for GoSupport {
+    fn modeled_external_package_identity(
+        &self,
+        overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+        import_path: &str,
+    ) -> Option<ModeledExternalPackageIdentity> {
+        let identity = package_identity::GoOverlayPackages::new(Some(overlay))
+            .modeled_package_identity(import_path)?;
+        Some(ModeledExternalPackageIdentity {
+            package_name: identity.package_name,
+            symbol_id: identity.symbol_id,
+            pack_id: identity.pack_id,
+            pack_digest: identity.pack_digest,
+            record_id: identity.record_id,
+        })
+    }
+
     fn materialize_callable_factory(
         &self,
         oracle: &crate::analyzer::semantic::WorkspaceSemanticOracle<'_>,

@@ -115,6 +115,7 @@ fn activate_go_context_with(workspace: &WorkspaceAnalyzer, config: &AnalyzerConf
         config,
         &[DependencyPackEcosystem::Go],
         DependencyPackWorkspaceContext {
+            activation_receipt: None,
             catalog: &catalog,
             persistence: None,
             activation: &activation,
@@ -1047,6 +1048,9 @@ fn a_body_edit_derives_one_unit_and_stops_at_the_output_digest() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#4994: retained summary statistics let Go reverse completeness scan source imports"
+)]
 fn go_unit_summary_readers_seek_in_both_statistics_states() {
     use super::super::planner_statistics::pinned_plans::{explain_pin, pinned};
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;

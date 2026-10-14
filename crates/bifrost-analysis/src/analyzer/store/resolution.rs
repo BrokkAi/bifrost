@@ -348,13 +348,13 @@ macro_rules! resolution_bundle_families {
             definition_unit_crosswalks => ("definition_unit_crosswalks", "resolution_definition_unit_crosswalks", "expected_definition_unit_crosswalk_count", "definition_semantic_key, unit_key, identity_digest", 3, 1),
             declaration_visibility_properties => ("declaration_visibility_properties", "resolution_declaration_visibility_properties", "expected_declaration_visibility_property_count", "definition_semantic_key, visibility", 2, 1),
             member_scope_properties => ("member_scope_properties", "resolution_member_scope_properties", "expected_member_scope_property_count", "definition_semantic_key, scope_head_node_key", 2, 1),
-            member_owner_properties => ("member_owner_properties", "resolution_member_owner_properties", "expected_member_owner_property_count", "definition_semantic_key, owner_definition_semantic_key, owner_scope_head_node_key, member_kind, member_access, qualifier_compatibility", 6, 6),
+            member_owner_properties => ("member_owner_properties", "resolution_member_owner_properties", "expected_member_owner_property_count", "definition_semantic_key, owner_definition_semantic_key, owner_scope_head_node_key, member_name, member_kind, member_access, qualifier_compatibility", 7, 7),
             trait_implementations => ("trait_implementations", "resolution_trait_implementations", "expected_trait_implementation_count", "relation_key, side, position, segment, terminal_spelling, impl_site, impl_start_byte, impl_end_byte", 8, 3),
             typed_fact_lookups => ("typed_fact_lookups", "resolution_typed_fact_lookups", "expected_typed_fact_lookup_count", "relation, identity_id", 2, 2),
             call_argument_lists => ("call_argument_lists", "resolution_call_argument_lists", "expected_call_argument_list_count", "call_site, list_ordinal", 2, 2),
             call_arguments => ("call_arguments", "resolution_call_arguments", "expected_call_argument_count", "call_site, list_ordinal, ordinal, value_semantic_key, label", 5, 3),
             named_argument_labels => ("named_argument_labels", "resolution_named_argument_labels", "expected_named_argument_label_count", "call_site, reference_site, label", 3, 2),
-            callable_parameter_lists => ("callable_parameter_lists", "resolution_callable_parameter_lists", "expected_callable_parameter_list_count", "callable_site, list_ordinal", 2, 2),
+            callable_parameter_lists => ("callable_parameter_lists", "resolution_callable_parameter_lists", "expected_callable_parameter_list_count", "callable_site, list_ordinal, contextual", 3, 2),
             callable_parameter_semantics => ("callable_parameter_semantics", "resolution_callable_parameter_semantics", "expected_callable_parameter_semantics_count", "callable_site, parameter_site, list_ordinal, ordinal, label, has_default", 6, 3),
             extension_receivers => ("extension_receivers", "resolution_extension_receivers", "expected_extension_receiver_count", "callable_site, receiver_type_semantic_key", 2, 1),
             import_selectors => ("import_selectors", "resolution_import_selectors", "expected_import_selector_count", "site, kind, source_name, local_name", 4, 1),
@@ -752,20 +752,25 @@ pub(super) const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
 /// whose source facts are unchanged.
 pub(crate) const fn resolution_bundle_epoch(language: Language) -> &'static str {
     match language {
-        Language::Java => "resolution-bundle-java-v38-jvm-batch-3-merge-2026-10",
-        Language::Go => "resolution-bundle-go-v51",
-        Language::Cpp => "resolution-bundle-cpp-v20",
-        Language::JavaScript => "resolution-bundle-javascript-v19",
-        Language::TypeScript => "resolution-bundle-typescript-v19",
-        Language::Python => "resolution-bundle-python-v19",
+        Language::Java => "resolution-bundle-java-v39-logical-member-names-2026-10",
+        Language::Go => "resolution-bundle-go-v53-logical-member-names-2026-10",
+        Language::Cpp => "resolution-bundle-cpp-v21-logical-member-names-2026-10",
+        Language::JavaScript => "resolution-bundle-javascript-v20-logical-member-names-2026-10",
+        Language::TypeScript => "resolution-bundle-typescript-v20-logical-member-names-2026-10",
+        Language::Python => "resolution-bundle-python-v20-logical-member-names-2026-10",
         // Macro-head references are already indexed at their invocation sites;
         // do not add the macro name as a candidate from its own argument gap.
-        Language::Rust => "resolution-bundle-rust-v98",
-        Language::Php => "resolution-bundle-php-v19",
-        Language::Scala => "resolution-bundle-scala-v55-jvm-batch-3-merge-2026-10",
-        Language::CSharp => "resolution-bundle-csharp-v19",
-        Language::Ruby => "resolution-bundle-ruby-v19",
-        Language::Kotlin => "resolution-bundle-kotlin-v39-jvm-batch-3-merge-2026-10",
+        Language::Rust => "resolution-bundle-rust-v99-logical-member-names-2026-10",
+        Language::Php => "resolution-bundle-php-v20-logical-member-names-2026-10",
+        // Self-type edges and aliases extend Scala's explicit-instantiation
+        // bundle; synthesized companions for case classes add singleton-relation
+        // rows.
+        Language::Scala => {
+            "resolution-bundle-scala-v61-synthesized-companions-and-logical-members-2026-10"
+        }
+        Language::CSharp => "resolution-bundle-csharp-v20-logical-member-names-2026-10",
+        Language::Ruby => "resolution-bundle-ruby-v20-logical-member-names-2026-10",
+        Language::Kotlin => "resolution-bundle-kotlin-v40-logical-member-names-2026-10",
         Language::None => panic!("a resolution bundle needs an analyzable language"),
     }
 }
@@ -956,7 +961,7 @@ impl AnalyzerStore {
         assert!(!storage_language.is_empty());
         let storage_language = storage_language.to_owned();
         let producer_epoch = resolution_bundle_epoch(semantic_language);
-        self.conn.execute(move |conn| {
+        self.execute_selection_publication(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let previous = tx
                 .query_row(

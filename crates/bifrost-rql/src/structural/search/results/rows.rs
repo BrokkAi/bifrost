@@ -1939,9 +1939,8 @@ detailed_row_domains! {
         display_range: |value| Some(value.range),
         identities: None,
         // Issue #2438, completed by #2499. The surface carries every column
-        // the relation was specified with, including `conversion`, which no
-        // language adapter publishes yet: a language that gains the fact
-        // adds a value, not a column.
+        // the relation was specified with. Language adapters publish bounded
+        // conversion proofs through the shared closed enum registry.
         fields: [
                     CodeQueryRowField::required("id", Scalar::StableId),
                     CodeQueryRowField::required("site_id", Scalar::StableId),

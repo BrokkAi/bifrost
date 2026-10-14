@@ -75,9 +75,9 @@ use crate::resolved::ResolvedEndpointIdentity;
 use crate::taint_policy::{
     BoundExternalModel, CallResolutionDiscoveryEvidence, CompiledTaintEndpoint,
     DiscoveryMaterializationCache, ExternalCallSeams, FrontierEndpoint, FrontierEndpointBinder,
-    FrontierSelector, PolicyDiscoveryProvider, TaintPolicyCompileError, UnjudgedSource,
-    exact_python_external_resolution_calls, exact_rust_builtin_macro_resolution_calls,
-    rust_format_result_identity, rust_std_builtin_model,
+    FrontierSelector, PolicyDiscoveryProvider, RefusalNotice, TaintPolicyCompileError,
+    UnjudgedSource, exact_python_external_resolution_calls,
+    exact_rust_builtin_macro_resolution_calls, rust_format_result_identity, rust_std_builtin_model,
 };
 use crate::units::WidenReason;
 
@@ -191,7 +191,7 @@ struct FrontierMatch {
     by_procedure: HashMap<DurableProcedureKey, Vec<FrontierEndpoint>>,
     gaps: Vec<String>,
     /// Per-row refusals must survive an earlier first-cause diagnostic.
-    refusals: Vec<String>,
+    refusals: Vec<RefusalNotice>,
 }
 
 /// One unsliceable selector's workspace-wide rows by file, and the reasons
@@ -355,7 +355,7 @@ impl<'a> PolicyCompositionProvider<'a> {
     /// Every refused frontier row of this policy, including cached matches
     /// served by earlier batches. The run retains them independently of its
     /// first path-relevant incompleteness (#4919).
-    pub(crate) fn refusal_messages(&self) -> Vec<String> {
+    pub(crate) fn refusal_messages(&self) -> Vec<RefusalNotice> {
         let mut messages = self
             .memo
             .matches
@@ -364,8 +364,8 @@ impl<'a> PolicyCompositionProvider<'a> {
             .filter(|((policy, _, _), _)| policy == &self.policy)
             .flat_map(|(_, matched)| matched.refusals.iter().cloned())
             .collect::<Vec<_>>();
-        messages.sort();
-        messages.dedup();
+        messages.sort_by(|left, right| left.message.cmp(&right.message));
+        messages.dedup_by(|left, right| left.message == right.message);
         messages
     }
 
@@ -806,6 +806,7 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
         {
             completeness = incomplete("no certified reverse inventory");
         }
+        self.discovery.prefetch_callers(&sites.sites, request)?;
         let target_key = handle.durable_key();
         let mut calls = Vec::new();
         let mut seen = HashSet::new();
@@ -882,11 +883,13 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
     }
 
     fn authored_models(&self) -> Vec<Box<[AuthoredArmClosure]>> {
-        self.models
-            .borrow()
-            .values()
-            .filter_map(|model| model.as_ref()?.authored.clone())
-            .collect()
+        let models = self.models.borrow();
+        let mut authored = models
+            .iter()
+            .filter_map(|(call, model)| Some((call, model.as_ref()?.authored.clone()?)))
+            .collect::<Vec<_>>();
+        authored.sort_unstable_by_key(|(call, _)| *call);
+        authored.into_iter().map(|(_, closures)| closures).collect()
     }
 
     fn unmodeled_call_behavior(&self) -> UnmodeledCallBehavior {

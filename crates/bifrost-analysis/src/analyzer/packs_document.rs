@@ -574,6 +574,8 @@ pub struct WorkspacePacksActivation {
 /// catalog stays machine-local infrastructure beneath the head workspace.
 #[derive(Debug, Clone, Copy)]
 pub struct WorkspaceActivationSources<'a> {
+    /// Optional request-lifetime diagnostic stream, excluded from persistent state.
+    pub activation_receipt: Option<&'a super::semantic_model::ActivationReceipt>,
     /// The root a document-configured catalog path resolves beneath.
     pub catalog_root: &'a Path,
     /// The root `.bifrost/semantic-models/` is discovered beneath. `None`
@@ -644,6 +646,7 @@ pub fn activate_workspace_packs(
         workspace,
         analyzer_config,
         WorkspaceActivationSources {
+            activation_receipt: None,
             catalog_root: workspace_root,
             workspace_model_root: None,
             config: Some(config),
@@ -823,6 +826,7 @@ pub fn activate_workspace_semantic_sources_in_catalog(
         &activation_config_with_source_toolchains(workspace, analyzer_config, sources.config),
         &ecosystems,
         DependencyPackWorkspaceContext {
+            activation_receipt: sources.activation_receipt,
             catalog,
             persistence: None,
             activation: &activation,
@@ -878,6 +882,7 @@ pub fn activate_installed_workspace_semantic_sources_in_catalog(
         &activation_config_with_source_toolchains(workspace, analyzer_config, sources.config),
         &ecosystems,
         DependencyPackWorkspaceContext {
+            activation_receipt: sources.activation_receipt,
             catalog,
             persistence: None,
             activation: &activation,
@@ -1272,6 +1277,7 @@ mod tests {
             &workspace,
             &config,
             WorkspaceActivationSources {
+                activation_receipt: None,
                 catalog_root: project.root(),
                 workspace_model_root: None,
                 config: None,
@@ -1416,6 +1422,7 @@ mod tests {
             workspace,
             &AnalyzerConfig::default(),
             WorkspaceActivationSources {
+                activation_receipt: None,
                 catalog_root: workspace_root,
                 workspace_model_root: None,
                 config: None,
@@ -1479,6 +1486,7 @@ mod tests {
                 &workspace,
                 &AnalyzerConfig::default(),
                 WorkspaceActivationSources {
+                    activation_receipt: None,
                     catalog_root: temp.path(),
                     workspace_model_root: None,
                     config: Some(&config),

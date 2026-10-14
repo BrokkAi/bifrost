@@ -1,0 +1,41 @@
+{
+  "created_at": "<TIMESTAMP>",
+  "engine": {
+    "build_identity": "fixture-build",
+    "executable_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version": "9.9.0"
+  },
+  "failure": {
+    "class": "integrity",
+    "message": "newest otherwise-complete candidate 1.0.0 failed integrity qualification",
+    "retryable": false
+  },
+  "inventory": {
+    "fetched_at": "<TIMESTAMP>",
+    "fetched_online": true,
+    "index_sha256": "af110ef414c2eb817e9874f491070eb9fb64eed3cccc8ca8bc4e0b7367ad9109"
+  },
+  "outcome_schema_version": 1,
+  "rejections": [
+    {
+      "detail": "a selected release declares failed integrity qualification",
+      "pack_id": "bifrost.public.rules",
+      "reason": "qualification-integrity-failed",
+      "release_version": "1.0.0",
+      "tag": "rules/v1.0.0"
+    }
+  ],
+  "request": {
+    "dependencies": [],
+    "pack_id": "bifrost.public.rules",
+    "repository": "https://github.com/BrokkAi/bifrost-packs",
+    "request_schema_version": 1,
+    "selection": {
+      "allowed_versions": "*",
+      "channel": "stable",
+      "mode": "preferred"
+    }
+  },
+  "selection": null,
+  "status": "failed"
+}

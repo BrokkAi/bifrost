@@ -31,6 +31,7 @@ pub(crate) struct SelectedNativeReferenceUnits {
     pub(crate) answer: FactResolutionAnswer,
     pub(crate) definitions: SelectedNativeDefinitions,
     pub(crate) external_members: Vec<ProjectedNativeExternalMember>,
+    pub(crate) direct_target: Option<NativeExternalMemberTarget>,
     pub(crate) named_argument: Option<SelectedNativeNamedArgument>,
     pub(crate) predeclared_go_symbol: bool,
     pub(crate) callable_applicability_candidates: Vec<(SemanticId, CodeUnit)>,
@@ -66,15 +67,37 @@ pub(crate) enum SelectedNativeTypes {
     Ready {
         nominal: Vec<(SemanticId, SelectedNativeDefinition)>,
         intrinsic: Box<[crate::analyzer::resolution::FactIntrinsicTypeDescriptor]>,
+        external_owners: Vec<(
+            SemanticId,
+            crate::analyzer::resolution::ExternalOwnerIdentity,
+        )>,
     },
     Unavailable,
     Cancelled,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NativeExternalMemberTarget {
+    Indexed(crate::analyzer::resolution::ExternalMemberIdentity),
+    Unindexed {
+        provider_path: std::sync::Arc<str>,
+        provider_package_id: Option<i64>,
+        member_name: String,
+    },
+}
+
 pub(crate) struct SelectedNativeReferenceTypes {
     pub(crate) named_reasons: Vec<(&'static str, String)>,
     pub(crate) answer: FactResolutionAnswer,
-    pub(crate) types: SelectedNativeTypes,
+    pub(crate) value_types: SelectedNativeTypes,
+    /// A whole expression selects its exact value slot independently of the
+    /// binding projections that its callee reference happens to publish.
+    pub(crate) query_result_slot: Option<SemanticId>,
+    /// Direct external-member evidence from the same selected answer, with
+    /// indexed identities distinguished from unknown provider frontiers.
+    /// Keeping this beside the projected expression type prevents consumers
+    /// from trying to join mount-local semantic IDs from separate operations.
+    pub(crate) direct_target: Option<NativeExternalMemberTarget>,
 }
 
 type NativeReferenceUnitsOutcome =
@@ -103,6 +126,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 go_demand: None,
                 selected_import_gap: None,
                 go_receiver_overlay: None,
+                query_result_slot: None,
                 point_metrics: None,
             },
             |ready, operation, _, answer| {
@@ -114,9 +138,12 @@ impl SelectedResolutionOperation<'_, '_> {
                     &session,
                 )?;
                 let named_reasons = named_reason_details(ready, answer.completion())?;
+                let direct_target = selected_external_member_target(ready, &answer, cancellation)?;
                 Ok(SelectedNativeReferenceTypes {
                     answer,
-                    types,
+                    value_types: types,
+                    query_result_slot: None,
+                    direct_target,
                     named_reasons,
                 })
             },
@@ -128,6 +155,7 @@ impl SelectedResolutionOperation<'_, '_> {
     pub(crate) fn resolve_native_reference_types_bounded_for_go_request(
         &mut self,
         prepared: super::GoPreparedImportContext,
+        query_result_slot: Option<SemanticId>,
         go_receiver_overlay: Option<crate::analyzer::resolution::GoReceiverSlotTypeOverlay>,
         locator: &SelectedSemanticLocator,
         budget: ReceiverAnalysisBudget,
@@ -148,6 +176,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 go_demand: Some(prepared.demand),
                 selected_import_gap: None,
                 go_receiver_overlay,
+                query_result_slot,
                 point_metrics: Some(point_metrics),
             },
             |ready, operation, _, answer| {
@@ -159,9 +188,12 @@ impl SelectedResolutionOperation<'_, '_> {
                     &session,
                 )?;
                 let named_reasons = named_reason_details(ready, answer.completion())?;
+                let direct_target = selected_external_member_target(ready, &answer, cancellation)?;
                 Ok(SelectedNativeReferenceTypes {
                     answer,
-                    types,
+                    value_types: types,
+                    query_result_slot,
+                    direct_target,
                     named_reasons,
                 })
             },
@@ -186,6 +218,7 @@ impl SelectedResolutionOperation<'_, '_> {
             go_demand: None,
             selected_import_gap: None,
             go_receiver_overlay: None,
+            query_result_slot: None,
             point_metrics: None,
         })
     }
@@ -229,6 +262,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 go_demand: None,
                 selected_import_gap,
                 go_receiver_overlay: None,
+                query_result_slot: None,
                 point_metrics: None,
             })?;
         Ok(session.finish(outcome))
@@ -258,6 +292,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 go_demand: Some(prepared.demand),
                 selected_import_gap: None,
                 go_receiver_overlay,
+                query_result_slot: None,
                 point_metrics: Some(point_metrics),
             })?;
         Ok(session.finish(outcome))
@@ -277,6 +312,7 @@ impl SelectedResolutionOperation<'_, '_> {
             go_demand,
             selected_import_gap,
             go_receiver_overlay,
+            query_result_slot,
             point_metrics,
         } = query;
         self.resolve_reference_with_projection(
@@ -290,6 +326,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 go_demand,
                 selected_import_gap,
                 go_receiver_overlay,
+                query_result_slot,
                 point_metrics,
             },
             |ready, operation, reference, answer| {
@@ -378,10 +415,12 @@ impl SelectedResolutionOperation<'_, '_> {
                     cancellation,
                     session,
                 )?;
+                let direct_target = selected_external_member_target(ready, &answer, cancellation)?;
                 Ok(SelectedNativeReferenceUnits {
                     answer,
                     definitions,
                     external_members,
+                    direct_target,
                     named_argument,
                     predeclared_go_symbol,
                     callable_applicability_candidates,
@@ -392,6 +431,55 @@ impl SelectedResolutionOperation<'_, '_> {
             },
         )
     }
+}
+
+fn selected_external_member_target(
+    ready: &ReadySelectedResolution<'_, '_>,
+    answer: &FactResolutionAnswer,
+    cancellation: &CancellationToken,
+) -> Result<Option<NativeExternalMemberTarget>> {
+    if let [target] = answer.binding().targets()
+        && let Some((owner, ordinal)) = ready.context_identities.external_member_identity(*target)
+    {
+        return Ok(Some(NativeExternalMemberTarget::Indexed(
+            crate::analyzer::resolution::ExternalMemberIdentity { owner, ordinal },
+        )));
+    }
+    let frontiers = answer
+        .projected_frontiers()
+        .iter()
+        .flat_map(|state| state.unindexed_external())
+        .collect::<BTreeSet<_>>();
+    let mut frontiers = frontiers.into_iter();
+    let Some(frontier) = frontiers.next() else {
+        return Ok(None);
+    };
+    if frontiers.next().is_some() {
+        return Ok(None);
+    }
+    let Some((fragment, lookup)) = frontier.member else {
+        return Ok(None);
+    };
+    let SelectedLookupRecipeReadOutcome::Ready(recipes) =
+        ready.lexical_source().lookup_semantic_recipes(
+            &[SelectedLookupRecipeRequest {
+                fragment,
+                semantic: lookup,
+            }],
+            cancellation,
+            None,
+        )?
+    else {
+        return Ok(None);
+    };
+    let recipe = recipes.into_iter().next().flatten().ok_or_else(|| {
+        StoreError::corrupt("unindexed external member has no structured lookup recipe")
+    })?;
+    Ok(Some(NativeExternalMemberTarget::Unindexed {
+        provider_path: frontier.provider_path.clone(),
+        provider_package_id: frontier.provider_package_id,
+        member_name: recipe.spelling().to_owned(),
+    }))
 }
 
 fn resolve_named_argument_parameter(
@@ -502,6 +590,12 @@ fn project_native_reference_types(
             }
         }
     }
+    if let Some(identity) = answer.observed_type_identity() {
+        if !session.scope_step() {
+            return Ok(SelectedNativeTypes::Cancelled);
+        }
+        identities.insert(identity);
+    }
     let identities = identities.into_iter().collect::<Vec<_>>();
     let Some(intrinsic) = operation.read_intrinsic_type_descriptors(&identities)? else {
         return Ok(SelectedNativeTypes::Cancelled);
@@ -510,15 +604,32 @@ fn project_native_reference_types(
         .iter()
         .map(|descriptor| descriptor.identity())
         .collect::<BTreeSet<_>>();
+    let external_owners = identities
+        .iter()
+        .filter_map(|&identity| {
+            ready
+                .context_identities
+                .external_owner_identity(identity)
+                .map(|owner| (identity, owner))
+        })
+        .collect::<Vec<_>>();
+    let external_identities = external_owners
+        .iter()
+        .map(|(identity, _)| *identity)
+        .collect::<BTreeSet<_>>();
     let nominal = identities
         .into_iter()
-        .filter(|identity| !intrinsic_identities.contains(identity))
+        .filter(|identity| {
+            !intrinsic_identities.contains(identity) && !external_identities.contains(identity)
+        })
         .collect::<Vec<_>>();
     Ok(
         match project_native_definition_units(ready, &nominal, cancellation, session)? {
-            SelectedNativeDefinitions::Ready(nominal) => {
-                SelectedNativeTypes::Ready { nominal, intrinsic }
-            }
+            SelectedNativeDefinitions::Ready(nominal) => SelectedNativeTypes::Ready {
+                nominal,
+                intrinsic,
+                external_owners,
+            },
             SelectedNativeDefinitions::Unavailable => SelectedNativeTypes::Unavailable,
             SelectedNativeDefinitions::Cancelled => SelectedNativeTypes::Cancelled,
         },

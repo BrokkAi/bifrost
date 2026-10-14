@@ -208,9 +208,10 @@ const TYPED_FAMILIES: &[TypedFamily] = &[
     TypedFamily {
         name: "member_owners",
         semantics: &["definition", "owner_definition"],
-        columns: "owner_scope_head_node INTEGER NOT NULL CHECK(owner_scope_head_node>=0), member_kind TEXT NOT NULL, member_access TEXT NOT NULL, qualifier_compatibility TEXT NOT NULL",
+        columns: "owner_scope_head_node INTEGER NOT NULL CHECK(owner_scope_head_node>=0), member_name TEXT NOT NULL, member_kind TEXT NOT NULL, member_access TEXT NOT NULL, qualifier_compatibility TEXT NOT NULL",
         unique: &[&[
             "definition",
+            "member_name",
             "member_kind",
             "member_access",
             "qualifier_compatibility",

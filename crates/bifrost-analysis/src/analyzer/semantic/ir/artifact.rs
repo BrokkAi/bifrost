@@ -10,8 +10,9 @@ use crate::hash::{HashMap, HashSet};
 use super::super::capabilities::SemanticCapabilities;
 use super::super::ids::{
     AllocationId, BlockId, CallSiteId, CaptureId, ControlEdgeId, EvidenceId, GuardId,
-    LengthDelimitedDigest, MemoryLocationId, ProcedureId, ProgramPointId, SemanticArtifactKey,
-    SemanticGapId, SemanticLocator, SourceMappingId, StableDigest, SwitchFactId, ValueId,
+    MemoryLocationId, ProcedureId, ProgramPointId, SemanticArtifactKey,
+    SemanticDigestHasher as MaterializationFingerprintHasher, SemanticGapId, SemanticLocator,
+    SourceMappingId, StableDigest, SwitchFactId, ValueId,
 };
 use super::super::provider::{SemanticBudget, SemanticBudgetExceeded, SemanticWork};
 use super::model::*;
@@ -522,79 +523,6 @@ pub struct SemanticArtifactMaterializationId(StableDigest);
 impl fmt::Display for SemanticArtifactMaterializationId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
-    }
-}
-
-struct MaterializationFingerprintHasher(LengthDelimitedDigest);
-
-impl MaterializationFingerprintHasher {
-    fn new(domain: &[u8]) -> Self {
-        Self(LengthDelimitedDigest::new(domain))
-    }
-
-    fn finish_digest(self) -> StableDigest {
-        self.0.finish()
-    }
-}
-
-impl Hasher for MaterializationFingerprintHasher {
-    fn finish(&self) -> u64 {
-        let digest = self.0.clone().finish();
-        let mut head = [0_u8; 8];
-        head.copy_from_slice(&digest.as_bytes()[..8]);
-        u64::from_le_bytes(head)
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        self.0.push(bytes);
-    }
-
-    fn write_u8(&mut self, value: u8) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_u16(&mut self, value: u16) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_u32(&mut self, value: u32) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_u128(&mut self, value: u128) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_usize(&mut self, value: usize) {
-        self.write_u64(u64::try_from(value).expect("usize fits u64 on supported targets"));
-    }
-
-    fn write_i8(&mut self, value: i8) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_i16(&mut self, value: i16) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_i32(&mut self, value: i32) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_i64(&mut self, value: i64) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_i128(&mut self, value: i128) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_isize(&mut self, value: isize) {
-        self.write_i64(i64::try_from(value).expect("isize fits i64 on supported targets"));
     }
 }
 

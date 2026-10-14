@@ -230,9 +230,10 @@ pub struct CallBindingRow {
     /// "conversion/coercion fact when established").
     ///
     /// Projected only through an exact join to [`CallBindingReport::conversion_facts`].
-    /// Java and TypeScript publish bounded structured proofs; missing types,
-    /// signature applicability or adapter capability leave this value absent.
-    /// Conversion completeness is independent of actual/formal mapping.
+    /// Language adapters publish bounded structured proofs. C# numeric widening
+    /// proves only its exact `char -> int32` pair. Missing types, signature
+    /// applicability or adapter capability leave this value absent. Conversion
+    /// completeness is independent of actual/formal mapping.
     pub conversion: Option<String>,
     /// Missing conversion evidence, projected through the same exact join as its label.
     pub conversion_reason: Option<super::call_conversion::ConversionUnknown>,

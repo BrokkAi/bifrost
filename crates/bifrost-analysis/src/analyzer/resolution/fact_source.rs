@@ -1108,7 +1108,7 @@ impl SelectedTypedRow<CompanionTypeRelation> {
 }
 
 impl SelectedTypedRow<LoweredMemberOwnerProperty> {
-    pub const fn natural_identity(
+    pub fn natural_identity(
         &self,
     ) -> (
         SelectedTypedRowKey,
@@ -1589,6 +1589,18 @@ pub trait SelectedTypedFactSource {
     /// own selection metadata, a source follows the Java selection answer.
     fn selection_has_jvm_semantics(&self) -> bool {
         self.selection_has_java_semantics()
+    }
+
+    /// Exact selected external callable result types keyed by their external
+    /// member identities. Results are present only for named types whose owner
+    /// has one identity in the selected provider set; unresolved and
+    /// non-nominal signatures remain absent.
+    fn external_callable_result_type_identities(
+        &self,
+        _definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(SemanticId, SemanticId)>>> {
+        Ok((!cancellation.is_cancelled()).then(Vec::new))
     }
 
     /// Whether a type-object qualifier written in `fragment` also searches its

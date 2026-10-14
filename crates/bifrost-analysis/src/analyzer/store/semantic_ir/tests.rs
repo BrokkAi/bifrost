@@ -337,14 +337,6 @@ fn print_report(report: &RoundTripReport) {
     }
 }
 
-#[test]
-fn semantic_ir_rows_round_trip_every_rust_fixture() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
-    let report = round_trip_tree(&root, 1);
-    print_report(&report);
-    assert!(report.round_tripped > 0, "{report:?}");
-}
-
 /// Runs on every available CPU; `.config/nextest.toml` reserves them.
 #[test]
 #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]

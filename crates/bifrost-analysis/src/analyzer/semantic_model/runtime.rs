@@ -49,8 +49,12 @@ use brokk_bifrost_core::util::elapsed_ns;
 /// variadic summary-formal binding; version 10 retains independently accepted
 /// review receipts in the active proof identity.
 pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 10;
+pub(crate) const ACTIVE_MODEL_SET_HASH_DOMAIN: &str = "bifrost.semantic-model.active-set.v3\0";
+pub(crate) const PYTHON_ACTIVE_MODEL_SET_HASH_DOMAIN: &str =
+    "bifrost.python-runtime-active-set.v1\0";
 
-type DependencyEvidencePublication = (Box<[Language]>, super::DependencyDiscoveryEvidence);
+pub(crate) type DependencyEvidencePublication =
+    (Box<[Language]>, super::DependencyDiscoveryEvidence);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SemanticModelActivationEvidence {
@@ -323,8 +327,8 @@ pub struct ActiveSemanticModelShard {
     /// Explicit authorization retained from the activation control decision.
     /// This is distinct from the pack payload's review requirement flag.
     pub review_accepted: bool,
-    evidence_rank: EvidenceRank,
-    source_rank: u8,
+    pub(crate) evidence_rank: EvidenceRank,
+    pub(crate) source_rank: u8,
 }
 
 impl ActiveSemanticModelShard {
@@ -3069,11 +3073,22 @@ impl SemanticModelRuntimeCache {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum EvidenceRank {
+pub(crate) enum EvidenceRank {
     Language,
     NamedCoordinate,
     VersionedCoordinate,
     ExactArtifact,
+}
+
+impl EvidenceRank {
+    pub(crate) const fn receipt_label(self) -> &'static str {
+        match self {
+            Self::Language => "language",
+            Self::NamedCoordinate => "named_coordinate",
+            Self::VersionedCoordinate => "versioned_coordinate",
+            Self::ExactArtifact => "exact_artifact",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3093,6 +3108,29 @@ pub fn resolve_active_semantic_models(
     request: &SemanticModelActivationRequest,
     cancellation: &CancellationToken,
 ) -> SemanticModelResolutionOutcome {
+    resolve_active_semantic_models_observed(catalog, request, cancellation, None)
+}
+
+pub(crate) fn resolve_active_semantic_models_observed(
+    catalog: &SemanticPackCatalog,
+    request: &SemanticModelActivationRequest,
+    cancellation: &CancellationToken,
+    mut observer: Option<&mut super::ActivationFrame<'_>>,
+) -> SemanticModelResolutionOutcome {
+    let outcome =
+        resolve_active_semantic_models_inner(catalog, request, cancellation, &mut observer);
+    if let Some(frame) = observer.as_mut() {
+        (**frame).record_resolution_outcome(&outcome);
+    }
+    outcome
+}
+
+fn resolve_active_semantic_models_inner(
+    catalog: &SemanticPackCatalog,
+    request: &SemanticModelActivationRequest,
+    cancellation: &CancellationToken,
+    observer: &mut Option<&mut super::ActivationFrame<'_>>,
+) -> SemanticModelResolutionOutcome {
     let _scope = crate::profiling::scope("semantic_pack.resolve_active");
     let mut report = SemanticModelActivationReport::default();
     let activation_sql_start = catalog.sql_statement_count();
@@ -3104,19 +3142,37 @@ pub fn resolve_active_semantic_models(
             return SemanticModelResolutionOutcome::Unavailable(report);
         }
     };
+    if let Some(frame) = observer.as_mut() {
+        (**frame).record_effective_evidence(&evidence);
+    }
     if cancellation.is_cancelled() {
+        if let Some(frame) = observer.as_mut() {
+            (**frame).set_candidate_phase(super::CandidatePhaseCoverage::Cancelled);
+        }
         return SemanticModelResolutionOutcome::Cancelled(report);
     }
 
     let mut candidates = BTreeMap::new();
+    if let Some(frame) = observer.as_mut() {
+        (**frame).set_candidate_phase(super::CandidatePhaseCoverage::InProgress);
+    }
     for row in &evidence {
         if cancellation.is_cancelled() {
+            if let Some(frame) = observer.as_mut() {
+                (**frame).set_candidate_phase(super::CandidatePhaseCoverage::Cancelled);
+            }
             return SemanticModelResolutionOutcome::Cancelled(report);
         }
         let query = evidence_query(row, request.bifrost_version.clone());
+        let query_index = observer.as_mut().map(|frame| {
+            (**frame).record_candidate_query(super::CandidateQuerySource::Evidence, &query)
+        });
         let discovered = match catalog.candidates(&query) {
             Ok(discovered) => discovered,
             Err(error) => {
+                if let Some(frame) = observer.as_mut() {
+                    (**frame).set_candidate_phase(super::CandidatePhaseCoverage::PartialFailure);
+                }
                 push_request_explanation(
                     &mut report,
                     request.limits,
@@ -3132,8 +3188,15 @@ pub fn resolve_active_semantic_models(
                 candidate.source_kind(),
                 candidate.source_id().to_owned(),
             );
+            if let (Some(frame), Some(query_index)) = (observer.as_mut(), query_index) {
+                let inserted = !candidates.contains_key(&key);
+                (**frame).record_candidate_seen(query_index, &candidate, inserted);
+            }
             candidates.entry(key).or_insert(candidate);
             if candidates.len() > request.limits.max_catalog_candidates {
+                if let Some(frame) = observer.as_mut() {
+                    (**frame).set_candidate_phase(super::CandidatePhaseCoverage::PartialBudgetStop);
+                }
                 push_request_explanation(
                     &mut report,
                     request.limits,
@@ -3156,6 +3219,9 @@ pub fn resolve_active_semantic_models(
     language_ecosystems.dedup();
     for (language, ecosystem) in language_ecosystems {
         if cancellation.is_cancelled() {
+            if let Some(frame) = observer.as_mut() {
+                (**frame).set_candidate_phase(super::CandidatePhaseCoverage::Cancelled);
+            }
             return SemanticModelResolutionOutcome::Cancelled(report);
         }
         let query = SemanticPackSelectorQuery {
@@ -3169,12 +3235,18 @@ pub fn resolve_active_semantic_models(
             artifact_sha256: None,
             bifrost_version: request.bifrost_version.clone(),
         };
+        let query_index = observer.as_mut().map(|frame| {
+            (**frame).record_candidate_query(super::CandidateQuerySource::LanguageEcosystem, &query)
+        });
         let discovered = match catalog.candidates_bounded(
             &query,
             request.limits.max_catalog_candidates.saturating_add(1),
         ) {
             Ok(discovered) => discovered,
             Err(error) => {
+                if let Some(frame) = observer.as_mut() {
+                    (**frame).set_candidate_phase(super::CandidatePhaseCoverage::PartialFailure);
+                }
                 push_request_explanation(
                     &mut report,
                     request.limits,
@@ -3190,8 +3262,15 @@ pub fn resolve_active_semantic_models(
                 candidate.source_kind(),
                 candidate.source_id().to_owned(),
             );
+            if let (Some(frame), Some(query_index)) = (observer.as_mut(), query_index) {
+                let inserted = !candidates.contains_key(&key);
+                (**frame).record_candidate_seen(query_index, &candidate, inserted);
+            }
             candidates.entry(key).or_insert(candidate);
             if candidates.len() > request.limits.max_catalog_candidates {
+                if let Some(frame) = observer.as_mut() {
+                    (**frame).set_candidate_phase(super::CandidatePhaseCoverage::PartialBudgetStop);
+                }
                 push_request_explanation(
                     &mut report,
                     request.limits,
@@ -3204,17 +3283,33 @@ pub fn resolve_active_semantic_models(
     report.catalog_candidates = candidates.len();
     report.phase_measurements.selection_nanos = elapsed_ns(selection_started);
 
+    if let Some(frame) = observer.as_mut() {
+        (**frame).set_candidate_phase(super::CandidatePhaseCoverage::Complete);
+        for (ordinal, candidate) in candidates.values().enumerate() {
+            (**frame).record_candidate_union_member(ordinal as u64, candidate);
+        }
+        (**frame).set_load_phase(super::CandidatePhaseCoverage::InProgress);
+        (**frame).set_matching_phase(super::CandidatePhaseCoverage::InProgress);
+    }
+
     let mut selected = Vec::<CandidateSelection>::new();
     let mut incomplete = false;
     let mut decode_hydration_nanos = 0u64;
     for candidate in candidates.into_values() {
         if cancellation.is_cancelled() {
+            if let Some(frame) = observer.as_mut() {
+                (**frame).set_load_phase(super::CandidatePhaseCoverage::Cancelled);
+                (**frame).set_matching_phase(super::CandidatePhaseCoverage::Cancelled);
+            }
             return SemanticModelResolutionOutcome::Cancelled(report);
         }
         let load_started = Instant::now();
         let loaded = match catalog.load(&candidate) {
             Ok(loaded) => loaded,
             Err(miss) => {
+                if let Some(frame) = observer.as_mut() {
+                    (**frame).record_candidate_load(&candidate, Err(&miss));
+                }
                 incomplete = true;
                 push_explanation(
                     &mut report,
@@ -3232,6 +3327,9 @@ pub fn resolve_active_semantic_models(
                 continue;
             }
         };
+        if let Some(frame) = observer.as_mut() {
+            (**frame).record_candidate_load(&candidate, Ok(&loaded));
+        }
         decode_hydration_nanos = decode_hydration_nanos.saturating_add(elapsed_ns(load_started));
         report.loaded_shards = report.loaded_shards.saturating_add(1);
         report.loaded_records = report
@@ -3240,6 +3338,10 @@ pub fn resolve_active_semantic_models(
         if report.loaded_shards > request.limits.max_loaded_shards
             || report.loaded_records > request.limits.max_records
         {
+            if let Some(frame) = observer.as_mut() {
+                (**frame).set_load_phase(super::CandidatePhaseCoverage::PartialBudgetStop);
+                (**frame).set_matching_phase(super::CandidatePhaseCoverage::PartialBudgetStop);
+            }
             push_request_explanation(
                 &mut report,
                 request.limits,
@@ -3248,18 +3350,21 @@ pub fn resolve_active_semantic_models(
             return SemanticModelResolutionOutcome::Unavailable(report);
         }
 
-        let Some(StrictActivationMatch {
-            evidence_rank,
-            matched_evidence,
-            matching_evidence,
-            matched_requirements,
-        }) = strict_activation_match(
+        let Some(strict_match) = strict_activation_match(
             &loaded.manifest,
             &loaded.shard,
             &evidence,
             &request.bifrost_version,
-        )
-        else {
+        ) else {
+            if let Some(frame) = observer.as_mut() {
+                (**frame).record_candidate_decision(
+                    &candidate,
+                    super::CandidateDecisionStatus::StrictIncompatible,
+                    None,
+                    false,
+                    None,
+                );
+            }
             let reason =
                 strict_activation_mismatch_reason(&loaded.manifest, &loaded.shard, &evidence);
             push_loaded_explanation(
@@ -3274,6 +3379,15 @@ pub fn resolve_active_semantic_models(
         let control = match effective_control(&loaded.manifest, &request.controls) {
             Ok(control) => control,
             Err(reason) => {
+                if let Some(frame) = observer.as_mut() {
+                    (**frame).record_candidate_decision(
+                        &candidate,
+                        super::CandidateDecisionStatus::ControlConflict,
+                        None,
+                        false,
+                        Some(&strict_match),
+                    );
+                }
                 push_loaded_explanation(
                     &mut report,
                     request.limits,
@@ -3286,6 +3400,15 @@ pub fn resolve_active_semantic_models(
             }
         };
         if control == Some(SemanticModelControlAction::Disable) {
+            if let Some(frame) = observer.as_mut() {
+                (**frame).record_candidate_decision(
+                    &candidate,
+                    super::CandidateDecisionStatus::Disabled,
+                    control,
+                    false,
+                    Some(&strict_match),
+                );
+            }
             push_loaded_explanation(
                 &mut report,
                 request.limits,
@@ -3304,13 +3427,31 @@ pub fn resolve_active_semantic_models(
             // it. Coordinate-specific review gates remain visible because
             // their matching evidence proves that the pack is relevant to a
             // discovered dependency or toolchain.
-            if evidence_rank == EvidenceRank::Language
+            if strict_match.evidence_rank == EvidenceRank::Language
                 && matches!(
                     loaded.source_kind,
                     CatalogPackSourceKind::PreShipped | CatalogPackSourceKind::Embedded
                 )
             {
+                if let Some(frame) = observer.as_mut() {
+                    (**frame).record_candidate_decision(
+                        &candidate,
+                        super::CandidateDecisionStatus::DormantOptional,
+                        control,
+                        false,
+                        Some(&strict_match),
+                    );
+                }
                 continue;
+            }
+            if let Some(frame) = observer.as_mut() {
+                (**frame).record_candidate_decision(
+                    &candidate,
+                    super::CandidateDecisionStatus::ReviewRequired,
+                    control,
+                    false,
+                    Some(&strict_match),
+                );
             }
             push_loaded_explanation(
                 &mut report,
@@ -3333,24 +3474,37 @@ pub fn resolve_active_semantic_models(
                         .is_ok_and(|version| range.matches(&version))
                 })
         });
+        if let Some(frame) = observer.as_mut() {
+            (**frame).record_candidate_decision(
+                &candidate,
+                super::CandidateDecisionStatus::EligibleForPrecedence,
+                control,
+                review_accepted,
+                Some(&strict_match),
+            );
+        }
         selected.push(CandidateSelection {
             semantic_sha256: descriptor.semantic_sha256.clone(),
             payload_kind: descriptor.payload_kind,
-            evidence_rank,
-            matched_requirements,
+            evidence_rank: strict_match.evidence_rank,
+            matched_requirements: strict_match.matched_requirements,
             source_rank: loaded.source_kind.precedence(),
             active: ActiveSemanticModelShard {
                 manifest: loaded.manifest,
                 shard: loaded.shard,
                 source_kind: loaded.source_kind,
                 source_id: loaded.source_id,
-                matched_evidence,
-                matching_evidence,
+                matched_evidence: strict_match.matched_evidence,
+                matching_evidence: strict_match.matching_evidence,
                 review_accepted,
-                evidence_rank,
+                evidence_rank: strict_match.evidence_rank,
                 source_rank: loaded.source_kind.precedence(),
             },
         });
+    }
+    if let Some(frame) = observer.as_mut() {
+        (**frame).set_load_phase(super::CandidatePhaseCoverage::Complete);
+        (**frame).set_matching_phase(super::CandidatePhaseCoverage::Complete);
     }
 
     selected.sort_by(compare_selection);
@@ -3360,6 +3514,13 @@ pub fn resolve_active_semantic_models(
         let key = (selection.semantic_sha256.clone(), selection.payload_kind);
         if let Some(&winner) = by_semantic_shard.get(&key) {
             let active_winner: &CandidateSelection = &active[winner];
+            if let Some(frame) = observer.as_mut() {
+                (**frame).record_final_selection(
+                    &selection.active,
+                    super::FinalSelectionStatus::Shadowed,
+                    Some(&active_winner.active),
+                );
+            }
             push_explanation(
                 &mut report,
                 request.limits,
@@ -3379,6 +3540,13 @@ pub fn resolve_active_semantic_models(
             continue;
         }
         by_semantic_shard.insert(key, active.len());
+        if let Some(frame) = observer.as_mut() {
+            (**frame).record_final_selection(
+                &selection.active,
+                super::FinalSelectionStatus::Selected,
+                None,
+            );
+        }
         active.push(selection);
     }
     active.sort_by(|left, right| {
@@ -3454,10 +3622,30 @@ pub fn resolve_active_semantic_models(
         .collect::<BTreeMap<_, _>>();
     let mut extraction_gaps = Vec::new();
     let mut extraction_gap_counts = BTreeMap::new();
+    if let Some(frame) = observer.as_mut() {
+        (**frame).set_extraction_phase(super::CandidatePhaseCoverage::InProgress);
+    }
     for (manifest_digest, pack_id) in active_packs {
         let extraction = match catalog.extraction_accounting(&manifest_digest) {
-            Ok(extraction) => extraction,
+            Ok(extraction) => {
+                if let Some(frame) = observer.as_mut() {
+                    (**frame).record_extraction_accounting(
+                        &manifest_digest,
+                        &pack_id,
+                        extraction.as_ref(),
+                    );
+                }
+                extraction
+            }
             Err(error) => {
+                if let Some(frame) = observer.as_mut() {
+                    (**frame).record_extraction_accounting_error(
+                        &manifest_digest,
+                        &pack_id,
+                        &error.to_string(),
+                    );
+                    (**frame).set_extraction_phase(super::CandidatePhaseCoverage::PartialFailure);
+                }
                 push_request_explanation(
                     &mut report,
                     request.limits,
@@ -3478,6 +3666,9 @@ pub fn resolve_active_semantic_models(
         } else {
             extraction_gap_counts.insert(manifest_digest, 0);
         }
+    }
+    if let Some(frame) = observer.as_mut() {
+        (**frame).set_extraction_phase(super::CandidatePhaseCoverage::Complete);
     }
     for explanation in &mut report.explanations {
         if explanation.status == SemanticModelActivationStatus::Active
@@ -3607,6 +3798,59 @@ pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
     runtime_artifacts: RuntimeArtifactPublication<'_>,
     cancellation: &CancellationToken,
 ) -> SemanticModelRuntimeOutcome {
+    acquire_active_semantic_models_with_runtime_artifacts_observed(
+        analyzer,
+        catalog,
+        persistence,
+        request,
+        dependency_evidence,
+        runtime_artifacts,
+        cancellation,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts_observed(
+    analyzer: &dyn IAnalyzer,
+    catalog: &SemanticPackCatalog,
+    persistence: Option<SemanticModelActivationPersistence<'_>>,
+    request: &SemanticModelActivationRequest,
+    dependency_evidence: Option<&[DependencyEvidencePublication]>,
+    runtime_artifacts: RuntimeArtifactPublication<'_>,
+    cancellation: &CancellationToken,
+    mut observer: Option<&mut super::ActivationFrame<'_>>,
+) -> SemanticModelRuntimeOutcome {
+    if let Some(frame) = observer.as_mut() {
+        (**frame).record_request(request, dependency_evidence, runtime_artifacts);
+    }
+    let outcome = acquire_active_semantic_models_with_runtime_artifacts_inner(
+        analyzer,
+        catalog,
+        persistence,
+        request,
+        dependency_evidence,
+        runtime_artifacts,
+        cancellation,
+        &mut observer,
+    );
+    if let Some(frame) = observer.as_mut() {
+        (**frame).finish_runtime_outcome(&outcome);
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn acquire_active_semantic_models_with_runtime_artifacts_inner(
+    analyzer: &dyn IAnalyzer,
+    catalog: &SemanticPackCatalog,
+    persistence: Option<SemanticModelActivationPersistence<'_>>,
+    request: &SemanticModelActivationRequest,
+    dependency_evidence: Option<&[DependencyEvidencePublication]>,
+    runtime_artifacts: RuntimeArtifactPublication<'_>,
+    cancellation: &CancellationToken,
+    observer: &mut Option<&mut super::ActivationFrame<'_>>,
+) -> SemanticModelRuntimeOutcome {
     let RuntimeArtifactPublication {
         jdk_artifacts_by_configured_home,
         python_runtime,
@@ -3647,8 +3891,16 @@ pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
     let snapshot_content = analyzer.workspace_content_identity();
     let content_is_current = || analyzer.workspace_content_identity() == snapshot_content;
     let Some(caches) = analyzer.snapshot_caches() else {
+        if let Some(frame) = observer.as_mut() {
+            (**frame).set_lifecycle(SemanticModelRuntimeLifecycle::Uncached);
+        }
         let outcome = with_python_provider_identity(
-            resolve_active_semantic_models(catalog, request, cancellation),
+            resolve_active_semantic_models_observed(
+                catalog,
+                request,
+                cancellation,
+                observer.as_mut().map(|frame| &mut **frame),
+            ),
             python_runtime,
         );
         if !content_is_current() {
@@ -3669,6 +3921,10 @@ pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
     let (acquisition, _) = caches.semantic_models().values.acquire(&key, cancellation);
     match acquisition {
         CompleteValueAcquisition::Cached { value } => {
+            if let Some(frame) = observer.as_mut() {
+                (**frame).set_lifecycle(SemanticModelRuntimeLifecycle::Cached);
+                (**frame).mark_cache_hit_without_resolver();
+            }
             if !content_is_current() {
                 return stale_generation_outcome(request.limits);
             }
@@ -3693,8 +3949,16 @@ pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
             }
         }
         CompleteValueAcquisition::Leader { permit } => {
+            if let Some(frame) = observer.as_mut() {
+                (**frame).set_lifecycle(SemanticModelRuntimeLifecycle::Built);
+            }
             let outcome = with_python_provider_identity(
-                resolve_active_semantic_models(catalog, request, cancellation),
+                resolve_active_semantic_models_observed(
+                    catalog,
+                    request,
+                    cancellation,
+                    observer.as_mut().map(|frame| &mut **frame),
+                ),
                 python_runtime,
             );
             let SemanticModelResolutionOutcome::Ready(active) = outcome else {
@@ -3731,6 +3995,13 @@ pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
             }
         }
         CompleteValueAcquisition::Cancelled => {
+            if let Some(frame) = observer.as_mut() {
+                (**frame).mark_cancelled_before_resolution();
+                (**frame).set_candidate_phase(super::CandidatePhaseCoverage::Cancelled);
+                (**frame).set_load_phase(super::CandidatePhaseCoverage::Cancelled);
+                (**frame).set_matching_phase(super::CandidatePhaseCoverage::Cancelled);
+                (**frame).set_extraction_phase(super::CandidatePhaseCoverage::Cancelled);
+            }
             SemanticModelRuntimeOutcome::Cancelled(SemanticModelActivationReport::default())
         }
         CompleteValueAcquisition::Rejected => {
@@ -3864,7 +4135,7 @@ fn with_python_provider_identity(
         };
         if let Some(active) = active {
             let mut hasher = Sha256::new();
-            hasher.update(b"bifrost.python-runtime-active-set.v1\0");
+            hasher.update(PYTHON_ACTIVE_MODEL_SET_HASH_DOMAIN.as_bytes());
             hasher.update(active.active_model_set_hash.as_bytes());
             hasher.update(publication.evidence_digest);
             active.active_model_set_hash = format!("{:x}", hasher.finalize());
@@ -4123,11 +4394,11 @@ fn semantic_pack_language(label: &str) -> &str {
 /// which requirement admitted the workspace (#3465). The matcher is the only
 /// place that decides this, so it is the only place that reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MatchedVersionRequirement {
-    axis: &'static str,
-    name: String,
-    requirement: String,
-    version: Version,
+pub(crate) struct MatchedVersionRequirement {
+    pub(crate) axis: &'static str,
+    pub(crate) name: String,
+    pub(crate) requirement: String,
+    pub(crate) version: Version,
 }
 
 impl MatchedVersionRequirement {
@@ -4140,11 +4411,11 @@ impl MatchedVersionRequirement {
 }
 
 #[derive(Debug)]
-struct StrictActivationMatch {
-    evidence_rank: EvidenceRank,
-    matched_evidence: SemanticModelActivationEvidence,
-    matching_evidence: Vec<SemanticModelActivationEvidence>,
-    matched_requirements: Vec<MatchedVersionRequirement>,
+pub(crate) struct StrictActivationMatch {
+    pub(crate) evidence_rank: EvidenceRank,
+    pub(crate) matched_evidence: SemanticModelActivationEvidence,
+    pub(crate) matching_evidence: Vec<SemanticModelActivationEvidence>,
+    pub(crate) matched_requirements: Vec<MatchedVersionRequirement>,
 }
 
 fn strict_activation_match(
@@ -4684,7 +4955,7 @@ fn active_model_set_hash(
             .then_with(|| left.reason.cmp(&right.reason))
     });
     let mut hasher = Sha256::new();
-    hasher.update(b"bifrost.semantic-model.active-set.v3\0");
+    hasher.update(ACTIVE_MODEL_SET_HASH_DOMAIN.as_bytes());
     hasher.update(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION.to_be_bytes());
     hasher.update((rows.len() as u64).to_be_bytes());
     for selection in rows {
@@ -6677,6 +6948,482 @@ mod procedure_claim_agreement_tests {
         assert!(
             !procedure_claims_agree(&left, &right),
             "the boolean result outcome is part of the modeled claim"
+        );
+    }
+}
+
+#[cfg(test)]
+mod activation_receipt_runtime_tests {
+    use super::*;
+    use crate::analyzer::semantic_model::{
+        ActivationOrigin, ActivationReceipt, ActivationReceiptInvocation, CatalogOptions,
+        CompilerOptions, DurablePackSource, DurablePackSourceKind, PackExtractionAccounting,
+        SessionPackSource, SessionPackSourceKind, SourceFormat, compile_source,
+    };
+    use crate::analyzer::{JavaAnalyzer, Language};
+    use crate::inline_project::InlineTestProject;
+    use serde_json::Value;
+
+    fn fixture_pack(pack_id: &str, type_id: &str) -> super::super::CompiledSemanticModelPack {
+        let source = serde_json::json!({
+            "schema_version": 2,
+            "pack_id": pack_id,
+            "version": "1.0.0",
+            "producer": {"name": "activation-receipt-test", "version": "1.0.0"},
+            "language": "java",
+            "ecosystem": "maven",
+            "compatibility": {"bifrost": ">=0.8.0, <1.0.0"},
+            "provenance": {"source": "activation-receipt-test"},
+            "license": "Apache-2.0",
+            "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{
+                "id": "declarations",
+                "activation": [{"package": {"name": "com.acme:widget", "version": "=1.0.0"}}],
+                "payload": {"kind": "declaration_facts", "types": [{
+                    "id": type_id,
+                    "name": format!("com.acme.{type_id}"),
+                    "type_kind": "class",
+                    "visibility": "public",
+                    "locator": {"kind": "artifact", "path": "widget.jar", "symbol": format!("com/acme/{type_id}.class")}
+                }], "members": [], "relations": []}
+            }]
+        });
+        compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).expect("fixture serializes"),
+            &CompilerOptions::default(),
+        )
+        .unwrap_or_else(|diagnostics| panic!("receipt fixture does not compile: {diagnostics:#?}"))
+    }
+
+    fn fixture_catalog(packs: &[(&str, &str)]) -> SemanticPackCatalog {
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral semantic catalog opens");
+        for (pack_id, type_id) in packs {
+            catalog
+                .register_session_pack(
+                    &fixture_pack(pack_id, type_id),
+                    &SessionPackSource {
+                        kind: SessionPackSourceKind::Embedded,
+                        source_id: format!("test:{pack_id}"),
+                    },
+                )
+                .expect("fixture pack registers");
+        }
+        catalog
+    }
+
+    fn fixture_request(limits: SemanticModelRuntimeLimits) -> SemanticModelActivationRequest {
+        SemanticModelActivationRequest {
+            bifrost_version: Version::parse("0.13.1").expect("valid Bifrost version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "java".to_owned(),
+                ecosystem: "maven".to_owned(),
+                package: Some(CatalogCoordinate {
+                    name: "com.acme:widget".to_owned(),
+                    version: Some(Version::parse("1.0.0").expect("valid package version")),
+                }),
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits,
+        }
+    }
+
+    fn receipt(directory: &tempfile::TempDir, name: &str) -> Arc<ActivationReceipt> {
+        ActivationReceipt::create(
+            directory.path().join(name),
+            &ActivationReceiptInvocation {
+                invocation_id: name.to_owned(),
+                tool: "query_code".to_owned(),
+            },
+        )
+        .expect("receipt file creates exclusively")
+    }
+
+    fn events(
+        receipt: &ActivationReceipt,
+        directory: &tempfile::TempDir,
+        name: &str,
+    ) -> Vec<Value> {
+        receipt.finish().expect("receipt footer flushes");
+        std::fs::read(directory.path().join(name))
+            .expect("receipt can be read")
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("each receipt line is JSON"))
+            .collect()
+    }
+
+    fn event<'a>(events: &'a [Value], name: &str) -> &'a Value {
+        events
+            .iter()
+            .find(|event| event["event"] == name)
+            .unwrap_or_else(|| panic!("receipt has no {name} event: {events:#?}"))
+    }
+
+    #[test]
+    fn traced_and_untraced_catalog_resolution_keep_the_same_hash_and_bind_exact_objects() {
+        let catalog = fixture_catalog(&[("receipt.fixture", "type.receipt-fixture")]);
+        let request = fixture_request(SemanticModelRuntimeLimits::default());
+        let untraced =
+            match resolve_active_semantic_models(&catalog, &request, &CancellationToken::default())
+            {
+                SemanticModelResolutionOutcome::Ready(active) => active,
+                other => panic!("fixture should resolve completely: {other:?}"),
+            };
+
+        let temp = tempfile::tempdir().unwrap();
+        let name = "catalog-resolution.jsonl";
+        let receipt = receipt(&temp, name);
+        let mut frame = receipt.begin_activation(ActivationOrigin::WorkspaceDependencyPublication);
+        frame.record_request(&request, None, RuntimeArtifactPublication::default());
+        let observed = resolve_active_semantic_models_observed(
+            &catalog,
+            &request,
+            &CancellationToken::default(),
+            Some(&mut frame),
+        );
+        let observed = runtime_outcome(
+            observed,
+            SemanticModelRuntimeLifecycle::Uncached,
+            None,
+            None,
+        );
+        let SemanticModelRuntimeOutcome::Ready {
+            active, snapshot, ..
+        } = &observed
+        else {
+            panic!("observed fixture should resolve completely: {observed:?}");
+        };
+        assert_eq!(
+            untraced.active_model_set_hash(),
+            active.active_model_set_hash()
+        );
+        frame.finish_runtime_outcome(&observed);
+        assert_eq!(
+            receipt.bind_snapshot(Some(snapshot)).unwrap(),
+            super::super::SnapshotBindingStatus::ExactSameProcessObject
+        );
+
+        let equal_hash_other_object =
+            match resolve_active_semantic_models(&catalog, &request, &CancellationToken::default())
+            {
+                SemanticModelResolutionOutcome::Ready(active) => Arc::new(active),
+                other => panic!("second fixture should resolve completely: {other:?}"),
+            };
+        assert_eq!(
+            active.active_model_set_hash(),
+            equal_hash_other_object.active_model_set_hash()
+        );
+        let other_snapshot = ActiveSemanticModelSnapshot::new(
+            equal_hash_other_object,
+            None,
+            None,
+            Arc::new(HashMap::default()),
+            None,
+        );
+        assert_eq!(
+            receipt.bind_snapshot(Some(&other_snapshot)).unwrap(),
+            super::super::SnapshotBindingStatus::DifferentObject,
+            "an equal hash from a distinct resolver object is not same-process binding"
+        );
+        let lines = events(&receipt, &temp, name);
+        assert_eq!(
+            event(&lines, "resolution_finish")["data"]["status"],
+            "ready"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|entry| entry["event"] == "candidate_union_member")
+                .count(),
+            1
+        );
+        let inserted_candidates = lines
+            .iter()
+            .filter(|entry| {
+                entry["event"] == "candidate_seen" && entry["data"]["inserted_into_union"] == true
+            })
+            .count() as u64;
+        let discovery_finished = lines
+            .iter()
+            .find(|entry| {
+                entry["event"] == "phase_coverage" && entry["data"]["status"] == "complete"
+            })
+            .expect("candidate discovery emits its complete phase");
+        assert_eq!(
+            discovery_finished["data"]["union_candidate_count"], inserted_candidates,
+            "discovery counts the union before emitting its ordered members"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|entry| entry["event"] == "snapshot_binding")
+                .map(|entry| entry["data"]["status"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["exact_same_process_object", "different_object"]
+        );
+    }
+
+    #[test]
+    fn invalid_cancelled_and_budget_stopped_requests_keep_typed_phase_coverage() {
+        let catalog = fixture_catalog(&[("receipt.fixture", "type.receipt-fixture")]);
+        let temp = tempfile::tempdir().unwrap();
+
+        let mut invalid = fixture_request(SemanticModelRuntimeLimits::default());
+        invalid.evidence[0].language.clear();
+        let invalid_receipt = receipt(&temp, "invalid.jsonl");
+        let mut invalid_frame =
+            invalid_receipt.begin_activation(ActivationOrigin::WorkspaceDependencyPublication);
+        invalid_frame.record_request(&invalid, None, RuntimeArtifactPublication::default());
+        let invalid_resolution = resolve_active_semantic_models_observed(
+            &catalog,
+            &invalid,
+            &CancellationToken::default(),
+            Some(&mut invalid_frame),
+        );
+        let invalid_runtime = runtime_outcome(
+            invalid_resolution,
+            SemanticModelRuntimeLifecycle::Uncached,
+            None,
+            None,
+        );
+        invalid_frame.finish_runtime_outcome(&invalid_runtime);
+        invalid_receipt.bind_snapshot(None).unwrap();
+        let invalid_events = events(&invalid_receipt, &temp, "invalid.jsonl");
+        assert_eq!(
+            event(&invalid_events, "runtime_finish")["data"]["status"],
+            "unavailable"
+        );
+        assert_eq!(
+            event(&invalid_events, "runtime_finish")["data"]["phase_coverage"]["effective_evidence"],
+            "not_recorded"
+        );
+        assert_eq!(
+            event(&invalid_events, "runtime_finish")["data"]["phase_coverage"]["candidate_discovery"],
+            "not_started"
+        );
+        assert!(
+            !invalid_events
+                .iter()
+                .any(|entry| entry["event"] == "effective_evidence")
+        );
+
+        let request = fixture_request(SemanticModelRuntimeLimits::default());
+        let cancelled_receipt = receipt(&temp, "cancelled.jsonl");
+        let mut cancelled_frame =
+            cancelled_receipt.begin_activation(ActivationOrigin::WorkspaceDependencyPublication);
+        cancelled_frame.record_request(&request, None, RuntimeArtifactPublication::default());
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let cancelled_resolution = resolve_active_semantic_models_observed(
+            &catalog,
+            &request,
+            &cancellation,
+            Some(&mut cancelled_frame),
+        );
+        let cancelled_runtime = runtime_outcome(
+            cancelled_resolution,
+            SemanticModelRuntimeLifecycle::Uncached,
+            None,
+            None,
+        );
+        cancelled_frame.finish_runtime_outcome(&cancelled_runtime);
+        cancelled_receipt.bind_snapshot(None).unwrap();
+        let cancelled_events = events(&cancelled_receipt, &temp, "cancelled.jsonl");
+        assert_eq!(
+            event(&cancelled_events, "runtime_finish")["data"]["status"],
+            "cancelled"
+        );
+        assert_eq!(
+            event(&cancelled_events, "runtime_finish")["data"]["phase_coverage"]["candidate_discovery"],
+            "cancelled"
+        );
+
+        let bounded_limits = SemanticModelRuntimeLimits {
+            max_catalog_candidates: 0,
+            ..SemanticModelRuntimeLimits::default()
+        };
+        let bounded = fixture_request(bounded_limits);
+        let bounded_receipt = receipt(&temp, "budget.jsonl");
+        let mut bounded_frame =
+            bounded_receipt.begin_activation(ActivationOrigin::WorkspaceDependencyPublication);
+        bounded_frame.record_request(&bounded, None, RuntimeArtifactPublication::default());
+        let bounded_resolution = resolve_active_semantic_models_observed(
+            &catalog,
+            &bounded,
+            &CancellationToken::default(),
+            Some(&mut bounded_frame),
+        );
+        let bounded_runtime = runtime_outcome(
+            bounded_resolution,
+            SemanticModelRuntimeLifecycle::Uncached,
+            None,
+            None,
+        );
+        bounded_frame.finish_runtime_outcome(&bounded_runtime);
+        bounded_receipt.bind_snapshot(None).unwrap();
+        let bounded_events = events(&bounded_receipt, &temp, "budget.jsonl");
+        assert_eq!(
+            event(&bounded_events, "runtime_finish")["data"]["status"],
+            "unavailable"
+        );
+        assert_eq!(
+            event(&bounded_events, "runtime_finish")["data"]["phase_coverage"]["candidate_discovery"],
+            "partial_budget_stop"
+        );
+        assert_eq!(
+            event(&bounded_events, "candidate_seen")["data"]["inserted_into_union"],
+            true
+        );
+    }
+
+    #[test]
+    fn extraction_accounting_distinguishes_absent_from_present_empty() {
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral semantic catalog opens");
+        let absent = fixture_pack("receipt.absent", "type.absent-extraction");
+        catalog
+            .install(
+                &absent,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "test:receipt.absent".to_owned(),
+                },
+            )
+            .expect("pack without extraction row installs");
+
+        let present_empty = fixture_pack("receipt.present-empty", "type.empty-extraction");
+        let empty_accounting = PackExtractionAccounting {
+            reject_count: 0,
+            suppressed_reject_count: 0,
+            error_reject_count: 0,
+            gaps: Vec::new(),
+            source_entries: Vec::new(),
+        };
+        catalog
+            .install_release(
+                &present_empty,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "test:receipt.present-empty".to_owned(),
+                },
+                &empty_accounting,
+            )
+            .expect("pack with an explicitly empty extraction row installs");
+
+        let request = fixture_request(SemanticModelRuntimeLimits::default());
+        let temp = tempfile::tempdir().unwrap();
+        let name = "extraction-presence.jsonl";
+        let receipt = receipt(&temp, name);
+        let mut frame = receipt.begin_activation(ActivationOrigin::WorkspaceDependencyPublication);
+        frame.record_request(&request, None, RuntimeArtifactPublication::default());
+        let resolution = resolve_active_semantic_models_observed(
+            &catalog,
+            &request,
+            &CancellationToken::default(),
+            Some(&mut frame),
+        );
+        let outcome = runtime_outcome(
+            resolution,
+            SemanticModelRuntimeLifecycle::Uncached,
+            None,
+            None,
+        );
+        let SemanticModelRuntimeOutcome::Ready { snapshot, .. } = &outcome else {
+            panic!("both fixture packs should activate: {outcome:?}");
+        };
+        frame.finish_runtime_outcome(&outcome);
+        receipt.bind_snapshot(Some(snapshot)).unwrap();
+        let lines = events(&receipt, &temp, name);
+        let extraction = lines
+            .iter()
+            .filter(|entry| entry["event"] == "extraction_accounting")
+            .map(|entry| {
+                (
+                    entry["data"]["pack_id"].as_str().unwrap().to_owned(),
+                    entry["data"]["presence"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            extraction.get("receipt.absent").map(String::as_str),
+            Some("absent")
+        );
+        assert_eq!(
+            extraction.get("receipt.present-empty").map(String::as_str),
+            Some("present_empty")
+        );
+    }
+
+    #[test]
+    fn actual_cached_catalog_result_marks_unreplayed_phases_unavailable() {
+        let catalog = fixture_catalog(&[("receipt.fixture", "type.receipt-fixture")]);
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("Sample.java", "class Sample {}\n")
+            .build();
+        let analyzer = JavaAnalyzer::from_project(project.project().clone());
+        let request = fixture_request(SemanticModelRuntimeLimits::default());
+        let cancellation = CancellationToken::default();
+        let first = acquire_active_semantic_models_with_runtime_artifacts(
+            &analyzer,
+            &catalog,
+            None,
+            &request,
+            None,
+            RuntimeArtifactPublication::default(),
+            &cancellation,
+        );
+        assert!(matches!(first, SemanticModelRuntimeOutcome::Ready { .. }));
+
+        let temp = tempfile::tempdir().unwrap();
+        let name = "cache-hit.jsonl";
+        let receipt = receipt(&temp, name);
+        let mut frame = receipt.begin_activation(ActivationOrigin::WorkspaceDependencyPublication);
+        let cached = acquire_active_semantic_models_with_runtime_artifacts_observed(
+            &analyzer,
+            &catalog,
+            None,
+            &request,
+            None,
+            RuntimeArtifactPublication::default(),
+            &cancellation,
+            Some(&mut frame),
+        );
+        let SemanticModelRuntimeOutcome::Ready {
+            snapshot,
+            lifecycle,
+            ..
+        } = &cached
+        else {
+            panic!("second acquisition should hit the complete-value cache: {cached:?}");
+        };
+        assert_eq!(*lifecycle, SemanticModelRuntimeLifecycle::Cached);
+        assert!(matches!(
+            receipt.bind_snapshot(Some(snapshot)).unwrap(),
+            super::super::SnapshotBindingStatus::ExactSameProcessObject
+        ));
+        let lines = events(&receipt, &temp, name);
+        let discovery = &event(&lines, "phase_coverage")["data"];
+        assert_eq!(discovery["status"], "unavailable_cached");
+        assert_eq!(discovery["query_count"], 0);
+        assert_eq!(discovery["candidate_observations"], 0);
+        assert_eq!(discovery["union_candidate_count"], 0);
+        let coverage = &event(&lines, "runtime_finish")["data"]["phase_coverage"];
+        assert_eq!(coverage["candidate_discovery"], "unavailable_cached");
+        assert_eq!(coverage["candidate_load"], "unavailable_cached");
+        assert_eq!(coverage["strict_matching"], "unavailable_cached");
+        assert_eq!(coverage["extraction_accounting"], "unavailable_cached");
+        assert!(
+            !event(&lines, "runtime_finish")["data"]["resolver_status_recorded"]
+                .as_bool()
+                .unwrap()
         );
     }
 }

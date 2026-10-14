@@ -6,11 +6,13 @@
 use super::package_context::{SelectedPackageRows, unique_package_references_by_token};
 use super::*;
 use crate::analyzer::resolution::{
-    FactPageVisitor, JvmImplicitRootProvider, PrecedenceStep, SelectedJvmBridgeEvidence,
-    SelectedJvmBridgeProvenance, SelectedJvmBridgeVisibility, SelectedPackageBridgeDescriptor,
-    SelectedResolutionMountContext, SelectedRootBridgeDescriptor, SelectedRootPathHalf,
-    SharedNameInterner, language_callables_occupy_value_namespace,
-    language_implicit_root_member_names, language_implicit_root_providers, package_domain_semantic,
+    BindingOrigin, CanonicalIdentityDescriptor, CanonicalIdentityPart, FactPageVisitor,
+    JvmImplicitRootProvider, PrecedenceStep, ResolutionIdentityDigestKey,
+    SelectedJvmBridgeEvidence, SelectedJvmBridgeProvenance, SelectedJvmBridgeVisibility,
+    SelectedPackageBridgeDescriptor, SelectedResolutionMountContext, SelectedRootBridgeDescriptor,
+    SelectedRootPathHalf, SharedNameInterner, binding_origin_rank,
+    language_callables_occupy_value_namespace, language_implicit_root_member_names,
+    language_implicit_root_providers, package_domain_semantic, selected_identity_content_digest,
     visit_selected_root_export_half_pages, visit_selected_root_import_half_pages,
 };
 use brokk_bifrost_core::analyzer::resolution_facts::{
@@ -20,7 +22,7 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{DeclaredVisibility, PrecedenceTier};
 use brokk_bifrost_jvm::java::import_split::{
-    JavaSingleTypeImportProof, prove_java_single_type_import_from_selected_rows,
+    JavaImportSplitGap, JavaSingleTypeImportProof, prove_java_single_type_import_from_selected_rows,
 };
 
 // Immutable derivation for the exact JVM source revision selected by this operation.
@@ -183,6 +185,7 @@ pub(crate) struct JvmImportContextGap {
     pub(crate) kind: &'static str,
     pub(crate) owner: Option<String>,
     pub(crate) boundary_status: Option<crate::analyzer::structural::BoundaryStatus>,
+    pub(crate) nominal_type_identity: Option<SemanticId>,
     suppress_if_same_package_candidate: bool,
 }
 
@@ -422,16 +425,27 @@ impl SelectedResolutionOperation<'_, '_> {
             )
             .optional()?;
         let identities = self.ready.context_identities.clone();
-        let inventory_reason = (source_language == Language::Java).then(|| {
-            let mut reason_hash = CanonicalHasher::new(b"bifrost-jvm-context-incomplete:v1");
-            reason_hash.field("context", &context_id.to_le_bytes());
-            reason_hash.field("language", source_language.config_label().as_bytes());
-            identities.named_semantic(
-                reason_hash.finish(),
+        let inventory_reason = if source_language == Language::Java {
+            let mut descriptor =
+                CanonicalIdentityDescriptor::new(b"bifrost-jvm-context-incomplete:v1", |key| {
+                    self.ready.identity_content_digest(key, cancellation)
+                });
+            descriptor.field(
+                "context",
+                CanonicalIdentityPart::identity(source.fragment()),
+            )?;
+            descriptor.field(
+                "language",
+                CanonicalIdentityPart::Label(source_language.config_label()),
+            )?;
+            Some(identities.named_semantic(
+                descriptor.finish(),
                 "jvm-context-incomplete",
                 "Selected JVM facts leave external artifacts, classpath ownership, inherited routes and peer-language inventory open",
-            )
-        });
+            ))
+        } else {
+            None
+        };
         let lexical = self.ready.lexical_source();
         let mut import_halves = Vec::new();
         let outcome = visit_selected_root_import_half_pages(
@@ -584,6 +598,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 anchor,
                 anchor_semantic,
                 demand,
+                precedence: import_precedence,
                 ..
             } = half
             else {
@@ -611,20 +626,23 @@ impl SelectedResolutionOperation<'_, '_> {
             let demand_recipe = recipes.pop().expect("one selected import demand");
             if selector.is_none() && !java_single_type {
                 if matches!(source_language, Language::Kotlin | Language::Scala) {
-                    scoped_gaps.push(self.jvm_import_context_gap(JvmImportContextGapSpec {
-                        context_id,
-                        source: source.fragment(),
-                        source_token: token,
-                        source_reference: None,
-                        kind: "jvm-import-selector-open",
-                        owner: None,
-                        lookup: demand_recipe.clone(),
-                        detail: format!(
-                            "{} import `{}` has no supported selector route",
-                            source_language.config_label(),
-                            demand_recipe.spelling()
-                        ),
-                    }));
+                    scoped_gaps.push(self.jvm_import_context_gap(
+                        JvmImportContextGapSpec {
+                            context_id,
+                            source: source.fragment(),
+                            source_token: token,
+                            source_reference: None,
+                            kind: "jvm-import-selector-open",
+                            owner: None,
+                            lookup: demand_recipe.clone(),
+                            detail: format!(
+                                "{} import `{}` has no supported selector route",
+                                source_language.config_label(),
+                                demand_recipe.spelling()
+                            ),
+                        },
+                        cancellation,
+                    )?);
                 } else {
                     route_inventory_open = true;
                 }
@@ -634,20 +652,23 @@ impl SelectedResolutionOperation<'_, '_> {
                 selector.kind == ResolutionImportSelectorKind::ReceiverMember
             }) {
                 if matches!(source_language, Language::Kotlin | Language::Scala) {
-                    scoped_gaps.push(self.jvm_import_context_gap(JvmImportContextGapSpec {
-                        context_id,
-                        source: source.fragment(),
-                        source_token: token,
-                        source_reference: None,
-                        kind: "jvm-import-receiver-route-open",
-                        owner: None,
-                        lookup: demand_recipe.clone(),
-                        detail: format!(
-                            "{} receiver import route for `{}` is not modeled",
-                            source_language.config_label(),
-                            demand_recipe.spelling()
-                        ),
-                    }));
+                    scoped_gaps.push(self.jvm_import_context_gap(
+                        JvmImportContextGapSpec {
+                            context_id,
+                            source: source.fragment(),
+                            source_token: token,
+                            source_reference: None,
+                            kind: "jvm-import-receiver-route-open",
+                            owner: None,
+                            lookup: demand_recipe.clone(),
+                            detail: format!(
+                                "{} receiver import route for `{}` is not modeled",
+                                source_language.config_label(),
+                                demand_recipe.spelling()
+                            ),
+                        },
+                        cancellation,
+                    )?);
                 } else {
                     route_inventory_open = true;
                 }
@@ -753,6 +774,9 @@ impl SelectedResolutionOperation<'_, '_> {
             let mut resolved_lookup_route = None;
             let mut resolved_wildcard_route = None;
             for lookup_route in &lookup_routes {
+                let chained_wildcard_route = chained_wildcard_routes
+                    .iter()
+                    .any(|route| route == lookup_route);
                 let mut matched_package_length = None;
                 // A relative reading finds the enclosing package itself for
                 // any route, so only an owner it also finds counts.
@@ -797,7 +821,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                     source_language.config_label(),
                                     source_demand.spelling()
                                 ),
-                            }));
+                            }, cancellation)?);
                         }
                     } else {
                         route_inventory_open |= !open_aliases.is_empty();
@@ -986,6 +1010,37 @@ impl SelectedResolutionOperation<'_, '_> {
                                         incomplete_reasons,
                                     ))
                                 };
+                                let binding_origin = if source_language == Language::Scala
+                                    && prefix_length < lookup_route.len()
+                                {
+                                    if caller_version.is_some() && caller_version == target_version
+                                    {
+                                        BindingOrigin::SameCompilationUnitPackage
+                                    } else {
+                                        BindingOrigin::OtherCompilationUnitPackage
+                                    }
+                                } else {
+                                    match selector.as_ref().map(|selector| selector.kind) {
+                                        Some(ResolutionImportSelectorKind::Named) => {
+                                            if source_language == Language::Java {
+                                                BindingOrigin::SingleTypeImport
+                                            } else {
+                                                BindingOrigin::ExplicitImport
+                                            }
+                                        }
+                                        Some(ResolutionImportSelectorKind::Star) => {
+                                            if source_language == Language::Kotlin {
+                                                BindingOrigin::StarImport
+                                            } else {
+                                                BindingOrigin::WildcardImport
+                                            }
+                                        }
+                                        Some(ResolutionImportSelectorKind::ReceiverMember)
+                                        | None => BindingOrigin::OtherCompilationUnitPackage,
+                                    }
+                                };
+                                let candidate_origin_rank =
+                                    binding_origin_rank(source_language, binding_origin);
                                 let Some(bridge) = self.jvm_root_import_bridge(
                                     identity.fragment(),
                                     source_language,
@@ -1006,6 +1061,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                     target_version,
                                     target_mount.persisted_relative_path(),
                                     relation,
+                                    candidate_origin_rank,
                                     bridge_completion,
                                     cancellation,
                                 )?
@@ -1025,7 +1081,11 @@ impl SelectedResolutionOperation<'_, '_> {
                 // The route may end inside a type the package declares:
                 // `import pkg.Obj.member` names a member of `Obj`. An import that
                 // renames the member keeps the alias route above.
-                if root_bridges.len() == bridges_before
+                if (root_bridges.len() == bridges_before
+                    || selector.as_ref().is_some_and(|selector| {
+                        selector.kind == ResolutionImportSelectorKind::Named
+                            && !chained_wildcard_route
+                    }))
                     && candidate_prefix_found
                     && source_name == local_name
                     && selector.as_ref().is_some_and(|selector| {
@@ -1049,6 +1109,15 @@ impl SelectedResolutionOperation<'_, '_> {
                             prefix_reference: None,
                             anchor,
                             anchor_semantic,
+                            selector_kind: selector.as_ref().map(|selector| selector.kind),
+                            import_precedence: import_precedence
+                                .iter()
+                                .copied()
+                                .find(|step| step.tier != PrecedenceTier::CandidateOriginRank),
+                            candidate_origin_rank: import_precedence
+                                .iter()
+                                .find(|step| step.tier == PrecedenceTier::CandidateOriginRank)
+                                .map(|step| step.ordinal),
                             route: &recipes,
                             lookup_route,
                             demand: &source_demand,
@@ -1162,46 +1231,51 @@ impl SelectedResolutionOperation<'_, '_> {
                         source_language.config_label(),
                         source_demand.spelling()
                     ),
-                }));
+                }, cancellation)?);
             }
             if !package_prefix_found {
-                if matches!(source_language, Language::Kotlin | Language::Scala) {
-                    let owner = recipes
-                        .iter()
-                        .map(ResolutionLookupSemanticRecipe::spelling)
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    let declared = format!("{owner}.{}", source_demand.spelling());
-                    if self.model_declares_jvm_type(&declared)? {
-                        // The reviewed model declares this type, so the import
-                        // closes with a model-declared identity instead of an
-                        // open route. Member enumeration stays open through the
-                        // identity's enumeration boundary.
-                        model_declared_routes.push(ModelDeclaredJvmImportRoute {
-                            source_token: token,
-                            lookup: source_demand.clone(),
-                            owner: self.model_declared_jvm_owner(&declared)?,
-                            declared_fqn: declared,
-                        });
-                    } else {
-                        scoped_gaps.push(self.jvm_import_context_gap(JvmImportContextGapSpec {
-                            context_id,
-                            source: source.fragment(),
-                            source_token: token,
-                            source_reference: None,
-                            kind: "jvm-import-owner-open",
-                            owner: Some(owner.clone()),
-                            lookup: source_demand.clone(),
-                            detail: format!(
-                                "{} import owner `{owner}` has no selected source or classpath route for `{}`",
-                                source_language.config_label(),
-                                source_demand.spelling()
-                            ),
-                        }));
-                    }
+                let owner = recipes
+                    .iter()
+                    .map(ResolutionLookupSemanticRecipe::spelling)
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let declared = format!("{owner}.{}", source_demand.spelling());
+                if self.model_declares_jvm_type(&declared)? {
+                    // The reviewed model declares this type, so the import
+                    // closes with a model-declared identity instead of an
+                    // open route. Member enumeration stays open through the
+                    // identity's enumeration boundary.
+                    model_declared_routes.push(ModelDeclaredJvmImportRoute {
+                        source_token: token,
+                        lookup: source_demand.clone(),
+                        owner: self.model_declared_jvm_owner(&declared)?,
+                        declared_fqn: declared,
+                    });
                 } else {
-                    route_inventory_open = true;
+                    let mut gap = self.jvm_import_context_gap(JvmImportContextGapSpec {
+                        context_id,
+                        source: source.fragment(),
+                        source_token: token,
+                        source_reference: None,
+                        kind: "jvm-import-owner-open",
+                        owner: Some(owner.clone()),
+                        lookup: source_demand.clone(),
+                        detail: format!(
+                            "{} import owner `{owner}` has no selected source or classpath route for `{}`",
+                            source_language.config_label(),
+                            source_demand.spelling()
+                        ),
+                    }, cancellation)?;
+                    gap.boundary_status = Some(
+                        crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
+                    );
+                    let identity =
+                        model_declared_jvm_type_identity(&declared, &self.ready.shared_names());
+                    identities.record_jvm_unindexed_import_owner(identity, &declared);
+                    gap.nominal_type_identity = Some(identity);
+                    scoped_gaps.push(gap);
                 }
+                route_inventory_open |= source_language == Language::Java;
             }
             if cancellation.is_cancelled() {
                 return Ok(JvmImportContext::Cancelled);
@@ -1304,26 +1378,83 @@ impl SelectedResolutionOperation<'_, '_> {
                     && seed
                         .site_metadata()
                         .is_some_and(|metadata| {
-                            metadata.namespace() == ResolutionNamespace::Type
+                            let type_or_value_qualifier =
+                                metadata.namespace() == ResolutionNamespace::TypeOrValue;
+                            let is_type_reference = metadata.site_kind()
+                                == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::TypeReference;
+                            let is_type_or_value_qualifier = type_or_value_qualifier
                                 && metadata.site_kind()
-                                    == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::TypeReference
-                                && metadata.unqualified()
-                                && !qualified_reference_nodes.contains(&seed.node())
-                                && !qualified_reference_semantics.contains(&seed.reference())
+                                    == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::ValueReference;
+                            matches!(
+                                metadata.namespace(),
+                                ResolutionNamespace::Type | ResolutionNamespace::TypeOrValue
+                            )
+                                && (is_type_reference || is_type_or_value_qualifier)
+                                && (type_or_value_qualifier || metadata.unqualified())
+                                && (type_or_value_qualifier
+                                    || (!qualified_reference_nodes.contains(&seed.node())
+                                        && !qualified_reference_semantics
+                                            .contains(&seed.reference())))
                         })
                 {
                     unqualified_type_references.insert(seed.reference());
                 }
             }
         }
-        register_jvm_external_provider_type_identities(
+        let mut durable_implicit_owners = BTreeMap::new();
+        for gap in &scoped_gaps {
+            if gap.boundary_status
+                != Some(crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed)
+                || gap.lookup.namespace() != ResolutionNamespace::Type
+            {
+                continue;
+            }
+            for provider in implicit_root_providers {
+                let JvmImplicitRootProvider::Package(package) = provider else {
+                    continue;
+                };
+                let fqn = format!("{package}.{}", gap.lookup.spelling());
+                if let Some(owner) = self.model_declared_jvm_owner(&fqn)? {
+                    durable_implicit_owners.insert(fqn, owner);
+                }
+            }
+        }
+        if source_language == Language::Java {
+            for reference in package_reference_occurrences.iter().filter(|reference| {
+                reference.namespace == ResolutionNamespace::Type
+                    && unqualified_type_references.contains(&reference.reference)
+            }) {
+                let Some(mut lookups) =
+                    self.jvm_lookup_recipes(source.fragment(), [reference.lookup], cancellation)?
+                else {
+                    return Ok(JvmImportContext::Cancelled);
+                };
+                let Some(lookup) = lookups.pop() else {
+                    continue;
+                };
+                for provider in implicit_root_providers {
+                    let JvmImplicitRootProvider::Package(package) = provider else {
+                        continue;
+                    };
+                    let fqn = format!("{package}.{}", lookup.spelling());
+                    if let Some(owner) = self.model_declared_jvm_owner(&fqn)? {
+                        durable_implicit_owners.insert(fqn, owner);
+                    }
+                }
+            }
+        }
+        register_jvm_external_provider_type_identities(JvmExternalProviderIdentityRegistration {
             source_language,
-            &scoped_gaps,
-            &package_reference_occurrences,
-            &unqualified_type_references,
-            &identities,
-            &names,
-        );
+            gaps: &scoped_gaps,
+            package_reference_occurrences: &package_reference_occurrences,
+            unqualified_type_references: &unqualified_type_references,
+            durable_owners: &durable_implicit_owners,
+            lexical: &lexical,
+            source_fragment: source.fragment(),
+            identities: &identities,
+            names: &names,
+            cancellation,
+        })?;
         register_model_declared_jvm_type_identities(
             &model_declared_routes,
             &package_reference_occurrences,
@@ -1363,11 +1494,17 @@ impl SelectedResolutionOperation<'_, '_> {
             }))
         };
         if route_inventory_open && !matches!(source_language, Language::Kotlin | Language::Scala) {
-            let mut hash = CanonicalHasher::new(b"bifrost-jvm-import-selector-open:v1");
-            hash.field("context", &context_id.to_le_bytes());
-            hash.field("source", &source.fragment().as_bytes());
+            let mut descriptor =
+                CanonicalIdentityDescriptor::new(b"bifrost-jvm-import-selector-open:v1", |key| {
+                    self.ready.identity_content_digest(key, cancellation)
+                });
+            descriptor.field(
+                "context",
+                CanonicalIdentityPart::identity(source.fragment()),
+            )?;
+            descriptor.field("source", CanonicalIdentityPart::identity(source.fragment()))?;
             let reason = self.ready.context_identities.named_semantic(
-                hash.finish(),
+                descriptor.finish(),
                 "jvm-import-selector-open",
                 "A selected JVM import has no supported selector route or selected destination",
             );
@@ -1385,21 +1522,35 @@ impl SelectedResolutionOperation<'_, '_> {
         })
     }
 
-    fn jvm_import_context_gap(&self, spec: JvmImportContextGapSpec) -> JvmImportContextGap {
-        let mut hash = CanonicalHasher::new(b"bifrost-jvm-import-context-gap:v1");
-        hash.field("context", &spec.context_id.to_le_bytes());
-        hash.field("source", &spec.source.as_bytes());
-        hash.field("source-token", &spec.source_token.as_bytes());
-        hash.field("kind", spec.kind.as_bytes());
+    fn jvm_import_context_gap(
+        &self,
+        spec: JvmImportContextGapSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<JvmImportContextGap> {
+        let mut descriptor =
+            CanonicalIdentityDescriptor::new(b"bifrost-jvm-import-context-gap:v1", |key| {
+                self.ready.identity_content_digest(key, cancellation)
+            });
+        descriptor.field("context", CanonicalIdentityPart::identity(spec.source))?;
+        descriptor.field("source", CanonicalIdentityPart::identity(spec.source))?;
+        descriptor.field(
+            "source-token",
+            CanonicalIdentityPart::identity(spec.source_token),
+        )?;
+        descriptor.field("kind", CanonicalIdentityPart::Content(spec.kind.as_bytes()))?;
         if let Some(owner) = &spec.owner {
-            hash.field("owner", owner.as_bytes());
+            descriptor.field("owner", CanonicalIdentityPart::Content(owner.as_bytes()))?;
         }
-        hash.field("lookup", &spec.lookup.name_digest());
-        let reason =
-            self.ready
-                .context_identities
-                .named_semantic(hash.finish(), spec.kind, &spec.detail);
-        JvmImportContextGap {
+        descriptor.field(
+            "lookup",
+            CanonicalIdentityPart::Content(&spec.lookup.name_digest()),
+        )?;
+        let reason = self.ready.context_identities.named_semantic(
+            descriptor.finish(),
+            spec.kind,
+            &spec.detail,
+        );
+        Ok(JvmImportContextGap {
             source_token: spec.source_token,
             source_reference: spec.source_reference,
             lookup: spec.lookup,
@@ -1407,27 +1558,30 @@ impl SelectedResolutionOperation<'_, '_> {
             kind: spec.kind,
             owner: spec.owner,
             boundary_status: None,
+            nominal_type_identity: None,
             suppress_if_same_package_candidate: false,
-        }
+        })
     }
 
     fn jvm_import_context_boundary_gap_with_same_package_shadow(
         &self,
         spec: JvmImportContextGapSpec,
-    ) -> JvmImportContextGap {
-        let mut gap = self.jvm_import_context_gap_with_same_package_shadow(spec);
+        cancellation: &CancellationToken,
+    ) -> Result<JvmImportContextGap> {
+        let mut gap = self.jvm_import_context_gap_with_same_package_shadow(spec, cancellation)?;
         gap.boundary_status =
             Some(crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed);
-        gap
+        Ok(gap)
     }
 
     fn jvm_import_context_gap_with_same_package_shadow(
         &self,
         spec: JvmImportContextGapSpec,
-    ) -> JvmImportContextGap {
-        let mut gap = self.jvm_import_context_gap(spec);
+        cancellation: &CancellationToken,
+    ) -> Result<JvmImportContextGap> {
+        let mut gap = self.jvm_import_context_gap(spec, cancellation)?;
         gap.suppress_if_same_package_candidate = true;
-        gap
+        Ok(gap)
     }
 
     pub(super) fn jvm_lookup_recipes(
@@ -1537,7 +1691,8 @@ impl SelectedResolutionOperation<'_, '_> {
                             source_recipe.spelling()
                         ),
                         },
-                    ));
+                        cancellation,
+                    )?);
                 }
                 for (target, target_version) in targets {
                     let target_ordinal = SelectedResolutionMountOrdinal::new(target);
@@ -1545,6 +1700,10 @@ impl SelectedResolutionOperation<'_, '_> {
                         continue;
                     }
                     let target_mount = self.mount_table().mount_by_ordinal(target_ordinal)?;
+                    let target_mount_record = self
+                        .ready
+                        .inventory
+                        .mount_record_by_ordinal(target_ordinal)?;
                     let target_language = target_mount.semantic_language();
                     if !is_jvm_language(target_language) {
                         continue;
@@ -1650,37 +1809,41 @@ impl SelectedResolutionOperation<'_, '_> {
                             target_language,
                             package,
                             reference,
-                            target_ordinal,
-                        );
+                            target_mount_record.fragment_digest().as_bytes(),
+                            |key| self.ready.identity_content_digest(key, cancellation),
+                        )?;
                         let same_package_candidate = Some(package.as_str()) == caller_package
                             && completion == ResolutionCompletion::Complete;
-                        bridges.push(SelectedPackageBridgeDescriptor::new_jvm_import(
-                            source_mount.fragment(),
-                            target_mount.fragment(),
+                        let precedence = Self::selected_jvm_package_precedence(
                             source_language,
-                            target_language,
-                            reference,
-                            member,
-                            source_recipe,
-                            &target_recipe,
-                            target_definition,
-                            route_identity,
-                            Self::selected_jvm_package_precedence(
+                            caller_package,
+                            package,
+                        );
+                        bridges.push(
+                            SelectedPackageBridgeDescriptor::new_jvm_import(
+                                source_mount.fragment(),
+                                target_mount.fragment(),
                                 source_language,
-                                caller_package,
-                                package,
+                                target_language,
+                                reference,
+                                member,
+                                source_recipe,
+                                &target_recipe,
+                                target_definition,
+                                route_identity,
+                                precedence.tier.map(|tier| PrecedenceStep {
+                                    tier,
+                                    ordinal: 0,
+                                    semantic: reference
+                                        .choice
+                                        .expect("selected Kotlin package choice is persisted"),
+                                }),
+                                &names,
+                                evidence,
+                                completion,
                             )
-                            .map(|tier| PrecedenceStep {
-                                tier,
-                                ordinal: 0,
-                                semantic: reference
-                                    .choice
-                                    .expect("selected Kotlin package choice is persisted"),
-                            }),
-                            &names,
-                            evidence,
-                            completion,
-                        ));
+                            .with_candidate_origin_rank(precedence.candidate_origin_rank),
+                        );
                         if same_package_candidate {
                             same_package_lookups.insert(reference.lookup);
                         }
@@ -1695,15 +1858,24 @@ impl SelectedResolutionOperation<'_, '_> {
         language: Language,
         caller_package: Option<&str>,
         target_package: &str,
-    ) -> Option<PrecedenceTier> {
-        match language {
-            Language::Kotlin => Some(if caller_package == Some(target_package) {
-                PrecedenceTier::PackageOrModule
-            } else {
-                PrecedenceTier::DefaultImport
-            }),
-            Language::Java | Language::Scala => None,
-            _ => unreachable!("selected JVM package imports belong to Kotlin or Scala"),
+    ) -> SelectedJvmPackagePrecedence {
+        let same_package = caller_package == Some(target_package);
+        let (tier, origin) = match language {
+            Language::Kotlin if same_package => (
+                Some(PrecedenceTier::PackageOrModule),
+                BindingOrigin::SamePackage,
+            ),
+            Language::Kotlin => (
+                Some(PrecedenceTier::DefaultImport),
+                BindingOrigin::StarImport,
+            ),
+            Language::Java if same_package => (None, BindingOrigin::SamePackage),
+            Language::Java | Language::Scala => (None, BindingOrigin::OtherCompilationUnitPackage),
+            _ => unreachable!("selected JVM package imports belong to Java, Kotlin, or Scala"),
+        };
+        SelectedJvmPackagePrecedence {
+            tier,
+            candidate_origin_rank: binding_origin_rank(language, origin),
         }
     }
 
@@ -1814,7 +1986,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                     row.fragment() == target_mount.fragment()
                                         && row.row().owner_definition() == predef_member.definition
                                 })
-                                .map(|row| *row.row()),
+                                .map(|row| row.row().clone()),
                         );
                         Ok(true)
                     }),
@@ -1914,7 +2086,8 @@ impl SelectedResolutionOperation<'_, '_> {
                             predef_member.definition,
                             owner_member.definition(),
                             source_language,
-                        );
+                            |key| self.ready.identity_content_digest(key, cancellation),
+                        )?;
                         let evidence = if source_language == target_language {
                             None
                         } else {
@@ -1998,7 +2171,8 @@ impl SelectedResolutionOperation<'_, '_> {
                     source_recipe.spelling()
                     ),
                 },
-            );
+                cancellation,
+            )?;
             if predef_root_unindexed {
                 gap.boundary_status =
                     Some(crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed);
@@ -2186,13 +2360,31 @@ impl SelectedResolutionOperation<'_, '_> {
                     if outcome.is_cancelled() {
                         return Ok(None);
                     }
-                    let mut alias_hash = CanonicalHasher::new(b"bifrost-jvm-alias-fact:v1");
-                    alias_hash.field("target-blob", &target_record.blob_id().to_le_bytes());
-                    alias_hash.field("alias", &alias_id.to_le_bytes());
-                    alias_hash.field("declaration-site", &declaration_site.to_le_bytes());
-                    alias_hash.field("member-name", imported_name.as_bytes());
+                    let mut alias_hash =
+                        CanonicalIdentityDescriptor::new(b"bifrost-jvm-alias-fact:v1", |key| {
+                            self.ready.identity_content_digest(key, cancellation)
+                        });
+                    alias_hash.field(
+                        "target-blob",
+                        CanonicalIdentityPart::Content(&target_record.fragment_digest().as_bytes()),
+                    )?;
+                    alias_hash.field(
+                        "alias",
+                        CanonicalIdentityPart::Content(&alias_id.to_le_bytes()),
+                    )?;
+                    alias_hash.field(
+                        "declaration-site",
+                        CanonicalIdentityPart::Content(&declaration_site.to_le_bytes()),
+                    )?;
+                    alias_hash.field(
+                        "member-name",
+                        CanonicalIdentityPart::Content(imported_name.as_bytes()),
+                    )?;
                     for segment in &owner {
-                        alias_hash.field("owner-segment", segment.as_bytes());
+                        alias_hash.field(
+                            "owner-segment",
+                            CanonicalIdentityPart::Content(segment.as_bytes()),
+                        )?;
                     }
                     let alias_identity = self.ready.context_identities.named_semantic(
                         alias_hash.finish(),
@@ -2393,6 +2585,7 @@ impl SelectedResolutionOperation<'_, '_> {
         target_version: Option<i64>,
         target_path: &str,
         relation: JvmPackageRelation,
+        candidate_origin_rank: Option<u32>,
         completion: ResolutionCompletion,
         cancellation: &CancellationToken,
     ) -> Result<Option<SelectedRootBridgeDescriptor>> {
@@ -2459,7 +2652,9 @@ impl SelectedResolutionOperation<'_, '_> {
             )
         };
         Ok(Some(
-            bridge.with_selected_member_definition(target_definition),
+            bridge
+                .with_selected_member_definition(target_definition)
+                .with_candidate_origin_rank(candidate_origin_rank),
         ))
     }
 
@@ -2536,9 +2731,16 @@ impl SelectedResolutionOperation<'_, '_> {
             .optional()?;
         let identities = self.ready.context_identities.clone();
         let evidence = "JVM selected source facts leave effective classpath, external artifacts, inherited imports and peer-language routes open";
-        let mut hash = CanonicalHasher::new(b"bifrost-java-context-incomplete:v1");
-        hash.field("context", &context_id.to_le_bytes());
-        let reason = identities.named_semantic(hash.finish(), "java-context-incomplete", evidence);
+        let mut descriptor =
+            CanonicalIdentityDescriptor::new(b"bifrost-java-context-incomplete:v1", |key| {
+                self.ready.identity_content_digest(key, cancellation)
+            });
+        descriptor.field(
+            "context",
+            CanonicalIdentityPart::Content(&source_record.fragment_digest().as_bytes()),
+        )?;
+        let reason =
+            identities.named_semantic(descriptor.finish(), "java-context-incomplete", evidence);
         let completion = ResolutionCompletion::Complete;
         let lexical = self.ready.lexical_source();
         let mut imports = Vec::new();
@@ -2562,6 +2764,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let mut bridges = Vec::new();
         let mut external_static_imports = Vec::new();
         let mut indexed_static_import_members = Vec::new();
+        let mut scoped_gaps = Vec::new();
         for import in imports {
             let SelectedRootPathHalf::Import {
                 route,
@@ -2633,6 +2836,9 @@ impl SelectedResolutionOperation<'_, '_> {
                     prefix_reference: None,
                     anchor,
                     anchor_semantic,
+                    selector_kind: None,
+                    import_precedence: None,
+                    candidate_origin_rank: None,
                     route: &recipes,
                     lookup_route: &recipes,
                     demand: &demand_recipe,
@@ -2692,6 +2898,9 @@ impl SelectedResolutionOperation<'_, '_> {
                             prefix_reference: None,
                             anchor,
                             anchor_semantic,
+                            selector_kind: None,
+                            import_precedence: None,
+                            candidate_origin_rank: None,
                             route: &recipes,
                             lookup_route: &recipes,
                             demand: &demand_recipe,
@@ -2734,7 +2943,80 @@ impl SelectedResolutionOperation<'_, '_> {
                             }
                             vec![unit]
                         }
-                        JavaSingleTypeImportProof::Open { targets, .. } => targets,
+                        JavaSingleTypeImportProof::Open { gap, targets } => {
+                            if targets.is_empty() && gap == JavaImportSplitGap::MissingDestination {
+                                let owner = recipes
+                                    .iter()
+                                    .map(ResolutionLookupSemanticRecipe::spelling)
+                                    .collect::<Vec<_>>()
+                                    .join(".");
+                                let declared = format!("{owner}.{}", demand_recipe.spelling());
+                                let mut selected_packages =
+                                    connection.prepare_cached(JVM_IMPORT_TARGET_MOUNTS)?;
+                                let mut selected_packages = selected_packages
+                                    .query_map([&owner], |row| row.get::<_, u32>(0))?;
+                                let package_prefix_found =
+                                    selected_packages.next().transpose()?.is_some();
+                                if !package_prefix_found
+                                    && self.model_declares_jvm_type(&declared)?
+                                {
+                                    let model_owner = self.model_declared_jvm_owner(&declared)?;
+                                    let boundary = register_model_declared_jvm_type_identity(
+                                        token,
+                                        &declared,
+                                        model_owner.as_ref(),
+                                        &identities,
+                                        &self.ready.shared_names(),
+                                    );
+                                    let mut gap = self.jvm_import_context_gap(
+                                        JvmImportContextGapSpec {
+                                            context_id,
+                                            source: source.fragment(),
+                                            source_token: token,
+                                            source_reference: None,
+                                            kind: "jvm-model-declared-import",
+                                            owner: Some(owner),
+                                            lookup: demand_recipe.clone(),
+                                            detail: format!(
+                                                "Java import type `{declared}` is model-declared; its members remain limited to the reviewed model"
+                                            ),
+                                        },
+                                        cancellation,
+                                    )?;
+                                    gap.reason = boundary;
+                                    scoped_gaps.push(gap);
+                                } else if !package_prefix_found {
+                                    let mut gap = self.jvm_import_context_gap(
+                                        JvmImportContextGapSpec {
+                                            context_id,
+                                            source: source.fragment(),
+                                            source_token: token,
+                                            source_reference: None,
+                                            kind: "jvm-import-owner-open",
+                                            owner: Some(owner),
+                                            lookup: demand_recipe.clone(),
+                                            detail: format!(
+                                                "Java import owner has no selected source or classpath route for `{}`",
+                                                demand_recipe.spelling()
+                                            ),
+                                        },
+                                        cancellation,
+                                    )?;
+                                    gap.boundary_status = Some(
+                                        crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
+                                    );
+                                    let identity = model_declared_jvm_type_identity(
+                                        &declared,
+                                        &self.ready.shared_names(),
+                                    );
+                                    identities
+                                        .record_jvm_unindexed_import_owner(identity, &declared);
+                                    gap.nominal_type_identity = Some(identity);
+                                    scoped_gaps.push(gap);
+                                }
+                            }
+                            targets
+                        }
                     };
                     bridges.extend(
                         members
@@ -2775,6 +3057,9 @@ impl SelectedResolutionOperation<'_, '_> {
                     prefix_reference: None,
                     anchor,
                     anchor_semantic,
+                    selector_kind: None,
+                    import_precedence: None,
+                    candidate_origin_rank: None,
                     route: &recipes,
                     lookup_route: &recipes,
                     demand: &demand_recipe,
@@ -2901,7 +3186,7 @@ impl SelectedResolutionOperation<'_, '_> {
             external_static_imports,
             inventory_reason: Some(reason),
             open_jvm_alias_imports: Vec::new(),
-            scoped_gaps: Vec::new(),
+            scoped_gaps,
         })
     }
     fn jvm_source_access_completion(
@@ -3404,29 +3689,57 @@ fn jvm_package_route_identity(
     target_language: Language,
     package: &str,
     reference: &crate::analyzer::resolution::LoweredPackageReference,
-    target: SelectedResolutionMountOrdinal,
-) -> [u8; 32] {
-    let mut hash = CanonicalHasher::new(b"bifrost-jvm-package-import-route:v2");
-    hash.field("source-language", source_language.config_label().as_bytes());
-    hash.field("target-language", target_language.config_label().as_bytes());
-    hash.field("package", package.as_bytes());
-    hash.field("source-token", &reference.token.as_bytes());
-    hash.field("source-lookup", &reference.lookup.as_bytes());
-    hash.field("target-mount", &target.get().to_le_bytes());
-    hash.finish()
+    target_mount_digest: [u8; 32],
+    resolve: impl FnMut(ResolutionIdentityDigestKey) -> Result<[u8; 32]>,
+) -> Result<[u8; 32]> {
+    let mut descriptor =
+        CanonicalIdentityDescriptor::new(b"bifrost-jvm-package-import-route:v2", resolve);
+    descriptor.field(
+        "source-language",
+        CanonicalIdentityPart::Label(source_language.config_label()),
+    )?;
+    descriptor.field(
+        "target-language",
+        CanonicalIdentityPart::Label(target_language.config_label()),
+    )?;
+    descriptor.field(
+        "package",
+        CanonicalIdentityPart::Content(package.as_bytes()),
+    )?;
+    descriptor.field(
+        "source-token",
+        CanonicalIdentityPart::identity(reference.token),
+    )?;
+    descriptor.field(
+        "source-lookup",
+        CanonicalIdentityPart::identity(reference.lookup),
+    )?;
+    descriptor.field(
+        "target-mount",
+        CanonicalIdentityPart::Content(&target_mount_digest),
+    )?;
+    Ok(descriptor.finish())
 }
 
 fn jvm_singleton_route_identity(
     singleton: SemanticId,
     member: SemanticId,
     source_language: Language,
-) -> [u8; 32] {
-    let mut hash = CanonicalHasher::new(b"bifrost-jvm-singleton-import-route:v1");
-    hash.field("source-language", source_language.config_label().as_bytes());
-    hash.field("singleton", &singleton.as_bytes());
-    hash.field("member", &member.as_bytes());
-    hash.field("predef", SCALA_PREDEF_DEFAULT_IMPORT.as_bytes());
-    hash.finish()
+    resolve: impl FnMut(ResolutionIdentityDigestKey) -> Result<[u8; 32]>,
+) -> Result<[u8; 32]> {
+    let mut descriptor =
+        CanonicalIdentityDescriptor::new(b"bifrost-jvm-singleton-import-route:v1", resolve);
+    descriptor.field(
+        "source-language",
+        CanonicalIdentityPart::Label(source_language.config_label()),
+    )?;
+    descriptor.field("singleton", CanonicalIdentityPart::identity(singleton))?;
+    descriptor.field("member", CanonicalIdentityPart::identity(member))?;
+    descriptor.field(
+        "predef",
+        CanonicalIdentityPart::Content(SCALA_PREDEF_DEFAULT_IMPORT.as_bytes()),
+    )?;
+    Ok(descriptor.finish())
 }
 
 fn jvm_implicit_provider_gap_matches(
@@ -3525,7 +3838,7 @@ fn register_model_declared_jvm_type_identity(
     owner: Option<&crate::analyzer::resolution::ExternalOwnerIdentity>,
     identities: &SelectedContextIdentities,
     names: &dyn SharedNameInterner,
-) {
+) -> SemanticId {
     let identity = owner.map_or_else(
         || model_declared_jvm_type_identity(declared_fqn, names),
         |owner| identities.external_owner_semantic(owner, names),
@@ -3543,16 +3856,40 @@ fn register_model_declared_jvm_type_identity(
         identity,
         enumeration_boundary,
     );
+    enumeration_boundary
+}
+
+struct JvmExternalProviderIdentityRegistration<'a, 'lexical, 'source> {
+    source_language: Language,
+    gaps: &'a [JvmImportContextGap],
+    package_reference_occurrences: &'a [crate::analyzer::resolution::LoweredPackageReference],
+    unqualified_type_references: &'a BTreeSet<SemanticId>,
+    durable_owners: &'a BTreeMap<String, crate::analyzer::resolution::ExternalOwnerIdentity>,
+    lexical: &'a crate::analyzer::store::resolution_lexical::SelectedResolutionLexicalSource<
+        'lexical,
+        'source,
+    >,
+    source_fragment: BindingFragmentId,
+    identities: &'a SelectedContextIdentities,
+    names: &'a dyn SharedNameInterner,
+    cancellation: &'a CancellationToken,
 }
 
 fn register_jvm_external_provider_type_identities(
-    source_language: Language,
-    gaps: &[JvmImportContextGap],
-    package_reference_occurrences: &[crate::analyzer::resolution::LoweredPackageReference],
-    unqualified_type_references: &BTreeSet<SemanticId>,
-    identities: &SelectedContextIdentities,
-    names: &dyn SharedNameInterner,
-) {
+    registration: JvmExternalProviderIdentityRegistration<'_, '_, '_>,
+) -> Result<()> {
+    let JvmExternalProviderIdentityRegistration {
+        source_language,
+        gaps,
+        package_reference_occurrences,
+        unqualified_type_references,
+        durable_owners,
+        lexical,
+        source_fragment,
+        identities,
+        names,
+        cancellation,
+    } = registration;
     let providers = language_implicit_root_providers(source_language);
     let mut references_by_route =
         std::collections::BTreeMap::<(SemanticId, SemanticId), Vec<SemanticId>>::new();
@@ -3617,8 +3954,19 @@ fn register_jvm_external_provider_type_identities(
             !ordered_providers.is_empty(),
             "a JVM external type identity has at least one unindexed provider"
         );
-        let identity =
-            jvm_external_provider_type_identity(&ordered_providers, lookup.spelling(), names);
+        let durable_matches = ordered_providers
+            .iter()
+            .filter_map(|provider| match provider {
+                JvmImplicitRootProvider::Package(package) => {
+                    durable_owners.get(&format!("{package}.{}", lookup.spelling()))
+                }
+                JvmImplicitRootProvider::ScalaPredef => None,
+            })
+            .collect::<Vec<_>>();
+        let identity = match durable_matches.as_slice() {
+            [owner] => identities.external_owner_semantic(owner, names),
+            _ => jvm_external_provider_type_identity(&ordered_providers, lookup.spelling(), names),
+        };
         let provider_names = ordered_providers
             .iter()
             .map(|provider| match provider {
@@ -3626,9 +3974,11 @@ fn register_jvm_external_provider_type_identities(
                 JvmImplicitRootProvider::ScalaPredef => SCALA_PREDEF_DEFAULT_IMPORT,
             })
             .collect::<Vec<_>>();
-        let mut boundary_hash =
-            CanonicalHasher::new(b"bifrost-jvm-external-provider-enumeration-boundary:v1");
-        boundary_hash.field("type-identity", &identity.as_bytes());
+        let mut boundary_hash = CanonicalIdentityDescriptor::new(
+            b"bifrost-jvm-external-provider-enumeration-boundary:v1",
+            |key| selected_identity_content_digest(identities, lexical, key, cancellation),
+        );
+        boundary_hash.field("type-identity", CanonicalIdentityPart::identity(identity))?;
         let enumeration_boundary = identities.named_semantic(
             boundary_hash.finish(),
             "jvm-external-provider-type",
@@ -3652,6 +4002,74 @@ fn register_jvm_external_provider_type_identities(
             }
         }
     }
+
+    if source_language == Language::Java {
+        let implicit_providers = providers
+            .iter()
+            .copied()
+            .filter(|provider| matches!(provider, JvmImplicitRootProvider::Package("java.lang")))
+            .collect::<Vec<_>>();
+        for ((source_token, lookup_semantic), references) in references_by_route {
+            let request = crate::analyzer::store::resolution_lexical::SelectedLookupRecipeRequest {
+                fragment: source_fragment,
+                semantic: lookup_semantic,
+            };
+            let crate::analyzer::store::resolution_lexical::SelectedLookupRecipeReadOutcome::Ready(
+                recipes,
+            ) = lexical.lookup_semantic_recipes(&[request], cancellation, None)?
+            else {
+                return Ok(());
+            };
+            let lookup = recipes[0]
+                .as_ref()
+                .expect("selected Java type reference has a lookup recipe");
+            if gaps
+                .iter()
+                .any(|gap| gap.source_token == source_token && gap.lookup == *lookup)
+            {
+                continue;
+            }
+            let durable = implicit_providers
+                .iter()
+                .filter_map(|provider| match provider {
+                    JvmImplicitRootProvider::Package(package) => {
+                        durable_owners.get(&format!("{package}.{}", lookup.spelling()))
+                    }
+                    JvmImplicitRootProvider::ScalaPredef => None,
+                })
+                .collect::<Vec<_>>();
+            let identity = match durable.as_slice() {
+                [owner] => identities.external_owner_semantic(owner, names),
+                _ => jvm_external_provider_type_identity(
+                    &implicit_providers,
+                    lookup.spelling(),
+                    names,
+                ),
+            };
+            let mut boundary_hash = CanonicalIdentityDescriptor::new(
+                b"bifrost-jvm-external-provider-enumeration-boundary:v1",
+                |key| selected_identity_content_digest(identities, lexical, key, cancellation),
+            );
+            boundary_hash.field("type-identity", CanonicalIdentityPart::identity(identity))?;
+            let enumeration_boundary = identities.named_semantic(
+                boundary_hash.finish(),
+                "jvm-external-provider-type",
+                &format!(
+                    "implicit Java provider java.lang is unindexed for type `{}`",
+                    lookup.spelling()
+                ),
+            );
+            for reference in references {
+                identities.record_jvm_external_provider_type_identity(
+                    reference,
+                    enumeration_boundary,
+                    identity,
+                    enumeration_boundary,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 impl JvmImportContext {
@@ -3686,6 +4104,9 @@ struct JavaMemberImportDemand<'a> {
     prefix_reference: Option<SemanticId>,
     anchor: ResolutionRootImportAnchor,
     anchor_semantic: SemanticId,
+    selector_kind: Option<ResolutionImportSelectorKind>,
+    import_precedence: Option<PrecedenceStep>,
+    candidate_origin_rank: Option<u32>,
     /// The route as the import half spells it; a bridge attaches to it.
     route: &'a [ResolutionLookupSemanticRecipe],
     /// The absolute route the selected sources are searched for. It is
@@ -3939,6 +4360,35 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Query-owned direct member continuation. Package prefixes come from
     /// exact selected package rows; each remaining segment must name a member
     /// of the already-proven type. Inherited routes remain incomplete.
+    fn jvm_scala_object_definition(&self, definition: SemanticId) -> Result<bool> {
+        let (Some(ordinal), Some(local_key)) = (definition.ordinal(), definition.local_key())
+        else {
+            return Ok(false);
+        };
+        let record = self
+            .ready
+            .inventory
+            .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+        self.ready
+            .inventory
+            .connection()
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM main.resolution_semantic_sites AS site
+                    JOIN main.resolution_singleton_relations AS singleton
+                      ON singleton.blob_id=site.blob_id
+                     AND singleton.declaration_site=site.source_site
+                    WHERE site.blob_id=?1 AND site.semantic_key=?2
+                      AND site.semantic_role='definition'
+                      AND singleton.kind IN ('object', 'companion')
+                )",
+                rusqlite::params![record.blob_id(), i64::from(local_key)],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     fn jvm_type_member_import_candidates(
         &self,
         context: i64,
@@ -4257,14 +4707,24 @@ impl SelectedResolutionOperation<'_, '_> {
                                                         == brokk_bifrost_core::analyzer::model::CodeUnitType::Field
                                                         || (row.kind
                                                             == brokk_bifrost_core::analyzer::model::CodeUnitType::Class
-                                                            // A Scala object's name ends in `$`. A
-                                                            // class's synthetic `apply` is the
-                                                            // callable, so the class itself is not.
-                                                            && row.fq.as_ref().is_some_and(|identity| {
-                                                                identity.segments.last().is_some_and(
-                                                                    |(_, spelling)| spelling.ends_with('$'),
-                                                                )
-                                                            }))))
+                                                            // Named Scala imports bind both a
+                                                            // class's type and its call role. For
+                                                            // wildcard imports, an object is a term
+                                                            // when its selected singleton row says so.
+                                                            && (import.selector_kind
+                                                                == Some(ResolutionImportSelectorKind::Named)
+                                                                || row.fq.as_ref().is_some_and(|identity| {
+                                                                    identity.segments.last().is_some_and(
+                                                                        |(_, spelling)| spelling.ends_with('$'),
+                                                                    )
+                                                                })
+                                                                || self.jvm_scala_object_definition(
+                                                                    SemanticId::local(
+                                                                        ordinal,
+                                                                        u32::try_from(key.get())
+                                                                            .expect("a catalog position fits u32"),
+                                                                    ),
+                                                                )?))))
                                         }
                                         ResolutionNamespace::TypeOrValue => matches!(
                                             row.kind,
@@ -4480,6 +4940,12 @@ struct JavaPackageTypeImportInventory {
     workspace_inventory_complete: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedJvmPackagePrecedence {
+    tier: Option<PrecedenceTier>,
+    candidate_origin_rank: Option<u32>,
+}
+
 impl SelectedResolutionOperation<'_, '_> {
     fn java_static_import_bridges(
         &self,
@@ -4527,7 +4993,7 @@ impl JavaMemberImportDemand<'_> {
         export_token: SemanticId,
         completion: ResolutionCompletion,
     ) -> SelectedRootBridgeDescriptor {
-        if let Some(prefix) = self.prefix_reference {
+        let bridge = if let Some(prefix) = self.prefix_reference {
             SelectedRootBridgeDescriptor::from_selected_path_tokens_with_prefix(
                 self.source,
                 self.language,
@@ -4558,7 +5024,43 @@ impl JavaMemberImportDemand<'_> {
                 self.demand.clone(),
                 completion,
             )
-        }
+        };
+        let explicit_import = self.selector_kind == Some(ResolutionImportSelectorKind::Named)
+            || matches!(
+                self.import_kind,
+                Some(
+                    ResolutionImportRouteKind::SingleType | ResolutionImportRouteKind::SingleStatic
+                )
+            );
+        let precedence = explicit_import.then(|| {
+            self.import_precedence.unwrap_or(PrecedenceStep {
+                tier: PrecedenceTier::ExplicitImport,
+                ordinal: 0,
+                semantic: self.token,
+            })
+        });
+        let origin = match self.import_kind {
+            Some(
+                ResolutionImportRouteKind::SingleType | ResolutionImportRouteKind::SingleStatic,
+            ) => Some(BindingOrigin::SingleTypeImport),
+            Some(
+                ResolutionImportRouteKind::TypeOnDemand | ResolutionImportRouteKind::StaticOnDemand,
+            ) => Some(BindingOrigin::OnDemandImport),
+            _ => match self.selector_kind {
+                Some(ResolutionImportSelectorKind::Named) => Some(BindingOrigin::ExplicitImport),
+                Some(ResolutionImportSelectorKind::Star) if self.language == Language::Kotlin => {
+                    Some(BindingOrigin::StarImport)
+                }
+                Some(ResolutionImportSelectorKind::Star) => Some(BindingOrigin::WildcardImport),
+                Some(ResolutionImportSelectorKind::ReceiverMember) | None => None,
+            },
+        };
+        let rank = self
+            .candidate_origin_rank
+            .or_else(|| origin.and_then(|origin| binding_origin_rank(self.language, origin)));
+        bridge
+            .with_precedence(precedence)
+            .with_candidate_origin_rank(rank)
     }
 }
 
@@ -5093,6 +5595,9 @@ impl SelectedResolutionOperation<'_, '_> {
                 prefix_reference: *prefix_reference,
                 anchor: *anchor,
                 anchor_semantic: *anchor_semantic,
+                selector_kind: None,
+                import_precedence: None,
+                candidate_origin_rank: None,
                 route: &recipes,
                 lookup_route: &recipes,
                 demand: &source_demand,
@@ -5470,7 +5975,7 @@ impl SelectedResolutionOperation<'_, '_> {
             TypedFactRequest::new(owners),
             cancellation,
             &mut FactPageVisitor::new(&mut |page| {
-                members.extend(page.iter().map(|row| *row.row()));
+                members.extend(page.iter().map(|row| row.row().clone()));
                 Ok(true)
             }),
         )?;
@@ -5705,6 +6210,9 @@ impl SelectedResolutionOperation<'_, '_> {
             prefix_reference: *prefix_reference,
             anchor: *anchor,
             anchor_semantic: *anchor_semantic,
+            selector_kind: None,
+            import_precedence: None,
+            candidate_origin_rank: None,
             route: &recipes,
             lookup_route: &recipes,
             demand: &demand,
@@ -5812,14 +6320,30 @@ mod tests {
         let precedence =
             SelectedResolutionOperation::<'static, 'static>::selected_jvm_package_precedence;
         assert_eq!(
-            precedence(Language::Kotlin, Some("sample"), "sample"),
+            precedence(Language::Kotlin, Some("sample"), "sample").tier,
             Some(PrecedenceTier::PackageOrModule)
         );
         assert_eq!(
-            precedence(Language::Kotlin, Some("sample"), "kotlin.collections"),
+            precedence(Language::Kotlin, Some("sample"), "kotlin.collections").tier,
             Some(PrecedenceTier::DefaultImport)
         );
-        assert_eq!(precedence(Language::Scala, Some("sample"), "scala"), None);
+        assert_eq!(
+            precedence(Language::Kotlin, Some("sample"), "sample").candidate_origin_rank,
+            binding_origin_rank(Language::Kotlin, BindingOrigin::SamePackage)
+        );
+        assert_eq!(
+            precedence(Language::Kotlin, Some("sample"), "kotlin.collections")
+                .candidate_origin_rank,
+            binding_origin_rank(Language::Kotlin, BindingOrigin::StarImport)
+        );
+        assert_eq!(
+            precedence(Language::Java, Some("sample"), "sample").candidate_origin_rank,
+            binding_origin_rank(Language::Java, BindingOrigin::SamePackage)
+        );
+        assert_eq!(
+            precedence(Language::Scala, Some("sample"), "scala").candidate_origin_rank,
+            binding_origin_rank(Language::Scala, BindingOrigin::OtherCompilationUnitPackage)
+        );
     }
 
     #[test]

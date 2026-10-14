@@ -301,11 +301,11 @@ LEFT JOIN main.rust_resolution_unit_summary_file_naming AS child_naming
 pub(crate) const RUST_IMPORT_GRAPH_MEMBER_SELECTION_SQL: &str = r#"
 CREATE TEMP VIEW IF NOT EXISTS selected_rust_import_graph_members AS
 SELECT member.* FROM selected_rust_unit_members AS member
-JOIN main.rust_resolution_unit_summary_contexts AS context
+CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
   ON context.summary_id = member.summary_id
 WHERE context.target_kind <> 'detached' OR NOT EXISTS (
   SELECT 1 FROM selected_rust_unit_members AS attached
-  JOIN main.rust_resolution_unit_summary_contexts AS attached_context
+  CROSS JOIN main.rust_resolution_unit_summary_contexts AS attached_context
     ON attached_context.summary_id = attached.summary_id
   WHERE attached.workspace_id = member.workspace_id
     AND attached.generation = member.generation
@@ -319,7 +319,7 @@ requested_members AS (
   SELECT members.summary_id, members.member_ordinal, members.rel_path,
          json(naming.root_components) AS root_components
   FROM selected_rust_import_graph_members AS members
-  JOIN main.rust_resolution_unit_summary_file_naming AS naming
+  CROSS JOIN main.rust_resolution_unit_summary_file_naming AS naming
     ON naming.summary_id = members.summary_id
    AND naming.member_ordinal = members.member_ordinal
   WHERE members.rel_path IN (SELECT value FROM json_each(?1))
@@ -339,7 +339,7 @@ binding_roots AS (
          route_source.target_binding_module_path AS first_target_module_path,
          route_source.target_binding_name AS first_target_name
   FROM requested_members AS members
-  JOIN main.rust_resolution_unit_summary_effective_bindings AS bindings
+  CROSS JOIN main.rust_resolution_unit_summary_effective_bindings AS bindings
     INDEXED BY rust_resolution_unit_summary_effective_bindings_member_name
     ON bindings.summary_id = members.summary_id
    AND bindings.member_ordinal = members.member_ordinal
@@ -365,9 +365,9 @@ origin_targets(root_summary_id, root_member_ordinal, root_route_ordinal,
          targets.root_route_ordinal, exports.target_unit_key,
          exports.target_module_path, exports.target_name, targets.namespace
   FROM origin_targets AS targets
-  JOIN selected_rust_unit_summary_route_owners AS owner
+  CROSS JOIN selected_rust_unit_summary_route_owners AS owner
     ON owner.unit_key = targets.unit_key
-  JOIN main.rust_resolution_unit_summary_exports AS exports
+  CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
     ON exports.summary_id = owner.summary_id
    AND exports.module_path = targets.module_path AND exports.name = targets.name
    AND exports.namespace = targets.namespace
@@ -402,9 +402,9 @@ roots AS (
    AND route_source.member_ordinal = roots.member_ordinal
    AND route_source.route_provenance_ordinal = roots.route_provenance_ordinal
    AND route_source.hop_ordinal = 0
-  JOIN selected_rust_unit_summary_route_owners AS owner
+  CROSS JOIN selected_rust_unit_summary_route_owners AS owner
     ON owner.unit_key = targets.unit_key
-  JOIN main.rust_resolution_unit_summary_exports AS exports
+  CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
     ON exports.summary_id = owner.summary_id
    AND exports.module_path = targets.module_path AND exports.name = targets.name
    AND exports.namespace = targets.namespace AND exports.origin = 'declaration'
@@ -417,6 +417,8 @@ roots AS (
          target_module_path, target_name
   FROM binding_roots WHERE target_declaration_key IS NOT NULL
 ),
+-- Drive both origin arms from requested roots. Reordering from historical
+-- exports/placements would scan those tables and automatically index roots.
 route_graph(root_summary_id, root_member_ordinal, root_route_ordinal,
             root_rel_path, root_module_path, root_name, root_namespace,
             root_visibility_kind, root_visibility_crate_root,
@@ -437,19 +439,19 @@ route_graph(root_summary_id, root_member_ordinal, root_route_ordinal,
          roots.source_import_id, roots.source_import_ordinal,
          roots.edge_target_unit_key
   FROM roots
-  JOIN selected_rust_unit_summary_route_owners AS origin_owner
+  CROSS JOIN selected_rust_unit_summary_route_owners AS origin_owner
     ON origin_owner.unit_key = roots.target_unit_key
-  JOIN main.rust_resolution_unit_summary_exports AS origin_export
+  CROSS JOIN main.rust_resolution_unit_summary_exports AS origin_export
     ON origin_export.summary_id = origin_owner.summary_id
    AND origin_export.module_path = roots.target_module_path
    AND origin_export.namespace = roots.namespace
    AND origin_export.name = roots.target_name
    AND origin_export.identity_id = roots.target_identity_id
    AND origin_export.origin = 'declaration'
-  JOIN main.resolution_unit_summary_members AS origin_member
+  CROSS JOIN main.resolution_unit_summary_members AS origin_member
     ON origin_member.summary_id = origin_export.summary_id
    AND origin_member.member_ordinal = origin_export.declaration_member_ordinal
-  JOIN main.rust_resolution_unit_summary_file_naming AS origin_naming
+  CROSS JOIN main.rust_resolution_unit_summary_file_naming AS origin_naming
     ON origin_naming.summary_id = origin_member.summary_id
    AND origin_naming.member_ordinal = origin_member.member_ordinal
   WHERE roots.target_identity_id IS NOT NULL
@@ -465,19 +467,19 @@ route_graph(root_summary_id, root_member_ordinal, root_route_ordinal,
          roots.source_import_id, roots.source_import_ordinal,
          roots.edge_target_unit_key
   FROM roots
-  JOIN selected_rust_unit_summary_route_owners AS origin_owner
+  CROSS JOIN selected_rust_unit_summary_route_owners AS origin_owner
     ON origin_owner.unit_key = roots.target_unit_key
-  JOIN main.resolution_unit_summary_members AS origin_member
-    ON origin_member.summary_id = origin_owner.summary_id
-  JOIN main.rust_resolution_unit_summary_placements AS origin_placement
-    ON origin_placement.summary_id = origin_member.summary_id
+  CROSS JOIN main.rust_resolution_unit_summary_placements AS origin_placement
+    ON origin_placement.summary_id = origin_owner.summary_id
    AND origin_placement.module_path = roots.target_module_path
-   AND origin_placement.member_ordinal = origin_member.member_ordinal
-  JOIN main.source_rust_module_declarations AS declaration
+  CROSS JOIN main.resolution_unit_summary_members AS origin_member
+    ON origin_member.summary_id = origin_placement.summary_id
+   AND origin_member.member_ordinal = origin_placement.member_ordinal
+  CROSS JOIN main.source_rust_module_declarations AS declaration
     ON declaration.blob_id = origin_member.blob_id
    AND declaration.declaration_id = roots.target_declaration_key
    AND declaration.module_name = roots.target_name
-  JOIN main.rust_resolution_unit_summary_file_naming AS origin_naming
+  CROSS JOIN main.rust_resolution_unit_summary_file_naming AS origin_naming
     ON origin_naming.summary_id = origin_member.summary_id
    AND origin_naming.member_ordinal = origin_member.member_ordinal
   WHERE roots.target_declaration_key IS NOT NULL
@@ -494,18 +496,18 @@ route_graph(root_summary_id, root_member_ordinal, root_route_ordinal,
          target.source_import_id, target.source_import_ordinal,
          graph.edge_target_unit_key
   FROM route_graph AS graph
-  JOIN main.rust_resolution_unit_summary_import_route_provenance AS route
+  CROSS JOIN main.rust_resolution_unit_summary_import_route_provenance AS route
     INDEXED BY rust_resolution_unit_summary_import_route_provenance_binding
     ON route.summary_id = graph.summary_id
    AND route.route_provenance_ordinal = graph.route_ordinal
-  JOIN selected_rust_unit_summary_route_owners AS target_owner
+  CROSS JOIN selected_rust_unit_summary_route_owners AS target_owner
     ON target_owner.unit_key = route.target_unit_key
-  JOIN main.rust_resolution_unit_summary_effective_bindings AS target
+  CROSS JOIN main.rust_resolution_unit_summary_effective_bindings AS target
     INDEXED BY rust_resolution_unit_summary_effective_bindings_module_name
     ON target.summary_id = target_owner.summary_id
    AND target.module_path = route.target_binding_module_path
    AND target.name = route.target_binding_name AND target.namespace = route.namespace
-  JOIN main.resolution_unit_summary_members AS target_member
+  CROSS JOIN main.resolution_unit_summary_members AS target_member
     ON target_member.summary_id = target.summary_id
    AND target_member.member_ordinal = target.member_ordinal
 )
@@ -4186,9 +4188,6 @@ impl AnalyzerStore {
             ))
         })?;
         let mut conn = self.read_conn_for_workspace(snapshots)?;
-        conn.execute_batch(
-            super::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_SCHEMA_SQL,
-        )?;
         conn.execute_batch(RUST_IMPORT_GRAPH_MEMBER_SELECTION_SQL)?;
         let tx = conn.transaction()?;
         let mut statement = tx.prepare_cached(RUST_SUMMARY_BINDING_COMPLETENESS_SQL)?;
@@ -4259,9 +4258,6 @@ impl AnalyzerStore {
             StoreError::corrupt(format!("Rust binding-surface paths serialize: {error}"))
         })?;
         let mut conn = self.read_conn_for_workspace(snapshots)?;
-        conn.execute_batch(
-            super::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_SCHEMA_SQL,
-        )?;
         conn.execute_batch(RUST_IMPORT_GRAPH_MEMBER_SELECTION_SQL)?;
         let tx = conn.transaction()?;
         let mut statement = tx.prepare_cached(RUST_SUMMARY_BINDING_SURFACES_SQL)?;
@@ -4370,9 +4366,6 @@ impl AnalyzerStore {
         target_names: &[(String, String)],
     ) -> Result<Vec<String>> {
         let mut conn = self.read_conn_for_workspace(snapshots)?;
-        conn.execute_batch(
-            super::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_SCHEMA_SQL,
-        )?;
         conn.execute_batch(RUST_IMPORT_GRAPH_MEMBER_SELECTION_SQL)?;
         let tx = conn.transaction()?;
         let mut statement = tx.prepare_cached(IMPORTING_FILES_FOR_MEMBER_SQL)?;
@@ -4780,6 +4773,7 @@ mod tests {
             [],
         )
         .expect("select fixture Rust workspace");
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
         prepare_pin_context(&conn);
         let mut pin = pinned("rust_unit_summary_import_graph_binding_surfaces");
         pin.params = vec![Value::Text(serde_json::json!(["src/lib.rs"]).to_string())];
@@ -4834,6 +4828,7 @@ mod tests {
             [],
         )
         .expect("select fixture Rust workspace");
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
         prepare_pin_context(&conn);
         let mut pin = pinned("rust_unit_summary_import_graph_binding_completeness");
         pin.params = vec![Value::Text(serde_json::json!(["src/lib.rs"]).to_string())];

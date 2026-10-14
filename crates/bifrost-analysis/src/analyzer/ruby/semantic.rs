@@ -30,7 +30,11 @@ use crate::analyzer::tree_walk::named_children;
 use crate::analyzer::{Language, ProjectFile, RubyAnalyzer};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v12";
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v13";
 
 impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 

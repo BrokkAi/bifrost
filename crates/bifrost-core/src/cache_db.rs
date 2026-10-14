@@ -30,6 +30,12 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 /// The store file and the SQLite sidecars that belong to it.
 pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 const INITIAL_BUILD_LOCK_SUFFIX: &str = ".initial-build.lock";
+/// Name prefix of a store copy staged for an upgrade, and of its SQLite
+/// sidecars. Nothing else in a cache directory starts with it.
+const STAGED_UPGRADE_PREFIX: &str = ".bifrost-cache-import";
+/// The lock that one process in a cache directory holds while it stages an
+/// upgrade. The file is never deleted, so every process locks the same inode.
+const UPGRADE_LOCK_FILE_NAME: &str = ".bifrost-cache-upgrade.lock";
 const ALLOW_NETWORK_CACHE_ENV: &str = "BIFROST_ALLOW_UNSAFE_NETWORK_CACHE";
 
 /// The version the baseline script creates. Versions below it are gone: the
@@ -43,7 +49,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 125;
 /// distinguishes nominal and receiver projection outputs on qualified routes.
 /// Once #2771 lands, this floor must not advance for compatible migrations.
 const FIRST_NATIVE_CACHE_VERSION: i64 = 125;
-const CURRENT_MIGRATION_VERSION: i64 = 174;
+const CURRENT_MIGRATION_VERSION: i64 = 178;
 const _: () = assert!(CURRENT_MIGRATION_VERSION >= FIRST_NATIVE_CACHE_VERSION);
 pub const OPTIONAL_FACT_KIND_CPP_CLASS_TEMPLATE: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
@@ -260,6 +266,22 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 174,
         sql: include_str!("../migrations/cache/0174-jvm-external-owner-inventory.sql"),
     },
+    CacheMigration {
+        version: 175,
+        sql: include_str!("../migrations/cache/0175-contextual-callable-parameter-lists.sql"),
+    },
+    CacheMigration {
+        version: 176,
+        sql: include_str!("../migrations/cache/0176-policy-evaluation-completion-labels.sql"),
+    },
+    CacheMigration {
+        version: 177,
+        sql: include_str!("../migrations/cache/0177-resolution-member-owner-name.sql"),
+    },
+    CacheMigration {
+        version: 178,
+        sql: include_str!("../migrations/cache/0178-class-set-owner-storage-identity.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -284,8 +306,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    173, 218, 25, 40, 168, 166, 180, 53, 134, 213, 13, 179, 208, 15, 10, 130, 46, 129, 58, 193,
-    219, 85, 104, 37, 4, 189, 136, 50, 168, 33, 221, 103,
+    87, 83, 96, 137, 69, 35, 118, 100, 8, 22, 57, 147, 71, 168, 62, 52, 197, 142, 135, 112, 53,
+    103, 183, 140, 140, 242, 52, 245, 201, 135, 213, 249,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -343,7 +365,7 @@ const GENERATED_LEGACY_PROJECT_GITIGNORE: &[u8] = b"/.gitignore\n/bifrost_cache.
 // openers for one canonical cache path. SQLite remains the cross-process lock.
 static PROCESS_LOCAL_OPEN_GUARDS: Lazy<Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-static PROCESS_LOCAL_VERSION_SWEEP_ATTEMPTS: Lazy<Mutex<HashSet<PathBuf>>> =
+static PROCESS_LOCAL_STARTUP_CLEANUP_ATTEMPTS: Lazy<Mutex<HashSet<PathBuf>>> =
     Lazy::new(|| Mutex::new(HashSet::new()));
 
 /// How long the retained store from another schema version may go untouched
@@ -702,7 +724,7 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
             db_path.display()
         )
     })?;
-    let startup_cleanup = disused_version_stores_on_startup(&db_path);
+    let disused_stores = startup_cleanup(&db_path);
     // #2771 is a mandatory cold start across FIRST_NATIVE_CACHE_VERSION.
     // Import selection and staging both reject older schemas before copying;
     // migrate() also replaces one found under this build's active filename.
@@ -754,7 +776,7 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
     if !initialized_before_open {
         delete_legacy_cache_files(&db_path);
     }
-    if let Some(stores) = startup_cleanup
+    if let Some(stores) = disused_stores
         && let Err(error) = remove_version_stores(&stores)
     {
         eprintln!("Bifrost cache startup cleanup skipped: {error}");
@@ -835,17 +857,23 @@ fn network_filesystem_kind(_path: &Path) -> Result<Option<&'static str>> {
     Ok(None)
 }
 
-fn disused_version_stores_on_startup(db_path: &Path) -> Option<Vec<PathBuf>> {
+/// Once per process and cache directory, remove the copies interrupted
+/// upgrades left behind, and return the disused version stores to remove after
+/// this build's store has opened.
+fn startup_cleanup(db_path: &Path) -> Option<Vec<PathBuf>> {
     if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
         return None;
     }
     let cache_dir = db_path.parent()?;
-    let should_attempt = PROCESS_LOCAL_VERSION_SWEEP_ATTEMPTS
+    let should_attempt = PROCESS_LOCAL_STARTUP_CLEANUP_ATTEMPTS
         .lock()
-        .expect("cache version sweep mutex poisoned")
+        .expect("cache startup cleanup mutex poisoned")
         .insert(cache_dir.to_path_buf());
     if !should_attempt {
         return None;
+    }
+    if let Err(error) = collect_abandoned_staged_copies(cache_dir) {
+        eprintln!("Bifrost cache cleanup of interrupted upgrades skipped: {error}");
     }
     match version_store_paths_to_remove(cache_dir) {
         Ok(stores) => Some(stores),
@@ -1132,6 +1160,20 @@ pub fn prepare_cache_dir(cache_dir: &Path) -> Result<PathBuf> {
 /// The copy goes through SQLite's backup API rather than the filesystem
 /// because a live source holds committed pages in its `-wal` sidecar; copying
 /// the main file alone would silently drop them.
+///
+/// Only the holder of the cache directory's upgrade lock stages a copy. Each
+/// copy is as large as the source store, and every linked worktree of a
+/// repository shares one cache directory, so without the lock ten processes
+/// starting at once each wrote their own 10 GB copy, and the ones that were
+/// killed left those copies behind. A process that waited for the lock finds
+/// the store the holder published and stages nothing.
+///
+/// The lock also guards *reading* the older stores. Selecting a candidate reads
+/// its `user_version`, and SQLite's WAL locking protocol does not tolerate a
+/// burst of concurrent openers on one store: an unlucky opener can spend the
+/// protocol retry budget -- about ten seconds -- and then report
+/// SQLITE_PROTOCOL. Every process starting while this build's store is missing
+/// would otherwise probe the same older store at once (#5150).
 fn import_newest_older_store(db_path: &Path) -> Result<()> {
     if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
         return Ok(());
@@ -1145,6 +1187,41 @@ fn import_newest_older_store(db_path: &Path) -> Result<()> {
     let cache_dir = db_path
         .parent()
         .expect("a prepared cache DB path has a parent directory");
+    // Decide whether there is anything to import by name alone. Opening a
+    // candidate here, before the lock, is what let a group of openers land on
+    // one older store at the same time (#5150). A name this build cannot
+    // import only costs one uncontended lock acquisition.
+    if !has_importable_store_candidate(cache_dir)? {
+        return Ok(());
+    }
+    // Held until this function returns, which is after the publish below.
+    // Even a read-only source probe starts a WAL transaction. Keep it inside
+    // the upgrade lock so simultaneous upgraders do not race those probes.
+    let upgrade_lock = open_upgrade_lock(cache_dir)?;
+    match upgrade_lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!(
+                "Bifrost cache upgrade waiting for another process that is upgrading a store in {}",
+                cache_dir.display()
+            );
+            upgrade_lock
+                .lock()
+                .map_err(|err| format!("cache DB I/O error locking upgrades: {err}"))?;
+        }
+        Err(std::fs::TryLockError::Error(err)) => {
+            return Err(format!("cache DB I/O error locking upgrades: {err}"));
+        }
+    }
+    if db_path.exists() {
+        return Ok(());
+    }
+    // Free the space before this upgrade takes as much again.
+    if let Err(error) = remove_abandoned_staged_copies(cache_dir) {
+        eprintln!("Bifrost cache cleanup of interrupted upgrades skipped: {error}");
+    }
+    // The previous holder or a version-store sweep may have changed the
+    // candidates while this process waited.
     let Some(source) = newest_importable_store(cache_dir)? else {
         return Ok(());
     };
@@ -1168,6 +1245,86 @@ fn import_newest_older_store(db_path: &Path) -> Result<()> {
             err.error
         )),
     }
+}
+
+fn open_upgrade_lock(cache_dir: &Path) -> Result<std::fs::File> {
+    let lock_path = cache_dir.join(UPGRADE_LOCK_FILE_NAME);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| format!("cache DB I/O error opening {}: {err}", lock_path.display()))
+}
+
+/// Remove staged upgrade copies when no upgrade is running in `cache_dir`.
+///
+/// A busy lock means a live upgrade, which removes abandoned copies itself
+/// before it stages; a later open retries otherwise.
+fn collect_abandoned_staged_copies(cache_dir: &Path) -> Result<()> {
+    // Most opens find nothing, and need not create the lock file to say so.
+    if staged_copy_paths(cache_dir)?.is_empty() {
+        return Ok(());
+    }
+    let upgrade_lock = open_upgrade_lock(cache_dir)?;
+    match upgrade_lock.try_lock() {
+        Ok(()) => remove_abandoned_staged_copies(cache_dir),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(()),
+        Err(std::fs::TryLockError::Error(err)) => {
+            Err(format!("cache DB I/O error locking upgrades: {err}"))
+        }
+    }
+}
+
+/// Remove every staged upgrade copy and sidecar in `cache_dir`.
+///
+/// The caller holds the upgrade lock. Every upgrade stages only while it holds
+/// that lock, and the operating system releases it when the holder exits, so
+/// each staged file left now belongs to a process that died mid-upgrade. The
+/// lock rather than the file's age is the proof: a large upgrade writes for
+/// minutes, and a suspended one for as long as it stays suspended.
+fn remove_abandoned_staged_copies(cache_dir: &Path) -> Result<()> {
+    let mut removed = Vec::new();
+    let mut outcome = Ok(());
+    for path in staged_copy_paths(cache_dir)? {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                outcome = Err(format!(
+                    "cache DB I/O error removing {}: {err}",
+                    path.display()
+                ));
+                break;
+            }
+        }
+    }
+    if !removed.is_empty() {
+        eprintln!("Bifrost cache removed copies left by interrupted upgrades: {removed:?}");
+    }
+    outcome
+}
+
+fn staged_copy_paths(cache_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(cache_dir).map_err(|err| format!("cache DB I/O error: {err}"))? {
+        let entry = entry.map_err(|err| format!("cache DB I/O error: {err}"))?;
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(STAGED_UPGRADE_PREFIX.as_bytes())
+        {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("cache DB I/O error: {err}"))?;
+        if !file_type.is_dir() {
+            paths.push(entry.path());
+        }
+    }
+    Ok(paths)
 }
 
 /// Copy `source` aside, migrate the copy to this build's schema, and prove the
@@ -1194,7 +1351,7 @@ fn stage_upgraded_store(cache_dir: &Path, source: &Path) -> Result<tempfile::Tem
     })?;
     refuse_pre_native_import(&source_conn, source)?;
     let staged = tempfile::Builder::new()
-        .prefix(".bifrost-cache-import")
+        .prefix(STAGED_UPGRADE_PREFIX)
         .tempfile_in(cache_dir)
         .map_err(|err| format!("failed to stage cache DB upgrade: {err}"))?
         // Release the handle. SQLite owns the path from here; the guard only
@@ -1272,6 +1429,33 @@ fn verify_upgraded_store(conn: &Connection, source: &Path) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Whether `cache_dir` holds any file whose name could be an older store.
+///
+/// A name-only decision, so it can run before the upgrade lock: the version a
+/// candidate really declares needs its `user_version`, which is the lock
+/// holder's job. The false positive -- a name in range that turns out to be
+/// pre-native, unreadable, or already current -- costs one uncontended lock
+/// acquisition, and the probe behind it rejects the file.
+fn has_importable_store_candidate(cache_dir: &Path) -> Result<bool> {
+    for entry in std::fs::read_dir(cache_dir).map_err(|err| format!("cache DB I/O error: {err}"))? {
+        let entry = entry.map_err(|err| format!("cache DB I/O error: {err}"))?;
+        let name = entry.file_name();
+        if name == std::ffi::OsStr::new(LEGACY_CACHE_DB_FILE_NAME) {
+            return Ok(true);
+        }
+        let importable_version =
+            name.to_str()
+                .and_then(store_file_version)
+                .is_some_and(|version| {
+                    (FIRST_NATIVE_CACHE_VERSION..CURRENT_MIGRATION_VERSION).contains(&version)
+                });
+        if importable_version {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The newest store in `cache_dir` this build can migrate forward.
@@ -1918,8 +2102,8 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         return Ok(());
     }
 
-    // Migration 140 replaces the semantic catalog to widen its import-kind
-    // CHECK constraint. Disable FK actions around the migration transaction
+    // Migrations 140 and 178 replace parent tables while preserving their
+    // children. Disable FK actions around the migration transaction
     // so dropping the old parent does not cascade-delete its child rows;
     // migrate_locked runs foreign_key_check before commit, then enforcement is
     // restored before the migrated store is returned.
@@ -2598,6 +2782,16 @@ mod tests {
         );
     }
 
+    /// Whether this process's own writes are constrained by the target
+    /// directory's mode bits, probed exactly as [`cache_write_denial`] probes a
+    /// denial. uid 0 and processes holding CAP_DAC_OVERRIDE bypass the 0o555
+    /// injection the permission tests use, so the denial cannot be injected for
+    /// them and those tests are not applicable (issue #5090).
+    #[cfg(unix)]
+    fn mode_bits_deny_writes(directory: &Path) -> bool {
+        tempfile::NamedTempFile::new_in(directory).is_err()
+    }
+
     #[path = "cpp_class_templates.rs"]
     mod cpp_class_templates;
     #[path = "resolution_schema.rs"]
@@ -2912,6 +3106,249 @@ mod tests {
         assert!(obsolete.exists());
         assert!(lock_path.exists());
         lock.unlock().unwrap();
+    }
+
+    /// A store this build imports: the pre-versioning file, at this schema.
+    fn create_importable_store(cache_dir: &Path) {
+        let legacy = cache_dir.join(LEGACY_CACHE_DB_FILE_NAME);
+        std::fs::File::create(&legacy).unwrap();
+        build_fresh_store(&legacy).unwrap();
+    }
+
+    /// The files a process killed mid-upgrade leaves: the staged copy and its
+    /// SQLite sidecars.
+    fn leave_interrupted_upgrade(cache_dir: &Path, stem: &str) -> Vec<PathBuf> {
+        STORE_FILE_SUFFIXES
+            .iter()
+            .map(|suffix| {
+                let path = cache_dir.join(format!("{STAGED_UPGRADE_PREFIX}{stem}{suffix}"));
+                std::fs::write(&path, b"interrupted upgrade").unwrap();
+                path
+            })
+            .collect()
+    }
+
+    #[test]
+    fn upgrade_waits_for_directory_lock_before_probing_the_legacy_store() {
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let legacy = root.join(LEGACY_CACHE_DB_FILE_NAME);
+        std::fs::write(&legacy, b"older store is being prepared by the lock holder").unwrap();
+        let db_path = root.join(cache_db_file_name());
+        let upgrade_lock = open_upgrade_lock(&root).unwrap();
+        upgrade_lock.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (finished_tx, finished_rx) = mpsc::channel();
+
+        let (before_unlock, result) = thread::scope(|scope| {
+            // Release the held lock before the scope joins its waiter even if
+            // preparing the replacement source panics.
+            let held_upgrade_lock = upgrade_lock;
+            let upgrader = scope.spawn(|| {
+                started_tx.send(()).unwrap();
+                let result = import_newest_older_store(&db_path);
+                finished_tx.send(()).unwrap();
+                result
+            });
+            started_rx.recv().unwrap();
+            let before_unlock = finished_rx.recv_timeout(std::time::Duration::from_millis(100));
+            // The holder may still be preparing the source. A waiter must not
+            // query that source until the holder publishes it and unlocks.
+            std::fs::remove_file(&legacy).unwrap();
+            create_importable_store(&root);
+            held_upgrade_lock.unlock().unwrap();
+            (
+                before_unlock,
+                upgrader.join().expect("upgrade thread panicked"),
+            )
+        });
+
+        assert!(
+            matches!(before_unlock, Err(mpsc::RecvTimeoutError::Timeout)),
+            "upgrade probed the source while its directory lock was held: {before_unlock:?}, {result:?}"
+        );
+        result.unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        assert!(current_schema_is_valid(&conn).unwrap());
+        assert!(staged_copy_paths(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    #[hardwon(
+        "473825ed9b2c: concurrent openers each staged a full copy of the store for one upgrade"
+    )]
+    fn concurrent_upgrades_stage_one_copy_and_publish_one_store() {
+        const UPGRADERS: usize = 8;
+
+        let temp = tempfile::tempdir().unwrap();
+        // Staging opens with SQLITE_OPEN_NOFOLLOW (#4604).
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        create_importable_store(&root);
+        let db_path = root.join(cache_db_file_name());
+        let barrier = Barrier::new(UPGRADERS);
+        let finished = std::sync::atomic::AtomicBool::new(false);
+
+        // The threads call the import directly. `open_unified_connection`
+        // already serializes openers of one path inside a process, so only the
+        // upgrade lock stands between processes. That lock belongs to each
+        // open file, not to the process, so threads contend for it the same
+        // way processes do.
+        let (results, staged_names) = thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let mut staged_names = HashSet::new();
+                while !finished.load(std::sync::atomic::Ordering::SeqCst) {
+                    for entry in std::fs::read_dir(&root).unwrap().flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if name.starts_with(STAGED_UPGRADE_PREFIX)
+                            && !STORE_FILE_SUFFIXES[1..]
+                                .iter()
+                                .any(|suffix| name.ends_with(suffix))
+                        {
+                            staged_names.insert(name);
+                        }
+                    }
+                }
+                staged_names
+            });
+            let upgraders = (0..UPGRADERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        import_newest_older_store(&db_path)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let results = upgraders
+                .into_iter()
+                .map(|handle| handle.join().expect("upgrade thread panicked"))
+                .collect::<Vec<_>>();
+            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            (results, watcher.join().expect("watcher thread panicked"))
+        });
+
+        assert!(
+            results.iter().all(Result::is_ok),
+            "concurrent upgrades failed: {results:#?}"
+        );
+        // The first holder publishes; every waiter then finds the store and
+        // stages nothing. The watcher can miss the one copy, never add one.
+        assert!(
+            staged_names.len() <= 1,
+            "more than one upgrade staged a copy: {staged_names:?}"
+        );
+        let conn = Connection::open(&db_path).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(staged_copy_paths(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    #[hardwon(
+        "473825ed9b2c: copies staged by killed upgrades were never removed and filled the disk"
+    )]
+    fn opening_removes_interrupted_upgrade_copies_and_nothing_else() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        create_importable_store(&root);
+        let mut interrupted = leave_interrupted_upgrade(&root, "Ab12Cd");
+        interrupted.extend(leave_interrupted_upgrade(&root, "Ef34Gh"));
+        std::fs::create_dir(root.join("semantic-packs")).unwrap();
+        let bystanders: Vec<(PathBuf, String)> = [
+            ".gitignore",
+            "bifrost_cache.v150.db",
+            "bifrost_cache.v150.db-wal",
+            "bifrost_cache.db.schema14.bak",
+            "catalog.db",
+            "catalog.db-wal",
+            "semantic-packs/catalog.db",
+            "bifrost_cache.v150.db.initial-build.lock",
+            &format!("{}{INITIAL_BUILD_LOCK_SUFFIX}", cache_db_file_name()),
+        ]
+        .iter()
+        .map(|name| {
+            let path = root.join(name);
+            let expected_contents = format!("bystander {name}");
+            std::fs::write(&path, &expected_contents).unwrap();
+            (path, expected_contents)
+        })
+        .collect();
+        let legacy = root.join(LEGACY_CACHE_DB_FILE_NAME);
+        let legacy_before = std::fs::read(&legacy).unwrap();
+
+        let conn = open_unified_connection(&root.join(cache_db_file_name())).unwrap();
+
+        assert!(current_schema_is_valid(&conn).unwrap());
+        let left: Vec<&PathBuf> = interrupted.iter().filter(|path| path.exists()).collect();
+        assert!(
+            left.is_empty(),
+            "interrupted upgrade files survived: {left:?}"
+        );
+        for (path, expected_contents) in &bystanders {
+            let name = path.strip_prefix(&root).unwrap().display();
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                *expected_contents,
+                "cleanup touched {name}"
+            );
+        }
+        assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
+    }
+
+    #[test]
+    fn opening_leaves_the_copy_of_a_live_upgrade_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let live = leave_interrupted_upgrade(&root, "Ij56Kl");
+        // A live upgrade holds the lock until it publishes.
+        let upgrade_lock = open_upgrade_lock(&root).unwrap();
+        upgrade_lock.lock().unwrap();
+
+        let conn = open_unified_connection(&root.join(cache_db_file_name())).unwrap();
+
+        assert!(current_schema_is_valid(&conn).unwrap());
+        let gone: Vec<&PathBuf> = live.iter().filter(|path| !path.exists()).collect();
+        assert!(gone.is_empty(), "removed files of a live upgrade: {gone:?}");
+        upgrade_lock.unlock().unwrap();
+    }
+
+    #[test]
+    #[hardwon(
+        "#5150: the upgrade probe opened the older store before the upgrade lock, so eight Windows openers read one WAL store at once"
+    )]
+    fn upgrade_probe_opens_no_older_store_before_the_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        // The legacy candidate is the one the probe opens to read its
+        // `user_version`, and SQLite cannot read these contents. A probe that
+        // runs before the lock therefore fails here while the lock is held.
+        std::fs::write(root.join(LEGACY_CACHE_DB_FILE_NAME), b"not a database").unwrap();
+        let db_path = root.join(cache_db_file_name());
+        let (probed, probes) = std::sync::mpsc::channel();
+        let holder = open_upgrade_lock(&root).unwrap();
+        holder.lock().unwrap();
+
+        let importer = thread::spawn(move || {
+            let outcome = import_newest_older_store(&db_path);
+            let _ = probed.send(());
+            outcome
+        });
+
+        assert!(
+            probes.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the importer finished while another process held the upgrade lock"
+        );
+        holder.unlock().unwrap();
+        // Holding the lock, it reaches the candidate and reports the probe
+        // failure.
+        let error = importer
+            .join()
+            .expect("importer thread panicked")
+            .unwrap_err();
+        assert!(error.contains("SQLite error"), "{error}");
     }
 
     fn open_in_memory_cache() -> Connection {
@@ -3939,7 +4376,10 @@ mod tests {
     #[test]
     fn jvm_external_owner_inventory_migration_applies_to_fresh_and_173_stores() {
         let fresh = open_in_memory_cache();
-        assert_eq!(cache_migration_version(&fresh).unwrap(), 174);
+        assert_eq!(
+            cache_migration_version(&fresh).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
         for table in [
             "jvm_external_owners",
             "jvm_external_owner_members",
@@ -3960,7 +4400,10 @@ mod tests {
 
         migrate(&mut upgraded).unwrap();
 
-        assert_eq!(cache_migration_version(&upgraded).unwrap(), 174);
+        assert_eq!(
+            cache_migration_version(&upgraded).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
         for table in [
             "jvm_external_owners",
             "jvm_external_owner_members",
@@ -3968,6 +4411,231 @@ mod tests {
         ] {
             assert!(table_exists(&upgraded, table).unwrap(), "missing {table}");
         }
+    }
+
+    #[test]
+    fn contextual_callable_parameter_lists_migration_applies_to_fresh_and_174_stores() {
+        let fresh = open_in_memory_cache();
+        assert_eq!(
+            cache_migration_version(&fresh).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        let column = fresh
+            .query_row(
+                "SELECT \"notnull\", dflt_value FROM pragma_table_info('resolution_callable_parameter_lists') WHERE name = 'contextual'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(column, (1, "0".to_owned()));
+
+        let mut upgraded = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 174)
+        {
+            upgraded.execute_batch(migration.sql).unwrap();
+        }
+        upgraded.pragma_update(None, "user_version", 174).unwrap();
+        assert_eq!(
+            upgraded
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('resolution_callable_parameter_lists') WHERE name = 'contextual'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        migrate(&mut upgraded).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&upgraded).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            upgraded
+                .query_row(
+                    "SELECT \"notnull\", dflt_value FROM pragma_table_info('resolution_callable_parameter_lists') WHERE name = 'contextual'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            (1, "0".to_owned())
+        );
+    }
+
+    #[test]
+    fn class_set_storage_identity_migration_preserves_owned_rows_and_constraints() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 178)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 177).unwrap();
+        let blob_id = insert_visibility_blob_fixture(&conn, "class-set-owner-migration", None, 1);
+        conn.execute_batch(&format!(
+            "INSERT INTO class_set_root_result_generations VALUES(
+               41, 'java', zeroblob(32), zeroblob(32), zeroblob(32),
+               zeroblob(32), zeroblob(32), 1, 0);
+             INSERT INTO class_set_finding_free_root_results VALUES(
+               42, 41, zeroblob(32), 'Owner.java', {blob_id}, 'java',
+               'complete', 0, 1, 17, zeroblob(32), 0);
+             INSERT INTO class_set_finding_free_root_rows(
+               result_id, row_ordinal, rel_path, start_byte, start_line,
+               start_byte_column, end_byte, end_line, end_byte_column,
+               member, atom_kind, class_name, class_set_status
+             ) VALUES(42, 0, 'Owner.java', 0, 0, 0, 1, 0, 1,
+                      'member', 'workspace', 'Owner', 'known');
+             INSERT INTO class_set_procedure_surfaces(
+               surface_id, surface_digest, procedure_lineage, owner_rel_path,
+               owner_blob_id, lang, artifact_public_identity, artifact_content_identity,
+               schema_version, local_structure_digest, behavior_read_digest,
+               carrier_semantics_digest, direct_calls_digest, call_count, binding_count,
+               entered_count, lexical_child_count, read_count, completion, published_at,
+               exact_behavior_digest, exact_provenance_digest
+             ) VALUES(43, zeroblob(32), zeroblob(32), 'Owner.java', {blob_id}, 'java',
+                      zeroblob(32), zeroblob(32), 1, zeroblob(32), zeroblob(32),
+                      zeroblob(32), zeroblob(32), 0, 0, 0, 1, 0, 'complete', 0,
+                      zeroblob(32), zeroblob(32));
+             INSERT INTO class_set_procedure_surface_lexical_children VALUES(
+               43, 0, zeroblob(32), 'Owner.java', 'java',
+               zeroblob(32), zeroblob(32), zeroblob(32));
+             INSERT INTO class_set_summaries(
+               summary_id, lookup_digest, procedure_lineage, owner_rel_path, owner_blob_id,
+               lang, artifact_public_identity, artifact_content_identity, schema_version,
+               semantics_digest, context_digest, behavior_read_digest, dependency_digest,
+               carrier_digest, field_slots_digest, entry_fact_ordinal, fact_count,
+               exit_count, reached_count, dependency_count, read_count, charge_count,
+               completion, budget_mode, output_digest, content_digest, published_at,
+               root_surface_digest, direct_calls_digest
+             ) VALUES(44, zeroblob(32), zeroblob(32), 'Owner.java', {blob_id}, 'java',
+                      zeroblob(32), zeroblob(32), 1, zeroblob(32), zeroblob(32),
+                      zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(32),
+                      0, 1, 1, 0, 0, 0, 1, 'complete', 'exhaustive',
+                      zeroblob(32), zeroblob(32), 0, zeroblob(32), zeroblob(32));
+             INSERT INTO class_set_summary_charges VALUES(44, 'fact', 1);"
+        ))
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        for (table, key, id) in [
+            ("class_set_finding_free_root_results", "result_id", 42),
+            ("class_set_procedure_surfaces", "surface_id", 43),
+            ("class_set_summaries", "summary_id", 44),
+        ] {
+            let owner: (i64, String) = conn
+                .query_row(
+                    &format!("SELECT owner_blob_id, lang FROM {table} WHERE {key} = ?1"),
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(owner, (blob_id, "java".into()));
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT payload_text_bytes FROM class_set_finding_free_root_results WHERE result_id = 42",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            21
+        );
+        for table in [
+            "class_set_finding_free_root_rows",
+            "class_set_procedure_surface_lexical_children",
+            "class_set_summary_charges",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                1
+            );
+        }
+        assert!(
+            conn.execute(
+                "UPDATE class_set_summaries SET root_surface_digest = NULL",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE class_set_summaries SET direct_calls_digest = NULL",
+                []
+            )
+            .is_err()
+        );
+
+        // A dialect-specific physical owner must coexist with a coarse semantic
+        // language. The root generation still enforces its semantic language.
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'typescript:ts', 0)",
+            [seeded_oid("class-set-typescript-owner")],
+        )
+        .unwrap();
+        let ts_blob_id = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE class_set_procedure_surfaces SET owner_blob_id = ?1, lang = 'typescript'",
+            [ts_blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE class_set_summaries SET owner_blob_id = ?1, lang = 'typescript'",
+            [ts_blob_id],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE class_set_finding_free_root_results SET owner_blob_id = ?1, lang = 'typescript'",
+                [ts_blob_id],
+            )
+            .is_err());
+        conn.execute(
+            "UPDATE class_set_root_result_generations SET lang = 'typescript'",
+            [],
+        )
+        .expect_err("a live result must keep its generation language");
+        conn.execute_batch(
+            "DELETE FROM class_set_finding_free_root_results;
+             UPDATE class_set_root_result_generations SET lang = 'typescript';",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_finding_free_root_results VALUES(
+               42, 41, zeroblob(32), 'subject.ts', ?1, 'typescript',
+               'complete', 0, 0, 13, zeroblob(32), 0)",
+            [ts_blob_id],
+        )
+        .unwrap();
+        assert!(current_schema_is_valid(&conn).unwrap());
+        validate_foreign_keys(&conn).unwrap();
+        conn.execute("DELETE FROM blobs WHERE id = ?1", [ts_blob_id])
+            .unwrap();
+        for table in [
+            "class_set_finding_free_root_results",
+            "class_set_finding_free_root_rows",
+            "class_set_procedure_surfaces",
+            "class_set_procedure_surface_lexical_children",
+            "class_set_summaries",
+            "class_set_summary_charges",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0
+            );
+        }
+        validate_foreign_keys(&conn).unwrap();
     }
 
     #[test]
@@ -4836,6 +5504,16 @@ mod tests {
             .join(cache_db_file_name());
         std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o555)).unwrap();
 
+        if !mode_bits_deny_writes(&workspace_root) {
+            std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            eprintln!(
+                "skipping cache_db::tests::unwritable_workspace_root_reports_the_ways_out: \
+                 this process bypasses the injected 0o555 write denial (issue #5090)"
+            );
+            return;
+        }
+
         let error = open_unified_connection(&db_path).unwrap_err();
 
         // Restored before any assertion can fail, so the tempdir still cleans up.
@@ -4884,6 +5562,15 @@ mod tests {
         std::fs::write(cache_dir.join(".gitignore"), GENERATED_CACHE_GITIGNORE).unwrap();
         let db_path = cache_dir.join(cache_db_file_name());
         std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        if !mode_bits_deny_writes(&cache_dir) {
+            std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "skipping cache_db::tests::unwritable_cache_directory_reports_the_ways_out: \
+                 this process bypasses the injected 0o555 write denial (issue #5090)"
+            );
+            return;
+        }
 
         let error = open_unified_connection(&db_path).unwrap_err();
 

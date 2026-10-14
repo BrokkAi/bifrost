@@ -160,7 +160,12 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// 55: the persisted Scala warning is declaration-scoped and keeps its source
 /// location without becoming a file-level source entry. Old dual-subject
 /// diagnostics cannot satisfy the release reject accounting contract.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 55;
+/// 56: C++ grammar 0.24.3 retains the closing language-linkage guard around
+/// header overloads. This combined epoch invalidates both earlier producers,
+/// including version 55 entries made before the grammar upgrade.
+/// 57: recoverable PHP source-syntax warnings retain their exact source entry,
+/// changing extraction accounting and the gaps reported by warm productions.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 57;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -386,6 +391,29 @@ impl CatalogCandidate {
     pub fn source_id(&self) -> &str {
         &self.source_id
     }
+
+    pub(crate) fn activation_receipt_location(&self) -> ActivationReceiptCandidateLocation {
+        match &self.location {
+            CatalogCandidateLocation::Durable => ActivationReceiptCandidateLocation::Durable,
+            CatalogCandidateLocation::Session {
+                pack_ordinal,
+                shard_ordinal,
+            } => ActivationReceiptCandidateLocation::Session {
+                pack_ordinal: *pack_ordinal,
+                shard_ordinal: *shard_ordinal,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ActivationReceiptCandidateLocation {
+    Durable,
+    Session {
+        pack_ordinal: usize,
+        shard_ordinal: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -10493,6 +10521,211 @@ mod native_compatibility_catalog_tests {
         assert_eq!(
             reopened_candidates[0].manifest_digest(),
             native.manifest.content_sha256.as_str()
+        );
+    }
+}
+
+#[cfg(test)]
+mod activation_receipt_catalog_tests {
+    use super::{CatalogOptions, DurablePackSource, DurablePackSourceKind, SemanticPackCatalog};
+    use crate::analyzer::semantic_model::{
+        ActivationOrigin, ActivationReceipt, ActivationReceiptInvocation, CatalogCoordinate,
+        CompilerOptions, SemanticModelActivationEvidence, SemanticModelActivationRequest,
+        SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SourceFormat, compile_source,
+    };
+    use crate::cancellation::CancellationToken;
+    use semver::Version;
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    fn fixture_pack(pack_id: &str, type_id: &str) -> super::CompiledSemanticModelPack {
+        let source = serde_json::json!({
+            "schema_version": 2,
+            "pack_id": pack_id,
+            "version": "1.0.0",
+            "producer": {"name": "activation-receipt-catalog-test", "version": "1.0.0"},
+            "language": "java",
+            "ecosystem": "maven",
+            "compatibility": {"bifrost": ">=0.8.0, <1.0.0"},
+            "provenance": {"source": "activation-receipt-catalog-test"},
+            "license": "Apache-2.0",
+            "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{
+                "id": "declarations",
+                "activation": [{"package": {"name": "com.acme:widget", "version": "=1.0.0"}}],
+                "payload": {"kind": "declaration_facts", "types": [{
+                    "id": type_id,
+                    "name": format!("com.acme.{type_id}"),
+                    "type_kind": "class",
+                    "visibility": "public",
+                    "locator": {"kind": "artifact", "path": "widget.jar", "symbol": format!("com/acme/{type_id}.class")}
+                }], "members": [], "relations": []}
+            }]
+        });
+        compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).expect("fixture serializes"),
+            &CompilerOptions::default(),
+        )
+        .unwrap_or_else(|diagnostics| panic!("catalog fixture does not compile: {diagnostics:#?}"))
+    }
+
+    fn request() -> SemanticModelActivationRequest {
+        SemanticModelActivationRequest {
+            bifrost_version: Version::parse("0.13.1").expect("valid Bifrost version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "java".to_owned(),
+                ecosystem: "maven".to_owned(),
+                package: Some(CatalogCoordinate {
+                    name: "com.acme:widget".to_owned(),
+                    version: Some(Version::parse("1.0.0").expect("valid package version")),
+                }),
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        }
+    }
+
+    fn new_receipt(directory: &tempfile::TempDir, name: &str) -> Arc<ActivationReceipt> {
+        ActivationReceipt::create(
+            directory.path().join(name),
+            &ActivationReceiptInvocation {
+                invocation_id: name.to_owned(),
+                tool: "query_code".to_owned(),
+            },
+        )
+        .expect("receipt creates exclusively")
+    }
+
+    fn receipt_events(receipt: &ActivationReceipt, path: &std::path::Path) -> Vec<Value> {
+        receipt.finish().expect("receipt footer flushes");
+        std::fs::read(path)
+            .expect("receipt is readable")
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("receipt line is JSON"))
+            .collect()
+    }
+
+    #[test]
+    fn durable_load_miss_is_recorded_incomplete_with_only_a_usable_hash() {
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let pack = fixture_pack("receipt.missing-object", "type.missing-object");
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "test:missing-object".to_owned(),
+                },
+            )
+            .unwrap();
+        let usable_pack = fixture_pack("receipt.usable-object", "type.usable-object");
+        catalog
+            .install(
+                &usable_pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "test:usable-object".to_owned(),
+                },
+            )
+            .unwrap();
+        let candidate = catalog
+            .candidates(&super::SemanticPackSelectorQuery {
+                language: "java".to_owned(),
+                ecosystem: "maven".to_owned(),
+                package: Some(CatalogCoordinate {
+                    name: "com.acme:widget".to_owned(),
+                    version: Some(Version::parse("1.0.0").unwrap()),
+                }),
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+                bifrost_version: Version::parse("0.13.1").unwrap(),
+            })
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.source_id() == "test:missing-object")
+            .expect("installed pack is a durable candidate");
+        // Leave the verified metadata intact so discovery still returns this
+        // candidate. A missing stored object is a real quarantined load miss;
+        // deleting its referenced metadata would violate catalog foreign keys.
+        let object_path = catalog.root.join(super::storage::relative_object_path(
+            &candidate.descriptor().stored_sha256,
+        ));
+        std::fs::remove_file(object_path).expect("remove only the fixture's stored object");
+
+        let temp = tempfile::tempdir().unwrap();
+        let name = "missing-object.jsonl";
+        let receipt = new_receipt(&temp, name);
+        let request = request();
+        let mut frame = receipt.begin_activation(ActivationOrigin::WorkspaceDependencyPublication);
+        frame.record_request(
+            &request,
+            None,
+            super::super::runtime::RuntimeArtifactPublication::default(),
+        );
+        let resolution = super::super::runtime::resolve_active_semantic_models_observed(
+            &catalog,
+            &request,
+            &CancellationToken::default(),
+            Some(&mut frame),
+        );
+        let super::super::runtime::SemanticModelResolutionOutcome::Incomplete { usable, report } =
+            resolution
+        else {
+            panic!("an actual durable candidate load miss remains incomplete");
+        };
+        let usable = usable.map(Arc::new);
+        let runtime = SemanticModelRuntimeOutcome::Incomplete { usable, report };
+        frame.finish_runtime_outcome(&runtime);
+        receipt.bind_snapshot(None).unwrap();
+        let events = receipt_events(&receipt, &temp.path().join(name));
+        let resolution = events
+            .iter()
+            .find(|event| event["event"] == "resolution_finish")
+            .unwrap();
+        assert_eq!(resolution["data"]["status"], "incomplete");
+        assert!(resolution["data"]["active_model_set_hash"].is_null());
+        assert!(resolution["data"]["usable_model_set_hash"].is_string());
+        let runtime = events
+            .iter()
+            .find(|event| event["event"] == "runtime_finish")
+            .unwrap();
+        assert_eq!(runtime["data"]["status"], "incomplete");
+        assert!(runtime["data"]["active_model_set_hash"].is_null());
+        assert!(runtime["data"]["usable_model_set_hash"].is_string());
+        assert_eq!(runtime["data"]["publication"], "usable_not_published");
+        let load = events
+            .iter()
+            .find(|event| {
+                event["event"] == "candidate_load"
+                    && event["data"]["candidate"]["source_id"] == "test:missing-object"
+            })
+            .unwrap();
+        assert_eq!(load["data"]["outcome"]["status"], "quarantined");
+        assert!(
+            load["data"]["outcome"]["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty())
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event["event"] == "final_selection"
+                        && event["data"]["candidate"]["source_id"] == "test:usable-object"
+                })
+                .count(),
+            1
         );
     }
 }

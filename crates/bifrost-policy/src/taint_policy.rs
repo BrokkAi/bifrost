@@ -56,8 +56,9 @@ use crate::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
-    PreparedWorkspaceDispatchSession, ProcedureRangeLookupStatus, RustStdBuiltinCall,
-    RustStdBuiltinTransfer, procedures_in_artifact, rust_std_builtin_call,
+    GapOpenness, PreparedWorkspaceDispatchSession, ProcedureRangeLookupStatus, RustStdBuiltinCall,
+    RustStdBuiltinTransfer, abort_paths_run_user_code, classify_gap_openness,
+    procedures_in_artifact, rust_std_builtin_call,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallArgumentMapping, CallArgumentMember, CallBinding, CallBindings, CallSiteHandle,
@@ -68,9 +69,9 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     ProcedureHandle, ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle, ProofStatus,
     ResolverOwnedExternalCalleeIdentity, ReturnedCallableProvenance, RuntimeReadSourceOrigin,
     SemanticArtifactKey, SemanticBudget, SemanticCapability, SemanticEffect,
-    SemanticExecutionBudget, SemanticGapSubject, SemanticLanguage, SemanticLocator,
-    SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingKind,
-    UnmaterializedExternalTarget, ValueAtPoint, ValueFlowSnapshot, ValueHandle,
+    SemanticExecutionBudget, SemanticGapKind, SemanticGapSubject, SemanticLanguage,
+    SemanticLocator, SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork,
+    SourceMappingKind, UnmaterializedExternalTarget, ValueAtPoint, ValueFlowSnapshot, ValueHandle,
     WorkspaceIcfgProvider, WorkspaceRelativePath, WorkspaceSemanticOracle,
     authored_procedure_target_identity, record_dispatch_read,
 };
@@ -324,7 +325,7 @@ enum TaintPolicyCompilation {
         /// One message per selector row the compile refused to bind (#2308).
         /// Non-empty means the run does not cover the whole selection, so it
         /// must not report `Complete`.
-        refusals: Vec<String>,
+        refusals: Vec<RefusalNotice>,
         incomplete_selectors: Vec<String>,
         authored_selector_summary: bool,
         skipped_region_roots: usize,
@@ -334,7 +335,7 @@ enum TaintPolicyCompilation {
     /// incomplete selector still prevents a complete negative verdict.
     Clean {
         work: PolicyWorkReport,
-        refusals: Vec<String>,
+        refusals: Vec<RefusalNotice>,
         incomplete_selectors: Vec<String>,
         empty_endpoints: EmptyEndpointSets,
         /// Set only for a changed-range answer with no sink in the range
@@ -385,7 +386,7 @@ struct PreparedTaintPlan {
 fn compiled_payload(
     policy_id: &PolicyId,
     work: PolicyWorkReport,
-    refusals: Vec<String>,
+    refusals: Vec<RefusalNotice>,
     empty_endpoints: Option<EmptyEndpointSets>,
     authored_selector_summary: bool,
     incomplete_selectors: Vec<String>,
@@ -395,7 +396,25 @@ fn compiled_payload(
         .unwrap_or_default();
     let source_filtered_by_threat_model =
         empty_endpoints.is_some_and(|empty| empty.source_filtered_by_threat_model);
-    if refusals.is_empty() && incomplete_selectors.is_empty() && !source_filtered_by_threat_model {
+    let has_incomplete_refusal = refusals
+        .iter()
+        .any(|refusal| refusal.impact == PolicyDiagnosticImpact::RunIncomplete);
+    let refusal_diagnostics = refusals
+        .into_iter()
+        .map(|refusal| {
+            PolicyDiagnostic::new_bounded(
+                PolicyDiagnosticCode::EvaluationFailure,
+                PolicyDiagnosticSeverity::Warning,
+                refusal.impact,
+                refusal.message,
+            )
+        })
+        .collect::<Vec<_>>();
+    if !has_incomplete_refusal
+        && incomplete_selectors.is_empty()
+        && !source_filtered_by_threat_model
+    {
+        diagnostics.extend(refusal_diagnostics);
         return TaintProjectionPayload {
             engine: None,
             scope: None,
@@ -412,7 +431,7 @@ fn compiled_payload(
         };
     }
     let mut reasons = Vec::new();
-    if !refusals.is_empty() {
+    if has_incomplete_refusal {
         reasons.push(PolicyIncompleteReason::CapabilityIncomplete);
     }
     if !incomplete_selectors.is_empty() {
@@ -423,19 +442,15 @@ fn compiled_payload(
     }
     let completion = PolicyRunCompletion::inconclusive(reasons)
         .expect("nonempty selector gaps have canonical reasons");
-    diagnostics.extend(
-        refusals
-            .into_iter()
-            .chain(incomplete_selectors)
-            .map(|message| {
-                PolicyDiagnostic::new_bounded(
-                    PolicyDiagnosticCode::EvaluationFailure,
-                    PolicyDiagnosticSeverity::Warning,
-                    PolicyDiagnosticImpact::RunIncomplete,
-                    message,
-                )
-            }),
-    );
+    diagnostics.extend(refusal_diagnostics);
+    diagnostics.extend(incomplete_selectors.into_iter().map(|message| {
+        PolicyDiagnostic::new_bounded(
+            PolicyDiagnosticCode::EvaluationFailure,
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::RunIncomplete,
+            message,
+        )
+    }));
     TaintProjectionPayload {
         engine: None,
         scope: None,
@@ -501,15 +516,16 @@ fn empty_selection_diagnostics(
 /// byte range, and the distinct call ranges that tied. The complete tie set is
 /// in the message so a corpus report says which site could not be named rather
 /// than only that some site could not be.
-fn refusal_messages(refused: &[RefusedCallSite]) -> Vec<String> {
+fn refusal_messages(refused: &[RefusedCallSite]) -> Vec<RefusalNotice> {
     refused
         .iter()
         .map(|refusal| {
-            let site = format!(
-                "{}:{}..{}",
-                refusal.file, refusal.span.start, refusal.span.end
-            );
-            match &refusal.reason {
+            // The message names a workspace-relative file, so it renders the
+            // path with POSIX separators regardless of the host: a diagnostic
+            // is a rendering boundary that needs a stable path spelling.
+            let file = refusal.file.to_string().replace('\\', "/");
+            let site = format!("{}:{}..{}", file, refusal.span.start, refusal.span.end);
+            let message = match &refusal.reason {
                 RefusalReason::AmbiguousCallSite(ranges) => format!(
                     "taint semantic binding refused one site: the selector row at {site} \
                      identifies {} distinct semantic call sites {ranges:?}, so it names no \
@@ -528,13 +544,53 @@ fn refusal_messages(refused: &[RefusedCallSite]) -> Vec<String> {
                     "taint semantic binding refused one site: the port `(argument :name \
                      \"{name}\")` at {site} does not identify one actual there: {detail}"
                 ),
-                RefusalReason::MissingOperand { port, arguments } => format!(
+                RefusalReason::MissingOperand {
+                    port,
+                    arguments,
+                    lowering_gap,
+                } => format!(
                     "taint semantic binding refused one site: the port `{port}` at {site} \
-                     names no operand of the selected call, which has {arguments} argument(s)"
+                     names no operand of the selected call, which has {arguments} argument(s); {}",
+                    if *lowering_gap {
+                        "the call's lowering leaves an unanswered gap at this site"
+                    } else {
+                        "the call's lowering records no unanswered operand gap"
+                    }
                 ),
+            };
+            RefusalNotice {
+                message,
+                impact: refusal.impact,
             }
         })
         .collect()
+}
+
+/// A missing operand is conclusive only when the selected semantic call and
+/// its argument values have no lowering gap that could have dropped it.
+fn missing_operand_has_lowering_gap(
+    procedure: &ProcedureHandle,
+    call: &brokk_bifrost_analysis::analyzer::semantic::SemanticCallSite,
+) -> bool {
+    let semantics = procedure.semantics();
+    let abort_user_code = abort_paths_run_user_code(semantics);
+    semantics.gaps().iter().any(|gap| {
+        let relevant_subject = gap.point == call.point
+            || call
+                .arguments
+                .iter()
+                .any(|argument| gap.subject == SemanticGapSubject::Value(argument.value));
+        relevant_subject
+            && matches!(
+                gap.capability,
+                SemanticCapability::Values | SemanticCapability::Calls
+            )
+            && matches!(
+                gap.kind,
+                SemanticGapKind::Unknown | SemanticGapKind::Unsupported
+            )
+            && classify_gap_openness(semantics, gap, abort_user_code) == GapOpenness::Blocked
+    })
 }
 
 /// Coordinator-owned production adapter.
@@ -732,7 +788,7 @@ impl ProductionTaintPolicyEvaluator {
         active_semantic_model_snapshot: Result<Option<Arc<ActiveSemanticModelSnapshot>>, String>,
         cancellation: Option<&CancellationToken>,
         budget: &PolicyBudget,
-        changed: Option<&[ProjectFile]>,
+        changed: Option<&[PolicyChangedFile]>,
     ) -> Self {
         let uncancelled = CancellationToken::default();
         let cancellation = cancellation.unwrap_or(&uncancelled);
@@ -1144,10 +1200,11 @@ pub(crate) struct TaintPolicyCompiler<'a> {
     candidate_probe: Option<&'a mut candidate::CandidateProbe>,
     /// The files a changed-range run binds sinks in (spec M4.1). `None` for a
     /// whole-workspace run, which binds every sink.
-    changed_files: Option<&'a [ProjectFile]>,
+    changed_files: Option<&'a [PolicyChangedFile]>,
     /// One note per sink selector that could not be sliced to the changed
     /// files and bound the whole workspace instead (spec M4.1).
     range_widened: Vec<String>,
+    examined_procedures: Vec<PolicySourceLocation>,
     /// How a matched-value port resolves to endpoints: from points-to
     /// observations for the up-front compile, from file-local observations
     /// for the composition's frontier (see `FrontierEndpointBinder::new`).
@@ -1238,9 +1295,17 @@ struct RefusedCallSite {
     /// The selector row's own byte range.
     span: ByteRange<usize>,
     reason: RefusalReason,
+    impact: PolicyDiagnosticImpact,
     /// Every procedure that holds a candidate for the refused row. A region
     /// containing none of these cannot contain the refused site.
     procedures: Vec<DurableProcedureKey>,
+}
+
+/// A refusal's rendered explanation and its effect on run completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefusalNotice {
+    pub(crate) message: String,
+    pub(crate) impact: PolicyDiagnosticImpact,
 }
 
 /// What `(argument :name ...)` resolved to at one semantic call site.
@@ -1280,7 +1345,11 @@ enum RefusalReason {
     /// receiver. The selector matched a site the port cannot name, so the
     /// site is refused instead of failing the whole compile. Carries the port
     /// as written and the call's argument count.
-    MissingOperand { port: String, arguments: usize },
+    MissingOperand {
+        port: String,
+        arguments: usize,
+        lowering_gap: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -1510,9 +1579,27 @@ pub(crate) struct CallResolutionDiscoveryEvidence {
 /// The reason `select_taint_engine` gives when no sink was bound.
 const NO_SINKS_REASON: &str = "no-sinks";
 
-/// The scope of a changed-range run over `files`.
-fn changed_range_scope(files: &[ProjectFile], widened: Vec<String>) -> PolicyRunScope {
-    PolicyRunScope::changed_range(files.iter().map(rel_path_string).collect(), widened)
+/// Query-local changed files and their head-buffer hunks. An explicit file
+/// request has no hunk restriction; a diff request always has hunks.
+pub(crate) struct PolicyChangedFile {
+    pub(crate) file: ProjectFile,
+    pub(crate) hunks: Option<Vec<ByteRange<usize>>>,
+}
+
+impl PolicyChangedFile {
+    fn overlaps(&self, procedure: &ByteRange<usize>) -> bool {
+        self.hunks.as_ref().is_none_or(|hunks| {
+            hunks.iter().any(|hunk| {
+                if hunk.is_empty() {
+                    // A pure deletion affects the procedure only at an interior
+                    // head position, not a neighboring declaration or module gap.
+                    procedure.start < hunk.start && hunk.start < procedure.end
+                } else {
+                    procedure.start < hunk.end && hunk.start < procedure.end
+                }
+            })
+        })
+    }
 }
 
 /// Choose the engine of one compiled taint policy (spec M3.0, M4.2). The rule
@@ -2499,6 +2586,24 @@ impl<'a, 'cache> PolicyDiscoveryProvider<'a, 'cache> {
         provider
     }
 
+    pub(crate) fn prefetch_callers(
+        &self,
+        sites: &[brokk_bifrost_analysis::analyzer::usages::CallSite],
+        request: &SemanticRequest<'_>,
+    ) -> Result<(), TaintPolicyCompileError> {
+        let pool = self
+            .dispatch_pool
+            .as_ref()
+            .expect("composition uses a dispatch pool");
+        if self.execution_budget.work().exhausted {
+            pool.discard_prefetched();
+            return Ok(());
+        }
+        pool.prefetch_callers(sites, request).map_err(|error| {
+            self.poison(TaintPolicyCompileError::SemanticProvider(error.to_string()))
+        })
+    }
+
     /// Announce calls whose dispatch this provider will be asked for, so the
     /// first of them that its file resolves takes the others into its batch.
     /// A call whose answer the compile already holds is not announced.
@@ -2758,6 +2863,14 @@ impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, Self::Error> {
         self.require_live()?;
+        if let Some(pool) = &self.dispatch_pool
+            && (self.execution_budget.work().exhausted
+                || request.budget.first_refusal().is_some()
+                || request.cancellation.is_cancelled()
+                || request.cancellation.soft_deadline_passed())
+        {
+            pool.discard_prefetched();
+        }
         record_taint_artifact_read(self.oracle.workspace(), call.procedure());
         let key = call.durable_key();
         if let Some(cached) = self.cache.dispatch.borrow().get(&key).cloned() {
@@ -2775,6 +2888,14 @@ impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
         .map_err(|error| {
             self.poison(TaintPolicyCompileError::SemanticProvider(error.to_string()))
         })?;
+        if let Some(pool) = &self.dispatch_pool
+            && (self.execution_budget.work().exhausted
+                || request.budget.first_refusal().is_some()
+                || request.cancellation.is_cancelled()
+                || request.cancellation.soft_deadline_passed())
+        {
+            pool.discard_prefetched();
+        }
         record_dispatch_read(self.oracle.workspace(), call, &outcome);
         self.require_outcome(&outcome, "taint call dispatch")?;
         self.record_returned_callables(&outcome);
@@ -2859,6 +2980,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             candidate_probe: None,
             changed_files: None,
             range_widened: Vec::new(),
+            examined_procedures: Vec::new(),
             matched_values: Self::resolve_matched_value,
         }
     }
@@ -2871,7 +2993,7 @@ impl<'a> TaintPolicyCompiler<'a> {
     }
 
     /// Bind sinks only in `files` (spec M4.1), or every sink when `None`.
-    pub(crate) fn with_changed_files(mut self, files: Option<&'a [ProjectFile]>) -> Self {
+    pub(crate) fn with_changed_files(mut self, files: Option<&'a [PolicyChangedFile]>) -> Self {
         self.changed_files = files;
         self
     }
@@ -2960,24 +3082,78 @@ impl<'a> TaintPolicyCompiler<'a> {
     /// Bind every sink selector of `spec`, in the changed files `range` when it
     /// is given, or in the whole workspace when it is `None` (spec M4.1). A
     /// selector whose query cannot be sliced to the files binds the whole
-    /// workspace, and its sinks are then kept only where they lie in the files,
-    /// so the range holds either way; the reason is recorded for the run.
+    /// workspace, and its candidates are kept only when their enclosing
+    /// procedure overlaps a changed hunk, before operand binding. The reason
+    /// for widening selector evaluation is recorded for the run.
     fn bind_sinks(
         &mut self,
         spec: &ResolvedTaintPolicySpec,
         selectors: &HashMap<&PolicySelectorPath, &ResolvedPolicySelector>,
-        range: Option<&[ProjectFile]>,
+        range: Option<&[PolicyChangedFile]>,
     ) -> Result<Vec<BoundEndpoint>, TaintPolicyCompileError> {
         let mut sinks = Vec::new();
+        let files = range.map(|changed| {
+            changed
+                .iter()
+                .map(|changed| changed.file.clone())
+                .collect::<Vec<_>>()
+        });
+        // All ranges come from procedure source mappings. Keep the full
+        // per-file range query until binding finishes so a nested unedited
+        // procedure cannot borrow its enclosing procedure's scope.
+        let mut procedure_ranges = HashMap::new();
+        if let Some(changed) = range {
+            self.examined_procedures.clear();
+            for changed in changed {
+                let artifact = self
+                    .selectors
+                    .materialize(&changed.file)
+                    .map_err(taint_selector_error)?;
+                let mut ranges = Vec::new();
+                for procedure in artifact.procedures() {
+                    self.selectors
+                        .require_execution_budget("changed procedure ranges")
+                        .map_err(taint_selector_error)?;
+                    if !self.selectors.execution_budget().charge_traversal(1) {
+                        return Err(query_budget_error(
+                            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                            "changed procedure ranges exhausted the shared traversal budget",
+                        ));
+                    }
+                    let mapping = procedure
+                        .source_mapping(procedure.source())
+                        .expect("validated procedure has its source mapping");
+                    let span = mapping.locator.anchor().span();
+                    let range = span.start_byte() as usize..span.end_byte() as usize;
+                    let overlaps = changed.overlaps(&range);
+                    if overlaps {
+                        self.examined_procedures.push(
+                            super::semantic_identity::policy_location(
+                                self.selectors.workspace(),
+                                &mapping.locator,
+                            )
+                            .map_err(TaintPolicyCompileError::SemanticUnavailable)?,
+                        );
+                    }
+                    ranges.push((range, overlaps));
+                }
+                procedure_ranges.insert(rel_path_string(&changed.file), ranges);
+            }
+            self.examined_procedures.sort();
+            self.examined_procedures.dedup();
+        }
         for sink in &spec.sinks {
             let selector = required_selector(selectors, &sink.definition.selector_path)?;
             let port = &sink.definition.dangerous_operand;
             let selected = match range {
                 None => self.select(selector, port)?,
-                Some(files) => {
+                Some(_) => {
                     let (selected, widened) = self
                         .selectors
-                        .select_taint_sliced(selector, files)
+                        .select_taint_sliced(
+                            selector,
+                            files.as_deref().expect("a range has sliced files"),
+                        )
                         .map_err(taint_selector_error)?;
                     if let Some(reason) = widened {
                         self.range_widened.push(format!(
@@ -2990,6 +3166,22 @@ impl<'a> TaintPolicyCompiler<'a> {
                 }
             };
             for selected in selected {
+                if range.is_some() {
+                    let enclosing = procedure_ranges
+                        .get(&rel_path_string(&selected.file))
+                        .and_then(|ranges| {
+                            ranges
+                                .iter()
+                                .filter(|(range, _)| {
+                                    range.start <= selected.span.start
+                                        && selected.span.end <= range.end
+                                })
+                                .min_by_key(|(range, _)| range.len())
+                        });
+                    if !enclosing.is_some_and(|(_, overlaps)| *overlaps) {
+                        continue;
+                    }
+                }
                 for resolved in self.resolve_selected_values(selected, selector, port)? {
                     sinks.push(BoundEndpoint {
                         endpoint: sink.identity.clone(),
@@ -3007,9 +3199,18 @@ impl<'a> TaintPolicyCompiler<'a> {
             }
         }
         if let Some(files) = range {
-            let changed = files.iter().map(rel_path_string).collect::<HashSet<_>>();
             sinks.retain(|sink| {
-                changed.contains(sink.point.procedure().artifact().key().path().as_str())
+                let procedure = sink.point.procedure();
+                let semantics = procedure.semantics();
+                let mapping = semantics
+                    .source_mapping(semantics.source())
+                    .expect("validated procedure has its source mapping");
+                let span = mapping.locator.anchor().span();
+                let range = span.start_byte() as usize..span.end_byte() as usize;
+                files.iter().any(|changed| {
+                    rel_path_string(&changed.file) == mapping.locator.path().as_str()
+                        && changed.overlaps(&range)
+                })
             });
         }
         Ok(sinks)
@@ -3028,7 +3229,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             .map(|selector| (&selector.path, selector))
             .collect::<HashMap<_, _>>();
         let mut all_sources = Vec::new();
-        // A changed-range run binds sinks in the changed files only (spec M4.1).
+        // A changed-range run binds sinks in edited procedures only.
         let mut all_sinks = self.bind_sinks(spec, &selectors, self.changed_files)?;
         // Spec M3.0 and M4.2: the engine is one rule over the specification
         // and the bound sinks, decided before discovery and any solve, and
@@ -3052,7 +3253,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         // reason is a composition answer with no region to search. Both are
         // decided before any source is bound, so an empty range binds none.
         let mut scope = None;
-        if let Some(files) = self.changed_files {
+        if self.changed_files.is_some() {
             let no_sinks_in_range = all_sinks.is_empty()
                 && match &engine {
                     TaintEngine::Composition => true,
@@ -3062,12 +3263,15 @@ impl<'a> TaintPolicyCompiler<'a> {
                 _ if no_sinks_in_range => {
                     return Ok(CompiledPolicy::NoSinkInRange {
                         engine: TaintEngine::Composition,
-                        scope: changed_range_scope(files, std::mem::take(&mut self.range_widened)),
+                        scope: PolicyRunScope::changed_range(
+                            std::mem::take(&mut self.examined_procedures),
+                            std::mem::take(&mut self.range_widened),
+                        ),
                     });
                 }
                 TaintEngine::Composition => {
-                    scope = Some(changed_range_scope(
-                        files,
+                    scope = Some(PolicyRunScope::changed_range(
+                        std::mem::take(&mut self.examined_procedures),
                         std::mem::take(&mut self.range_widened),
                     ));
                 }
@@ -3475,6 +3679,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             let refused = self
                 .refused_sites
                 .iter()
+                .filter(|refusal| refusal.impact == PolicyDiagnosticImpact::RunIncomplete)
                 .flat_map(|refusal| refusal.procedures.iter().cloned())
                 .collect::<HashSet<_>>();
             discoveries.retain(|discovery| {
@@ -4195,6 +4400,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             file: selection.file.clone(),
             span: selection.span.clone(),
             reason,
+            impact: PolicyDiagnosticImpact::RunIncomplete,
             procedures,
         });
         None
@@ -4205,6 +4411,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             file: selection.file.clone(),
             span: selection.span.clone(),
             reason: RefusalReason::NoValueObservation,
+            impact: PolicyDiagnosticImpact::RunIncomplete,
             // There is no value endpoint to solve. Other endpoints in this
             // procedure keep their findings; the refusal caps run completion.
             procedures: Vec::new(),
@@ -4346,6 +4553,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                                         name: name.clone(),
                                         detail,
                                     },
+                                    impact: PolicyDiagnosticImpact::RunIncomplete,
                                     procedures: vec![procedure.durable_key()],
                                 });
                                 None
@@ -4417,18 +4625,26 @@ impl<'a> TaintPolicyCompiler<'a> {
                 // The selector matched a call that has no operand at this
                 // port. Refuse the site rather than guess its operand, as an
                 // ambiguous row is refused (#2308).
+                let semantic_call = procedure
+                    .semantics()
+                    .call_site(call.id())
+                    .expect("validated call handle resolves");
+                let semantic_arguments = semantic_call.arguments.len();
+                let lowering_gap = missing_operand_has_lowering_gap(procedure, semantic_call);
+                let impact = if lowering_gap {
+                    PolicyDiagnosticImpact::RunIncomplete
+                } else {
+                    PolicyDiagnosticImpact::Advisory
+                };
                 self.refused_sites.push(RefusedCallSite {
                     file: selection.file.clone(),
                     span: selection.span.clone(),
                     reason: RefusalReason::MissingOperand {
                         port: operand_port_label(port),
-                        arguments: procedure
-                            .semantics()
-                            .call_site(call.id())
-                            .expect("validated call handle resolves")
-                            .arguments
-                            .len(),
+                        arguments: semantic_arguments,
+                        lowering_gap,
                     },
+                    impact,
                     procedures: vec![procedure.durable_key()],
                 });
                 continue;
@@ -4826,6 +5042,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                                 name: name.clone(),
                                 detail,
                             },
+                            impact: PolicyDiagnosticImpact::RunIncomplete,
                             procedures: vec![procedure.durable_key()],
                         });
                         return Ok(None);
@@ -7355,7 +7572,7 @@ impl FrontierEndpoint {
 pub(crate) struct FrontierBindings {
     pub(crate) endpoints: Vec<FrontierEndpoint>,
     pub(crate) gaps: Vec<String>,
-    pub(crate) refusals: Vec<String>,
+    pub(crate) refusals: Vec<RefusalNotice>,
 }
 
 /// What the composition needs to match one policy's sources, sanitizers and
@@ -7517,7 +7734,11 @@ impl<'a> FrontierEndpointBinder<'a> {
             }
         }
         let refusals = refusal_messages(&std::mem::take(&mut self.compiler.refused_sites));
-        let mut gaps = refusals.clone();
+        let mut gaps = refusals
+            .iter()
+            .filter(|refusal| refusal.impact == PolicyDiagnosticImpact::RunIncomplete)
+            .map(|refusal| refusal.message.clone())
+            .collect::<Vec<_>>();
         gaps.extend(self.compiler.selectors.take_incomplete_taint_selectors());
         Ok(FrontierBindings {
             endpoints,
@@ -7800,12 +8021,12 @@ fn compose_batch(
     let composition_refusals = provider
         .refusal_messages()
         .into_iter()
-        .map(|message| {
+        .map(|refusal| {
             PolicyDiagnostic::new_bounded(
                 PolicyDiagnosticCode::EvaluationFailure,
                 PolicyDiagnosticSeverity::Warning,
-                PolicyDiagnosticImpact::RunIncomplete,
-                message,
+                refusal.impact,
+                refusal.message,
             )
         })
         .collect();
@@ -11250,8 +11471,8 @@ mod tests {
     use crate::definition::PolicyId;
     use crate::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
     use crate::finding::{
-        PolicyDiagnostic, PolicyIncompleteReason, PolicyRunCompletion, PolicyWorkMetric,
-        PolicyWorkReport,
+        PolicyDiagnostic, PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyIncompleteReason,
+        PolicyRunCompletion, PolicyWorkMetric, PolicyWorkReport,
     };
     use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
     use crate::registry::PolicyRegistry;
@@ -11696,7 +11917,10 @@ mod tests {
         let refused = compiled_payload(
             &policy_id,
             PolicyWorkReport::default(),
-            vec!["contract-violating workspace target".to_owned()],
+            vec![super::RefusalNotice {
+                message: "contract-violating workspace target".to_owned(),
+                impact: super::PolicyDiagnosticImpact::RunIncomplete,
+            }],
             None,
             true,
             Vec::new(),
@@ -12585,7 +12809,7 @@ def put(value):
     pass
 
 def direct():
-    put(read())
+    put(validate(read()))
 ";
 
     const RECEIVER_SANITIZER_SOURCE: &str = r#"
@@ -12997,10 +13221,11 @@ fn run(input: String) {
         }
     }
 
-    /// The other half of the same claim: kills change propagation, so two
-    /// policies that disagree about them must not share a solve. Without the
-    /// kill semantics in the batch compatibility key these two would collide
-    /// on one key and the planner's own equality check would fail the run.
+    /// Kills change propagation, so two policies with different active kills
+    /// must not share a solve. `direct` calls `validate` so the first policy
+    /// binds a kill; the second policy selects `read()`, whose missing argument
+    /// is refused Advisory, leaving it with no kill. Without the kill semantics
+    /// in the batch compatibility key these plans would collide.
     #[test]
     fn flow_policies_with_different_kills_do_not_share_a_solve() {
         let (_workspace, analyzer) = flow_workspace();
@@ -13615,6 +13840,7 @@ pub fn run() {
         )>,
         Vec<String>,
         Vec<String>,
+        Vec<(PolicyDiagnosticSeverity, PolicyDiagnosticImpact, String)>,
     );
 
     /// `COMPOSED_POLICY` with `:unmodeled behavior` over `source`, evaluated
@@ -13676,6 +13902,17 @@ pub fn run() {
                 .map(|diagnostic| diagnostic.message().to_owned())
                 .collect::<Vec<_>>();
             messages.sort();
+            let diagnostics = run
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.severity(),
+                        diagnostic.impact(),
+                        diagnostic.message().to_owned(),
+                    )
+                })
+                .collect();
             (
                 run.engine().map(TaintEngine::render),
                 run.completion().clone(),
@@ -13691,6 +13928,7 @@ pub fn run() {
                     .collect(),
                 families,
                 messages,
+                diagnostics,
             )
         })
     }
@@ -13791,18 +14029,82 @@ pub fn run() {
         }
     }
 
-    /// `run` passes its source as the second argument of a two-argument
-    /// `sink`. `other` calls a one-argument `sink`, which the same name selector
-    /// matches; the policy binds the sink on argument index 1, which that call
-    /// lacks. The site is refused and `other`'s region is dropped, so `run`
-    /// keeps its finding. The refusal makes the run incomplete, and both
-    /// engines answer the same. Before the refusal, binding aborted the whole
-    /// compile with `selected call has no argument at index 1`.
+    #[test]
+    #[hardwon(
+        "a2e548b43fb7: six out-of-arity operand refusals made a complete Vector taint run inconclusive"
+    )]
+    fn missing_operand_with_only_refinement_gaps_is_advisory() {
+        const SOURCE: &str = r#"fn source() -> String {
+    String::new()
+}
+
+fn sink(text: String) -> usize {
+    text.len()
+}
+
+fn sink_valid(text: String) -> usize {
+    text.len()
+}
+
+pub fn run() {
+    sink(source());
+    sink_valid(source());
+}
+"#;
+        let policy = COMPOSED_POLICY
+            .replacen(
+                ":dangerous-operand (argument :index 0)",
+                ":dangerous-operand (argument :index 3)",
+                1,
+            )
+            .replacen(
+                ":accepts [attacker-controlled])])))",
+                ":accepts [attacker-controlled])
+          (sink :id valid-sink :display-name \"valid sink\" :categories [data.sensitive]
+            :selector (rql :schema-version 1
+              (language rust (call :callee (name \"sink_valid\"))))
+            :dangerous-operand (argument :index 0)
+            :accepts [attacker-controlled])])))",
+                1,
+            );
+        let [composed, icfg] = engine_runs_of(&policy, SOURCE, "optimistic");
+        for run in [&composed, &icfg] {
+            assert_eq!(
+                run.1,
+                PolicyRunCompletion::Complete,
+                "call-target refinement gaps do not imply a dropped operand: {run:#?}"
+            );
+            assert_eq!(
+                run.5.len(),
+                1,
+                "one advisory diagnostic is emitted: {run:#?}"
+            );
+            assert_eq!(run.5[0].0, PolicyDiagnosticSeverity::Warning);
+            assert_eq!(run.5[0].1, PolicyDiagnosticImpact::Advisory);
+            assert!(
+                run.5[0]
+                    .2
+                    .contains("the call's lowering records no unanswered operand gap")
+            );
+        }
+        assert_eq!(
+            (&composed.1, &composed.2, &composed.5),
+            (&icfg.1, &icfg.2, &icfg.5),
+            "the engines agree on advisory missing-operand handling"
+        );
+    }
+
+    /// `other` contains a one-argument `println!` call selected with an
+    /// out-of-range argument port. Its malformed macro arguments leave a
+    /// Blocked Values gap at that call point, so the refusal remains
+    /// run-incomplete. `run` contains a separate valid sink, and both engines
+    /// retain its finding. Before missing operands were refused, binding
+    /// aborted the whole compile with `selected call has no argument at index 1`.
     #[test]
     #[hardwon(
         "9ce1a3aecb5a: a selected call without the declared argument aborted the compile instead of being refused"
     )]
-    fn both_engines_refuse_a_selected_call_without_the_declared_operand() {
+    fn both_engines_keep_a_refusal_incomplete_when_the_call_has_a_blocked_values_gap() {
         const OPERAND_SOURCE: &str = r#"fn source() -> String {
     String::new()
 }
@@ -13811,23 +14113,36 @@ fn sink(label: usize, text: String) -> usize {
     label + text.len()
 }
 
-fn other(text: String) -> usize {
-    fn sink(text: String) -> usize {
-        text.len()
-    }
-    sink(text)
+fn sink_valid(text: String) -> usize {
+    text.len()
+}
+
+fn other() {
+    println!(source());
 }
 
 pub fn run() {
     let raw = source();
-    sink(0, raw);
+    sink_valid(raw);
 }
 "#;
-        let policy = COMPOSED_POLICY.replacen(
-            ":dangerous-operand (argument :index 0)",
-            ":dangerous-operand (argument :index 1)",
-            1,
-        );
+        let policy = COMPOSED_POLICY
+            .replacen(
+                ":dangerous-operand (argument :index 0)",
+                ":dangerous-operand (argument :index 1)",
+                1,
+            )
+            .replacen("(name \"sink\")", "(name \"println\")", 1)
+            .replacen(
+                ":accepts [attacker-controlled])])))",
+                ":accepts [attacker-controlled])
+          (sink :id valid-sink :display-name \"valid sink\" :categories [data.sensitive]
+            :selector (rql :schema-version 1
+              (language rust (call :callee (name \"sink_valid\"))))
+            :dangerous-operand (argument :index 0)
+            :accepts [attacker-controlled])])))",
+                1,
+            );
         let [composed, icfg] = engine_runs_of(&policy, OPERAND_SOURCE, "optimistic");
         assert_eq!(composed.0.as_deref(), Some("composition"));
         assert_eq!(icfg.0.as_deref(), Some("icfg (store-ends)"));
@@ -13845,32 +14160,34 @@ pub fn run() {
         assert_eq!(
             icfg.2.len(),
             1,
-            "the two-argument call's flow is reported: {:?}",
+            "the valid sink's flow is reported: {:?}",
             icfg.2
         );
         assert_eq!(
-            icfg.4
+            icfg.5
                 .iter()
                 .filter(
-                    |message| message.contains("the port `(argument :index 1)` at")
-                        && message.contains("which has 1 argument(s)")
+                    |diagnostic| diagnostic.1 == PolicyDiagnosticImpact::RunIncomplete
+                        && diagnostic
+                            .2
+                            .contains("the call's lowering leaves an unanswered gap at this site")
                 )
                 .count(),
             1,
-            "the one-argument call is refused with its diagnostic: {:?}",
-            icfg.4
+            "the call with a lowering gap is refused as incomplete: {:?}",
+            icfg.5
         );
     }
 
     /// `run` holds both sinks the name selector matches: the two-argument
     /// `sink`, which receives the source as argument 1, and the one-argument
-    /// `sink1`, which has no argument 1 and is refused. A composed run builds
-    /// no region, so the refusal costs only its own site: the flow into `sink`
-    /// is reported and the run is incomplete for the refusal. Before, the
+    /// `sink1`, which has no argument 1 and is refused. The call-target gap
+    /// classifies as a refinement question, so the refusal is advisory. The
+    /// flow into `sink` is reported and the composed run is complete. Before, the
     /// composed compile discovered regions and dropped every region holding
     /// `run` (#2308), so the run compiled to no root and failed with "no
-    /// analysis root contains both a selected source and sink". The ICFG
-    /// engine keeps that region rule, so it reports nothing here.
+    /// analysis root contains both a selected source and sink". An advisory
+    /// refusal no longer drops that region from either engine.
     #[test]
     #[hardwon(
         "c3dd2cb6be7f: a refused sink site dropped every sink of its procedure from a composed run"
@@ -13904,9 +14221,8 @@ pub fn run() -> usize {
         assert_eq!(composed.0.as_deref(), Some("composition"));
         assert_eq!(
             composed.1,
-            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::CapabilityIncomplete])
-                .expect("a canonical capability reason"),
-            "the refusal leaves the composed run incomplete"
+            PolicyRunCompletion::Complete,
+            "an answered call-target refinement gap does not degrade the run"
         );
         assert_eq!(
             composed.2.len(),
@@ -13921,15 +14237,18 @@ pub fn run() -> usize {
                 .filter(
                     |message| message.contains("the port `(argument :index 1)` at")
                         && message.contains("which has 1 argument(s)")
+                        && message
+                            .contains("the call's lowering records no unanswered operand gap")
                 )
                 .count(),
             1,
             "the one-argument call is refused with its diagnostic: {:?}",
             composed.4
         );
-        assert!(
-            icfg.2.is_empty(),
-            "the ICFG engine drops the region that holds the refused site: {:?}",
+        assert_eq!(
+            icfg.2.len(),
+            1,
+            "the ICFG engine keeps the advisory region and its valid sink: {:?}",
             icfg.2
         );
     }

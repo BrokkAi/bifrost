@@ -2603,12 +2603,18 @@ fn adapt_definition_answer(
             diagnostics.push(DefinitionLookupDiagnostic {
                 claim: None,
                 kind: "GeneratedItemSurface".to_owned(),
+                // Emit keys in sorted order. `serde_json`'s `preserve_order`
+                // feature is unified into a `--workspace` build (for example by
+                // the policy crate's dev-dependency), which would otherwise
+                // serialize this literal in insertion order and flip the key
+                // order inside the diagnostic message between a narrow and a
+                // whole-workspace run.
                 message: serde_json::json!({
                     "evidence": [{
-                        "reason": "GeneratedItemSurface",
-                        "semantic": frontier.semantic.to_string(),
                         "gap_kind": frontier.kind.evidence_name(),
                         "native_macro_invocation": false,
+                        "reason": "GeneratedItemSurface",
+                        "semantic": frontier.semantic.to_string(),
                     }]
                 })
                 .to_string(),
@@ -2631,12 +2637,13 @@ fn adapt_definition_answer(
         diagnostics.push(DefinitionLookupDiagnostic {
             claim: None,
             kind: kind.to_owned(),
+            // Sorted keys for the same feature-unification reason as above.
             message: serde_json::json!({
-                "reason": reason,
                 "evidence": frontiers.iter().map(|frontier| serde_json::json!({
-                    "semantic": frontier.semantic.to_string(),
                     "gap_kind": frontier.kind.evidence_name(),
+                    "semantic": frontier.semantic.to_string(),
                 })).collect::<Vec<_>>(),
+                "reason": reason,
             })
             .to_string(),
         });

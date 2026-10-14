@@ -659,7 +659,7 @@ fn jsts_binding_range_belongs_to_import(root: Node<'_>, range: Range) -> bool {
 
 pub(super) fn resolve_js_ts(
     analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext<'_>,
+    context: &mut DefinitionBatchContext<'_, '_>,
     file: &ProjectFile,
     language: Language,
     source: &str,

@@ -11,6 +11,9 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
 use rusqlite::{OptionalExtension, params};
 use std::sync::OnceLock;
 
+mod retained;
+use crate::analyzer::resolution::worker_transport::{TransportedAnswer, run_selected_worker};
+
 /// The namespaces a Rust name can be looked up in. A reverse candidate is a
 /// reference that looks the target's name up in any of them, and an export
 /// half is a route from the crate root under one of them.
@@ -703,6 +706,9 @@ pub(crate) const FIELD_REFERENCE_PROVENANCE_SQL: &str = "SELECT
          AND site.role=0 AND site.namespace=?3 AND site.site_kind=?4
          AND site.unqualified=0 AND context.source_site=site.site";
 
+pub(crate) const CALL_ARITY_SQL: &str = include_str!("rust_reverse_call_arity.sql");
+pub(crate) const CALL_SHAPE_SQL: &str = include_str!("rust_reverse_call_shape.sql");
+
 impl SelectedResolutionOperation<'_, '_> {
     fn reverse_target_activation(
         &self,
@@ -1389,11 +1395,12 @@ enum RustContractCompletion {
 /// Confirm every named site of one caller file in one request. The sites of a
 /// candidate blob share everything a point request prepares, so the reverse
 /// asks about all of them at once.
-type ConfirmReferences<'a> = dyn for<'store, 'input> FnMut(
+type ConfirmReferences<'a> = dyn for<'store, 'input> Fn(
         &mut SelectedResolutionOperation<'store, 'input>,
         &Path,
         &[&SelectedSemanticLocator],
     ) -> Result<RustReverseConfirmation>
+    + Sync
     + 'a;
 
 #[cfg(test)]
@@ -1751,8 +1758,9 @@ struct RustReverseQueries<'a, 'store, 'input> {
     selected: &'a mut SelectedResolutionOperation<'store, 'input>,
     cancellation: &'a CancellationToken,
     admitted: Option<&'a HashSet<ProjectFile>>,
-    confirm: &'a mut ConfirmReferences<'a>,
+    confirm: &'a ConfirmReferences<'a>,
     unavailable: Option<SelectedResolutionUnavailable>,
+    stale: Option<SelectedResolutionStale>,
     #[cfg(test)]
     definition_mounts: HashSet<SelectedResolutionMountOrdinal>,
 }
@@ -1775,7 +1783,7 @@ impl RustReverseQueries<'_, '_, '_> {
     fn confirm_locators(
         selected: &mut SelectedResolutionOperation<'_, '_>,
         cancellation: &CancellationToken,
-        confirm: &mut ConfirmReferences<'_>,
+        confirm: &ConfirmReferences<'_>,
         locators: &[&SelectedSemanticLocator],
         auxiliary_locators: &HashSet<&SelectedSemanticLocator>,
         evaluations: &mut usize,
@@ -1807,9 +1815,6 @@ impl RustReverseQueries<'_, '_, '_> {
         for root in roots {
             if cancellation.is_cancelled() {
                 return Ok(RustReverseConfirmation::Cancelled);
-            }
-            if cancellation.soft_deadline_passed() {
-                return Ok(RustReverseConfirmation::TimeBudgetExceeded);
             }
             *evaluations += 1;
             let found = match confirm(selected, Path::new(&root), locators)? {
@@ -1864,7 +1869,7 @@ impl RustReverseQueries<'_, '_, '_> {
     fn contract_completion(
         selected: &mut SelectedResolutionOperation<'_, '_>,
         cancellation: &CancellationToken,
-        confirm: &mut ConfirmReferences<'_>,
+        confirm: &ConfirmReferences<'_>,
         definition: SemanticId,
         implementation: SemanticId,
         evaluations: &mut usize,
@@ -1996,6 +2001,751 @@ impl RustReverseQueries<'_, '_, '_> {
     }
 }
 
+/// Evidence retained by one candidate partition after all reader-dependent
+/// checks. Nothing in this value outlives the enclosing reverse query.
+#[derive(Default)]
+struct RustReverseRetained {
+    references: Vec<SemanticId>,
+    witnesses: Vec<crate::analyzer::resolution::ResolutionWitness>,
+    bindings: Vec<crate::analyzer::resolution::FactReverseReferenceBinding>,
+    accounted_references: Vec<SemanticId>,
+    qualified_references: Vec<SemanticId>,
+    inventory: ResolutionCompletionAccumulator,
+    confirmed_enumeration: HashMap<ProjectFile, ResolutionCompletionAccumulator>,
+    evaluated_type_terminals: Vec<SemanticId>,
+    type_terminal_rejections: Vec<(SemanticId, ResolutionCompletion)>,
+    proven_prefixes: HashSet<SemanticId>,
+    proven_local_type_prefixes: HashSet<SemanticId>,
+    local_prefix_reasons: HashMap<SemanticId, HashSet<ResolutionIncompleteReason>>,
+    time_budget_exceeded: bool,
+    evaluation_count: usize,
+}
+
+/// Target and structured prefix evidence that one partition must check.
+struct RustReverseRetentionInput<'a> {
+    target: &'a CodeUnit,
+    definition: SemanticId,
+    type_terminal_references: &'a HashSet<SemanticId>,
+    type_prefix_references: &'a HashSet<SemanticId>,
+    auxiliary_type_prefix_references: &'a HashSet<SemanticId>,
+}
+
+/// Confirm and retain one fixed group of candidate blobs on its own reader.
+/// The reader is opened, validated, and dropped on this worker thread.
+fn confirm_partition(
+    store: &AnalyzerStore,
+    input: &CapturedSelectedResolutionInput<'_>,
+    cancellation: &CancellationToken,
+    confirm: &ConfirmReferences<'_>,
+    retention: &RustReverseRetentionInput<'_>,
+    parent_sites: &[(&SelectedSemanticLocator, SemanticId)],
+    range: std::ops::Range<usize>,
+) -> Result<SelectedResolutionOperationOutcome<TransportedAnswer<retained::RetainedPartition>>> {
+    let open_timing = crate::profiling::scope("rust_selected::reverse_worker_open");
+    run_selected_worker(store, input, cancellation, |selected| {
+        drop(open_timing);
+        let definition = match selected.locate_rust_definition(retention.target, cancellation)? {
+            SelectedRustDefinitionSemanticOutcome::Found(definition) => definition,
+            SelectedRustDefinitionSemanticOutcome::Missing => {
+                return Ok(SelectedResolutionOperationOutcome::Unavailable(
+                    SelectedResolutionUnavailable::MissingDefinitionUnit {
+                        storage_language: "rust".to_owned(),
+                        persisted_relative_path: crate::path_utils::rel_path_string(
+                            retention.target.source(),
+                        ),
+                    },
+                ));
+            }
+            SelectedRustDefinitionSemanticOutcome::Cancelled => {
+                return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                    cancelled_completion(),
+                ));
+            }
+        };
+        let mut sites = Vec::with_capacity(range.len());
+        let mut admitted = Vec::with_capacity(range.len());
+        let mut type_terminals = HashSet::default();
+        let mut type_prefixes = HashSet::default();
+        let mut auxiliary_prefixes = HashSet::default();
+        for index in range {
+            let (locator, parent_reference) = parent_sites[index];
+            let reference = match selected.ready.lookup_locator(
+                &selected.ready.lexical_source(),
+                locator,
+                cancellation,
+            )? {
+                LocatedSemantic::Found(reference) => reference,
+                LocatedSemantic::Missing => {
+                    return Err(StoreError::new(format!(
+                        "worker has no selected source locator: {locator:?}"
+                    )));
+                }
+                LocatedSemantic::Cancelled => {
+                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                        cancelled_completion(),
+                    ));
+                }
+            };
+            if retention
+                .type_terminal_references
+                .contains(&parent_reference)
+            {
+                type_terminals.insert(reference);
+            }
+            if retention.type_prefix_references.contains(&parent_reference) {
+                type_prefixes.insert(reference);
+            }
+            if retention
+                .auxiliary_type_prefix_references
+                .contains(&parent_reference)
+            {
+                auxiliary_prefixes.insert(reference);
+            }
+            sites.push((index, reference));
+            admitted.push((locator, reference));
+        }
+        let mut retained = RustReverseRetained::default();
+        let mut projected_units = HashSet::default();
+        let mut start = 0;
+        while start < admitted.len() {
+            // A request deadline stops between whole blobs. Never interrupt a
+            // blob's forward solve or its reader-dependent retention checks.
+            if cancellation.soft_deadline_passed() {
+                retained
+                    .inventory
+                    .include(&ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::TimeBudgetExceeded(definition),
+                    ]));
+                retained.time_budget_exceeded = true;
+                break;
+            }
+            let mut end = start + 1;
+            while end < admitted.len()
+                && admitted[end].0.relative_path() == admitted[start].0.relative_path()
+            {
+                end += 1;
+            }
+            let group = admitted[start..end]
+                .iter()
+                .map(|&(locator, _)| locator)
+                .collect::<Vec<_>>();
+            let auxiliary_locators = admitted[start..end]
+                .iter()
+                .filter(|(_, reference)| auxiliary_prefixes.contains(reference))
+                .map(|&(locator, _)| locator)
+                .collect::<HashSet<_>>();
+            let answers = match RustReverseQueries::confirm_locators(
+                selected,
+                cancellation,
+                confirm,
+                &group,
+                &auxiliary_locators,
+                &mut retained.evaluation_count,
+            )? {
+                RustReverseConfirmation::Confirmed(answers) => answers,
+                RustReverseConfirmation::Bounded { .. } => {
+                    retained
+                        .inventory
+                        .include(&ResolutionCompletion::incomplete([
+                            ResolutionIncompleteReason::ReceiverBudgetExhausted(definition),
+                        ]));
+                    std::iter::repeat_with(Vec::new).take(group.len()).collect()
+                }
+                RustReverseConfirmation::Cancelled => {
+                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                        cancelled_completion(),
+                    ));
+                }
+                RustReverseConfirmation::TimeBudgetExceeded => {
+                    retained
+                        .inventory
+                        .include(&ResolutionCompletion::incomplete([
+                            ResolutionIncompleteReason::TimeBudgetExceeded(definition),
+                        ]));
+                    retained.time_budget_exceeded = true;
+                    break;
+                }
+            };
+            projected_units.extend(
+                answers
+                    .iter()
+                    .flatten()
+                    .flat_map(|answer| answer.definitions.iter().cloned()),
+            );
+            let Some(next) = RustReverseQueries::retain_confirmed_sites(
+                selected,
+                cancellation,
+                confirm,
+                RustReverseRetentionInput {
+                    target: retention.target,
+                    definition,
+                    type_terminal_references: &type_terminals,
+                    type_prefix_references: &type_prefixes,
+                    auxiliary_type_prefix_references: &auxiliary_prefixes,
+                },
+                admitted[start..end].to_vec(),
+                answers,
+                retained,
+            )?
+            else {
+                return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                    cancelled_completion(),
+                ));
+            };
+            retained = next;
+            start = end;
+        }
+        let mut unattempted_blobs = admitted[start..]
+            .iter()
+            .map(|(locator, _)| std::path::PathBuf::from(locator.relative_path()))
+            .collect::<Vec<_>>();
+        unattempted_blobs.dedup();
+        Ok(SelectedResolutionOperationOutcome::Native(
+            retained::RetainedPartition {
+                retained,
+                definition,
+                sites,
+                projected_units: projected_units.into_iter().collect(),
+                unattempted_blobs,
+            },
+        ))
+    })
+}
+
+impl RustReverseQueries<'_, '_, '_> {
+    fn confirm_partitions(
+        &mut self,
+        admitted: &[(&SelectedSemanticLocator, SemanticId)],
+        retention: RustReverseRetentionInput<'_>,
+    ) -> Result<Option<RustReverseRetained>> {
+        assert!(
+            !self.selected.ready.store.uses_single_connection_reads(),
+            "worker operations require independent readers"
+        );
+        // Four complete blobs per partition. Both this count and the sorted
+        // locator order are fixed, independent of pool width or completion time.
+        let mut partitions = Vec::new();
+        let mut start = 0;
+        while start < admitted.len() {
+            let mut end = start;
+            for _ in 0..4 {
+                if end == admitted.len() {
+                    break;
+                }
+                let path = admitted[end].0.relative_path();
+                while end < admitted.len() && admitted[end].0.relative_path() == path {
+                    end += 1;
+                }
+            }
+            partitions.push(start..end);
+            start = end;
+        }
+        let store = self.selected.worker_store();
+        let input = self.selected.worker_input();
+        let cancellation = self.cancellation;
+        let confirm = self.confirm;
+        crate::analyzer::ensure_global_rayon_pool();
+        let results = partitions
+            .iter()
+            .map(|_| std::sync::Mutex::new(None))
+            .collect::<Vec<_>>();
+        rayon::scope(|scope| {
+            for (range, result) in partitions.iter().zip(&results) {
+                // The dispatcher and workers share the request's deadline.
+                // Empty slots record groups which were never dispatched.
+                if cancellation.soft_deadline_passed() {
+                    break;
+                }
+                let retention = &retention;
+                scope.spawn(move |_| {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        confirm_partition(
+                            store,
+                            input,
+                            cancellation,
+                            confirm,
+                            retention,
+                            admitted,
+                            range.clone(),
+                        )
+                    }));
+                    let outcome = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(panic) => Err(StoreError::new(format!(
+                            "Rust reverse worker panicked for partition {range:?}: {}",
+                            brokk_bifrost_core::panic_report::panic_payload_message(panic.as_ref()),
+                        ))),
+                    };
+                    *result.lock().expect("worker result lock") = Some(outcome);
+                });
+            }
+        });
+        let mut retained = RustReverseRetained::default();
+        // Indexed collection and content-sorted imports make alias encounter
+        // order deterministic even when worker completion order differs.
+        for (range, result) in partitions.iter().zip(results) {
+            let Some(result) = result.into_inner().expect("worker result lock") else {
+                // An undispatched group has the same unproved status as a
+                // sequential blob skipped at the request deadline.
+                retained
+                    .inventory
+                    .include(&ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::TimeBudgetExceeded(retention.definition),
+                    ]));
+                retained.time_budget_exceeded = true;
+                let mut unattempted_blobs = admitted[range.clone()]
+                    .iter()
+                    .map(|(locator, _)| locator.relative_path())
+                    .collect::<Vec<_>>();
+                unattempted_blobs.dedup();
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!("rust reverse undispatched blobs: {unattempted_blobs:?}")
+                });
+                continue;
+            };
+            match result? {
+                SelectedResolutionOperationOutcome::Native(partition) => {
+                    let answer = partition.answer();
+                    let anchors =
+                        std::iter::once((answer.definition.into(), retention.definition.into()))
+                            .chain(answer.sites.iter().map(|&(index, reference)| {
+                                (reference.into(), admitted[index].1.into())
+                            }))
+                            .collect::<Vec<_>>();
+                    retained.append(
+                        partition
+                            .reintern(self.selected, anchors, cancellation)?
+                            .merge(),
+                    );
+                }
+                SelectedResolutionOperationOutcome::Unavailable(reason) => {
+                    self.unavailable = Some(reason);
+                    return Ok(None);
+                }
+                SelectedResolutionOperationOutcome::Stale(reason) => {
+                    self.stale = Some(reason);
+                    return Ok(None);
+                }
+                SelectedResolutionOperationOutcome::Cancelled(_) => return Ok(None),
+            }
+        }
+        Ok(Some(retained))
+    }
+
+    fn retain_confirmed_sites(
+        selected: &mut SelectedResolutionOperation<'_, '_>,
+        cancellation: &CancellationToken,
+        confirm: &ConfirmReferences<'_>,
+        input: RustReverseRetentionInput<'_>,
+        admitted_sites: Vec<(&SelectedSemanticLocator, SemanticId)>,
+        confirmed: Vec<Vec<SelectedRustReferenceAnswer>>,
+        mut retained: RustReverseRetained,
+    ) -> Result<Option<RustReverseRetained>> {
+        use crate::analyzer::resolution::FactReverseReferenceBinding;
+        let RustReverseRetentionInput {
+            target,
+            definition,
+            type_terminal_references,
+            type_prefix_references,
+            auxiliary_type_prefix_references,
+        } = input;
+        let mut contract_time_budget_exceeded = retained.time_budget_exceeded;
+        for ((locator, reference), answers) in admitted_sites.into_iter().zip(confirmed) {
+            let mut forward_targets = BTreeSet::new();
+            let mut forward_completion = ResolutionCompletionAccumulator::default();
+            let mut closure_completion = ResolutionCompletionAccumulator::default();
+            let mut qualified_views = true;
+            let mut prefix_completion = ResolutionCompletionAccumulator::default();
+            let mut concrete_prefix_views = true;
+            let mut local_type_prefix_views = true;
+            let mut rejected_completion = ResolutionCompletionAccumulator::default();
+            let mut bound = false;
+            let mut binding = None;
+            let observed = !answers.is_empty();
+            if observed && type_terminal_references.contains(&reference) {
+                retained.evaluated_type_terminals.push(reference);
+            }
+            for answer in answers {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "rust reverse confirmation: locator={locator:?}, definitions={:?}, binding={:?}, enumeration={:?}, inventory_details={:?}",
+                        answer.definitions,
+                        answer.resolution.binding(),
+                        answer.enumeration,
+                        answer.inventory_details
+                    )
+                });
+                // Source-fragment enumeration must be complete. The exact
+                // target-linked binder gaps are the only binding reasons
+                // this Cargo view may discharge; activation stays intact.
+                let local_type_prefix = type_prefix_references.contains(&reference)
+                    && locator.role() == LoweredSemanticRole::Reference
+                    && answer.resolution.site_metadata().is_some_and(|metadata| {
+                        metadata.namespace() == ResolutionNamespace::Type
+                            && metadata.site_kind() == ResolutionSiteKind::TypeReference
+                    })
+                    && answer.enumeration.as_ref().is_some_and(|(_, completion)| {
+                        *completion == ResolutionCompletion::Complete
+                    })
+                    && super::rust_crate_context::block_local_type_prefix_binding_is_decided(
+                        &selected.ready,
+                        answer.resolution.binding().targets(),
+                        answer.resolution.binding().completion(),
+                    )?;
+                local_type_prefix_views &= local_type_prefix;
+                if local_type_prefix
+                    && let ResolutionCompletion::Incomplete(reasons) =
+                        answer.resolution.binding().completion()
+                {
+                    retained
+                        .local_prefix_reasons
+                        .entry(reference)
+                        .or_default()
+                        .extend(reasons.iter().copied());
+                }
+                if let Some((file, completion)) = answer.enumeration {
+                    retained
+                        .confirmed_enumeration
+                        .entry(file)
+                        .or_default()
+                        .include(&completion);
+                }
+                if auxiliary_type_prefix_references.contains(&reference) {
+                    // This root was requested only to certify its
+                    // nominated terminal. It is not an independent
+                    // target candidate: an unavailable sibling Cargo
+                    // dependency cannot donate its own root rejection.
+                    // An undecided root still prevents terminal closure.
+                    continue;
+                }
+                // Alternatives are published to a caller that speaks
+                // `CodeUnit`s, so targets that project to the one unit this
+                // scan is about are not alternatives to it. Two `pub fn
+                // value` in one `impl`, or one item declared under two
+                // `cfg`s, are one overload set and every use of the name
+                // would otherwise be ambiguous against itself. `names`
+                // keeps a row per target, so the two counts agreeing is
+                // what says every target projected to a unit rather than
+                // one of them having no `CodeUnit` at all.
+                let every_target_is_this_unit = answer.definitions.as_slice()
+                    == std::slice::from_ref(target)
+                    && answer.lexical_definitions.is_empty()
+                    && (answer.definition_names.len()
+                        == answer.resolution.binding().targets().len()
+                        || (answer.resolution.binding().targets().is_empty()
+                            && !answer.definition_names.is_empty()
+                            && answer
+                                .definition_names
+                                .iter()
+                                .all(|(_, name)| name == target.fq_name().as_str())));
+                // Cfg alternatives of one declaration project to one
+                // CodeUnit. The selected target may be one alternative
+                // while this site's active binding names its sibling.
+                // Macro-use lookup can project an exact target without
+                // listing it in the binding's target set. Its retained.witnesses
+                // still control whether that candidate closes retained.inventory.
+                let binds_target_unit = every_target_is_this_unit;
+                // A site that reached a block-local item names that item,
+                // which is never this target: it has no `CodeUnit`.
+                let block_local = super::rust_block_local_binding_is_decided(
+                    &answer.definitions,
+                    &answer.lexical_definitions,
+                    answer.resolution.binding().completion(),
+                );
+                let answer = answer.resolution;
+                // One answer is one Cargo target's view of this site. Its
+                // alternatives and its completion belong to that view:
+                // another target's answer is a different compilation of the
+                // same file, not an alternative reading of this one. They
+                // are merged below, and only the views that bound the
+                // definition are published with it.
+                let mut answer_targets = BTreeSet::new();
+                let mut answer_completion = ResolutionCompletionAccumulator::default();
+                let mut answer_bound = false;
+                if every_target_is_this_unit {
+                    answer_targets.insert(definition);
+                } else {
+                    answer_targets.extend(answer.binding().targets().iter().copied());
+                }
+                answer_completion.include(
+                    if (block_local && !type_prefix_references.contains(&reference))
+                        || local_type_prefix
+                    {
+                        &ResolutionCompletion::Complete
+                    } else {
+                        answer.binding().completion()
+                    },
+                );
+                retained.witnesses.extend(
+                    answer
+                        .binding()
+                        .witnesses()
+                        .iter()
+                        .filter(|witness| witness.target() == definition)
+                        .cloned(),
+                );
+                let candidate_binding =
+                    FactReverseReferenceBinding::from_forward(reference, &answer);
+                if answer.binding().targets().contains(&definition) || binds_target_unit {
+                    answer_bound = true;
+                    binding = Some(candidate_binding);
+                } else if answer.binding().targets().is_empty()
+                    && (candidate_binding.type_bound_receiver()
+                        || undecided_callable_receiver(&answer))
+                {
+                    let completion =
+                        candidate_binding
+                            .completion()
+                            .combine(&ResolutionCompletion::incomplete([
+                                ResolutionIncompleteReason::UnsupportedSemantic(definition),
+                            ]));
+                    answer_completion.include(&completion);
+                    retained
+                        .witnesses
+                        .push(crate::analyzer::resolution::ResolutionWitness::new(
+                            reference,
+                            definition,
+                            Vec::new(),
+                            completion,
+                        ));
+                    answer_bound = true;
+                    binding = Some(candidate_binding);
+                } else {
+                    for &implementation in answer.binding().targets() {
+                        if contract_time_budget_exceeded {
+                            continue;
+                        }
+                        match Self::contract_completion(
+                            selected,
+                            cancellation,
+                            confirm,
+                            definition,
+                            implementation,
+                            &mut retained.evaluation_count,
+                        )? {
+                            RustContractCompletion::TimeBudgetExceeded => {
+                                contract_time_budget_exceeded = true;
+                                retained.time_budget_exceeded = true;
+                                retained
+                                    .inventory
+                                    .include(&ResolutionCompletion::incomplete([
+                                        ResolutionIncompleteReason::TimeBudgetExceeded(definition),
+                                    ]));
+                            }
+                            RustContractCompletion::Incomplete(completion) => {
+                                retained.inventory.include(&completion);
+                            }
+                            RustContractCompletion::Cancelled => {
+                                return Ok(None);
+                            }
+                            RustContractCompletion::Confirmed(Some(provenance)) => {
+                                answer_completion.include(&provenance);
+                                for witness in answer
+                                    .binding()
+                                    .witnesses()
+                                    .iter()
+                                    .filter(|witness| witness.target() == implementation)
+                                {
+                                    let source = witness.reference();
+                                    let completion = witness.completion();
+                                    let mut steps = witness.steps().to_vec();
+                                    steps
+                                        .push(crate::analyzer::resolution::WitnessStep::Candidate {
+                                        semantic: definition,
+                                        outcome:
+                                            crate::analyzer::structural::CandidateOutcome::Selected,
+                                    });
+                                    retained.witnesses.push(
+                                        crate::analyzer::resolution::ResolutionWitness::new(
+                                            source,
+                                            definition,
+                                            steps,
+                                            completion.combine(&provenance),
+                                        ),
+                                    );
+                                }
+                                answer_bound = true;
+                                binding = Some(candidate_binding.clone());
+                            }
+                            RustContractCompletion::Confirmed(None) => {}
+                        }
+                    }
+                }
+                // A retained binding accounts for this view's source site
+                // even when its receiver remains unproven. Other views
+                // must independently bind or prove exclusion; publishing
+                // one view never discards another root's unresolved route.
+                let answer_completion = answer_completion.finish();
+                // Point evaluation can emit an operation-local reason
+                // while rejecting a concrete unrelated member. It is not
+                // a source retained.inventory gap in this selected reader. Apply
+                // the same ownership check before per-root closure, while
+                // keeping the original binding evidence for retained hits.
+                let proven_other_binding = !answer_bound
+                    && !answer.binding().targets().is_empty()
+                    && answer.binding().targets().iter().all(|target| {
+                        answer.binding().witnesses().iter().any(|witness| {
+                            witness.reference() == reference
+                                && witness.target() == *target
+                                && *witness.completion() == ResolutionCompletion::Complete
+                        })
+                    });
+                let mut completion = if proven_other_binding {
+                    retain_owned_reverse_rejection(selected, answer_completion.clone())
+                } else {
+                    answer_completion.clone()
+                };
+                let wrong_target_dependency = wrong_target_workspace_dependency(
+                    selected,
+                    locator,
+                    reference,
+                    &answer,
+                    cancellation,
+                )?;
+                let target_inaccessible = !answer_bound
+                    && answer_targets.is_empty()
+                    && completion == ResolutionCompletion::Complete
+                    && target_access_denied_at(
+                        selected,
+                        locator,
+                        definition,
+                        reference,
+                        cancellation,
+                    )?;
+                let open_surface = ResolutionIncompleteReason::OpenBoundary {
+                    semantic: reference,
+                    status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
+                };
+                let mut owner_excluded = false;
+                if !answer_bound
+                    && let ResolutionCompletion::Incomplete(reasons) = &completion
+                    && reasons.contains(&open_surface)
+                    && member_owner_unnameable_at(selected, definition, reference, cancellation)?
+                {
+                    completion = reasons.without_reasons([open_surface]).map_or(
+                        ResolutionCompletion::Complete,
+                        ResolutionCompletion::Incomplete,
+                    );
+                    // This exact trait cannot supply the call even though
+                    // another unindexed trait may. Its absence is scoped
+                    // to this target and leaves point uncertainty intact.
+                    owner_excluded = completion == ResolutionCompletion::Complete;
+                }
+                if wrong_target_dependency {
+                    completion = ResolutionCompletion::Complete;
+                } else {
+                    concrete_prefix_views &= !answer_targets.is_empty();
+                }
+                prefix_completion.include(&completion);
+                // A complete empty binding can close local applicability,
+                // but does not prove an unresolved qualified route absent.
+                // Require evidence in every root before closing that
+                // independent retained.inventory placeholder.
+                qualified_views &= answer_bound
+                    || !answer_targets.is_empty()
+                    || wrong_target_dependency
+                    || target_inaccessible
+                    || owner_excluded;
+                // Inventory completion tracks whether this source site
+                // was accounted for. The retained binding carries its
+                // own forward uncertainty and does not make the scan
+                // incomplete.
+                closure_completion.include(if answer_bound {
+                    &ResolutionCompletion::Complete
+                } else {
+                    &completion
+                });
+                // Publish the evidence of the views that bound the
+                // definition, and only those. A view that did not bind it
+                // is another Cargo target's compilation of the same file;
+                // its targets are not alternatives to this one and its
+                // doubt is not doubt about this one. The first binding view
+                // discards whatever earlier non-binding views accumulated.
+                if answer_bound {
+                    if !bound {
+                        bound = true;
+                        forward_targets.clear();
+                        forward_completion = ResolutionCompletionAccumulator::default();
+                    }
+                    forward_targets.extend(answer_targets);
+                    forward_completion.include(&answer_completion);
+                } else if !bound {
+                    forward_targets.extend(answer_targets);
+                    forward_completion.include(&completion);
+                    rejected_completion.include(&completion);
+                }
+            }
+            if auxiliary_type_prefix_references.contains(&reference) {
+                if observed && local_type_prefix_views {
+                    retained.proven_prefixes.insert(reference);
+                    retained.proven_local_type_prefixes.insert(reference);
+                }
+                continue;
+            }
+            let forward_completion = forward_completion.finish();
+            if observed && closure_completion.finish() == ResolutionCompletion::Complete {
+                retained.accounted_references.push(reference);
+                if qualified_views {
+                    retained.qualified_references.push(reference);
+                }
+            }
+            if observed
+                && concrete_prefix_views
+                && prefix_completion.finish() == ResolutionCompletion::Complete
+            {
+                retained.proven_prefixes.insert(reference);
+            }
+            if observed && local_type_prefix_views {
+                retained.proven_local_type_prefixes.insert(reference);
+            }
+            if binding.is_none() {
+                // Crate-root rows nominate every structured component of a
+                // qualified route. Forward confirmation rejects prefix
+                // components. An unowned gap from that negative point has
+                // no producer row capable of weakening the complete
+                // target-index relation; retain only source-owned gaps.
+                let mut rejected =
+                    retain_owned_reverse_rejection(selected, rejected_completion.finish());
+                if type_terminal_references.contains(&reference) {
+                    // Defer the original boundary until all authored
+                    // prefixes have independent proof in every Cargo root.
+                    retained
+                        .type_terminal_rejections
+                        .push((reference, rejected));
+                    continue;
+                }
+                let open_surface = ResolutionIncompleteReason::OpenBoundary {
+                    semantic: reference,
+                    status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
+                };
+                if let ResolutionCompletion::Incomplete(reasons) = &rejected
+                    && reasons.contains(&open_surface)
+                    && member_owner_unnameable_at(selected, definition, reference, cancellation)?
+                {
+                    rejected = reasons.without_reasons([open_surface]).map_or(
+                        ResolutionCompletion::Complete,
+                        ResolutionCompletion::Incomplete,
+                    );
+                }
+                retained.inventory.include(&rejected);
+                continue;
+            }
+            if let Some(binding) = binding {
+                // Preserve alternate forward targets and their completion;
+                // querying one overload must never erase ambiguity.
+                retained.bindings.push(
+                    binding.with_alternatives(
+                        forward_targets.into_iter().collect(),
+                        forward_completion,
+                    ),
+                );
+                retained.references.push(reference);
+            }
+        }
+        Ok(Some(retained))
+    }
+}
+
 impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
     fn analysis_generation(&self) -> u64 {
         self.selected.ready.analysis_generation
@@ -2038,10 +2788,9 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
         &mut self,
         targets: &[CodeUnit],
         candidates: &[RustReverseCandidateSet],
+        request: RustReverseRequest,
     ) -> Result<SelectedRustReverseBatchOutcome> {
-        use crate::analyzer::resolution::{
-            FactReverseReferenceBinding, MAX_REVERSE_TARGETS_PER_BATCH,
-        };
+        use crate::analyzer::resolution::MAX_REVERSE_TARGETS_PER_BATCH;
         assert!(targets.len() <= MAX_REVERSE_TARGETS_PER_BATCH);
         assert_eq!(
             targets.len(),
@@ -2098,13 +2847,7 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
                     .collect::<HashSet<_>>(),
             };
             let lexical = self.selected.ready.lexical_source();
-            let mut references = Vec::new();
-            let mut witnesses = Vec::new();
-            let mut bindings = Vec::new();
-            let mut accounted_references = Vec::new();
-            let mut qualified_references = Vec::new();
             let mut inventory = ResolutionCompletionAccumulator::default();
-            let mut confirmed_enumeration = HashMap::default();
             let target_activation =
                 self.selected
                     .reverse_target_activation(definition, target, self.cancellation)?;
@@ -2336,6 +3079,7 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
                 .copied()
                 .collect::<HashSet<_>>();
             let mut examined = HashSet::default();
+            let nominated_site_count = locators.len();
             let mut candidate_count = 0;
             let mut evaluation_count = 0;
             // Admit and locate every candidate site first, then confirm them
@@ -2350,6 +3094,43 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
                 .inventory
                 .connection()
                 .prepare_cached(FIELD_REFERENCE_PROVENANCE_SQL)?;
+            let connection = self.selected.ready.inventory.connection();
+            let mut call_shape = (request == RustReverseRequest::CallSites)
+                .then(|| connection.prepare_cached(CALL_SHAPE_SQL))
+                .transpose()?;
+            let mut call_shape_rejections = Vec::new();
+            let formal_arities = if request == RustReverseRequest::CallSites {
+                let arities = connection
+                    .prepare_cached(CALL_ARITY_SQL)?
+                    .query_map(
+                        params![
+                            definition.ordinal().map(i64::from),
+                            definition.local_key().map(i64::from)
+                        ],
+                        |row| Ok((row.get::<_, Option<usize>>(0)?, row.get::<_, bool>(1)?)),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if arities.is_empty() || arities.iter().any(|(arity, _)| arity.is_none()) {
+                    None
+                } else {
+                    Some(
+                        serde_json::to_string(
+                            &arities
+                                .iter()
+                                .map(|(arity, receiver)| {
+                                    (
+                                        arity.expect("known formal inventory"),
+                                        usize::from(*receiver),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .expect("arity pairs serialize as JSON"),
+                    )
+                }
+            } else {
+                None
+            };
             for locator in locators {
                 if self.cancellation.is_cancelled() {
                     return Ok(SelectedRustReverseBatchOutcome::Cancelled);
@@ -2357,6 +3138,36 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
                 let file =
                     ProjectFile::new(self.selected.ready.project.root(), locator.relative_path());
                 if self.admitted.is_some_and(|files| !files.contains(&file)) {
+                    continue;
+                }
+                if request == RustReverseRequest::CallSites
+                    && target.is_callable()
+                    && let Some(site) = locator.source_site()
+                    && call_shape.as_mut().expect("call-site request has its statement").query_row(params![
+                        locator.relative_path(), site.get(), formal_arities,
+                        site_kind_code(ResolutionSiteKind::CallableReference),
+                        site_kind_code(ResolutionSiteKind::MemberReference),
+                        namespace_code(ResolutionNamespace::Callable),
+                        super::super::resolution_prepare::resolution_rows::code(
+                            brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_ENGINE_RULE_KINDS,
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionEngineRuleKind::ArgumentCoercionFilter,
+                        ),
+                        super::super::source_facts::provenance_code(
+                            brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::PrimaryNode,
+                        ),
+                        gap_origin_code(crate::analyzer::resolution::LoweringGapOrigin::QualifiedReference),
+                        gap_origin_code(crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                            ResolutionGapKind::UnsupportedCallApplicability,
+                        )),
+                    ], |row| row.get::<_, bool>(0)).optional()? == Some(false)
+                {
+                    // This structural rejection closes only the exact site's
+                    // coarse lookup/applicability placeholders for this target.
+                    // Macro, binder and enumeration gaps stay independent.
+                    let mount = self.selected.mount_table()
+                        .mount_for_path("rust", locator.relative_path())?
+                        .expect("a selected candidate has a mount");
+                    call_shape_rejections.push((mount.ordinal().get(), site.get()));
                     continue;
                 }
                 // Keep inventory_files from before this exclusion: a file
@@ -2419,477 +3230,148 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
                 admitted_sites.push((locator, reference));
             }
             drop(field_provenance);
-            let mut confirmed = Vec::with_capacity(admitted_sites.len());
-            let mut confirmed_site_count = 0;
-            let mut evaluated_type_terminals = Vec::new();
-            let mut type_terminal_rejections = Vec::new();
-            let mut proven_prefixes = HashSet::default();
-            let mut proven_local_type_prefixes = HashSet::default();
-            let mut local_prefix_reasons = HashMap::default();
-            let mut time_budget_exceeded = false;
-            let mut blob_start = 0;
-            while blob_start < admitted_sites.len() {
-                if self.cancellation.is_cancelled() {
-                    return Ok(SelectedRustReverseBatchOutcome::Cancelled);
-                }
-                if self.cancellation.soft_deadline_passed() {
-                    inventory.include(&ResolutionCompletion::incomplete([
-                        ResolutionIncompleteReason::TimeBudgetExceeded(definition),
-                    ]));
-                    time_budget_exceeded = true;
-                    break;
-                }
-                let path = admitted_sites[blob_start].0.relative_path().to_owned();
-                let mut blob_end = blob_start;
-                while blob_end < admitted_sites.len()
-                    && admitted_sites[blob_end].0.relative_path() == path
-                {
-                    blob_end += 1;
-                }
-                let group = admitted_sites[blob_start..blob_end]
-                    .iter()
-                    .map(|&(locator, _)| locator)
-                    .collect::<Vec<_>>();
-                let auxiliary_locators = admitted_sites[blob_start..blob_end]
-                    .iter()
-                    .filter(|(_, reference)| auxiliary_type_prefix_references.contains(reference))
-                    .map(|&(locator, _)| locator)
-                    .collect::<HashSet<_>>();
-                match Self::confirm_locators(
-                    self.selected,
-                    self.cancellation,
-                    self.confirm,
-                    &group,
-                    &auxiliary_locators,
-                    &mut evaluation_count,
-                )? {
-                    RustReverseConfirmation::Confirmed(answers) => {
-                        confirmed_site_count += answers.len();
-                        confirmed.extend(answers);
-                    }
-                    RustReverseConfirmation::Cancelled => {
+            drop(call_shape);
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "rust reverse nominations: target={}, request={request:?}, nominated_sites={nominated_site_count}, confirmed_sites={candidate_count}, confirmed_blobs={}",
+                    target.fq_name(),
+                    admitted_sites
+                        .iter()
+                        .map(|(locator, _)| locator.relative_path())
+                        .collect::<HashSet<_>>()
+                        .len(),
+                )
+            });
+            admitted_sites.sort_unstable_by_key(|(locator, _)| *locator);
+            let retained = if self.selected.ready.store.uses_single_connection_reads() {
+                // The writer-only store cannot lend another reader while this
+                // operation owns its connection.
+                let mut confirmed = Vec::with_capacity(admitted_sites.len());
+                let mut confirmed_site_count = 0;
+                let mut time_budget_exceeded = false;
+                let mut blob_start = 0;
+                while blob_start < admitted_sites.len() {
+                    if self.cancellation.is_cancelled() {
                         return Ok(SelectedRustReverseBatchOutcome::Cancelled);
                     }
-                    // The declared budget stopped this blob. Its sites stay
-                    // unproven and say so; the target keeps every other blob's
-                    // proved answers instead of losing the whole scan.
-                    RustReverseConfirmation::Bounded { .. } => {
-                        inventory.include(&ResolutionCompletion::incomplete([
-                            ResolutionIncompleteReason::ReceiverBudgetExhausted(definition),
-                        ]));
-                        confirmed_site_count += group.len();
-                        confirmed.extend(std::iter::repeat_with(Vec::new).take(group.len()));
-                    }
-                    RustReverseConfirmation::TimeBudgetExceeded => {
+                    if self.cancellation.soft_deadline_passed() {
                         inventory.include(&ResolutionCompletion::incomplete([
                             ResolutionIncompleteReason::TimeBudgetExceeded(definition),
                         ]));
                         time_budget_exceeded = true;
                         break;
                     }
-                }
-                blob_start = blob_end;
-            }
-            assert_eq!(confirmed.len(), confirmed_site_count);
-            assert!(confirmed_site_count <= admitted_sites.len());
-            let mut contract_time_budget_exceeded = time_budget_exceeded;
-            for ((locator, reference), answers) in admitted_sites
-                .into_iter()
-                .zip(confirmed)
-                .take(confirmed_site_count)
-            {
-                let mut forward_targets = BTreeSet::new();
-                let mut forward_completion = ResolutionCompletionAccumulator::default();
-                let mut closure_completion = ResolutionCompletionAccumulator::default();
-                let mut qualified_views = true;
-                let mut prefix_completion = ResolutionCompletionAccumulator::default();
-                let mut concrete_prefix_views = true;
-                let mut local_type_prefix_views = true;
-                let mut rejected_completion = ResolutionCompletionAccumulator::default();
-                let mut bound = false;
-                let mut binding = None;
-                let observed = !answers.is_empty();
-                if observed && type_terminal_prefixes.contains_key(&reference) {
-                    evaluated_type_terminals.push(reference);
-                }
-                for answer in answers {
-                    brokk_bifrost_core::profiling::note_with(|| {
-                        format!(
-                            "rust reverse confirmation: locator={locator:?}, definitions={:?}, binding={:?}, enumeration={:?}, inventory_details={:?}",
-                            answer.definitions,
-                            answer.resolution.binding(),
-                            answer.enumeration,
-                            answer.inventory_details
-                        )
-                    });
-                    // Source-fragment enumeration must be complete. The exact
-                    // target-linked binder gaps are the only binding reasons
-                    // this Cargo view may discharge; activation stays intact.
-                    let local_type_prefix = type_prefix_references.contains(&reference)
-                        && locator.role() == LoweredSemanticRole::Reference
-                        && answer.resolution.site_metadata().is_some_and(|metadata| {
-                            metadata.namespace() == ResolutionNamespace::Type
-                                && metadata.site_kind() == ResolutionSiteKind::TypeReference
-                        })
-                        && answer.enumeration.as_ref().is_some_and(|(_, completion)| {
-                            *completion == ResolutionCompletion::Complete
-                        })
-                        && super::rust_crate_context::block_local_type_prefix_binding_is_decided(
-                            &self.selected.ready,
-                            answer.resolution.binding().targets(),
-                            answer.resolution.binding().completion(),
-                        )?;
-                    local_type_prefix_views &= local_type_prefix;
-                    if local_type_prefix
-                        && let ResolutionCompletion::Incomplete(reasons) =
-                            answer.resolution.binding().completion()
+                    let path = admitted_sites[blob_start].0.relative_path().to_owned();
+                    let mut blob_end = blob_start;
+                    while blob_end < admitted_sites.len()
+                        && admitted_sites[blob_end].0.relative_path() == path
                     {
-                        local_prefix_reasons
-                            .entry(reference)
-                            .or_insert_with(HashSet::default)
-                            .extend(reasons.iter().copied());
+                        blob_end += 1;
                     }
-                    if let Some((file, completion)) = answer.enumeration {
-                        confirmed_enumeration
-                            .entry(file)
-                            .or_insert_with(ResolutionCompletionAccumulator::default)
-                            .include(&completion);
-                    }
-                    if auxiliary_type_prefix_references.contains(&reference) {
-                        // This root was requested only to certify its
-                        // nominated terminal. It is not an independent
-                        // target candidate: an unavailable sibling Cargo
-                        // dependency cannot donate its own root rejection.
-                        // An undecided root still prevents terminal closure.
-                        continue;
-                    }
-                    // Alternatives are published to a caller that speaks
-                    // `CodeUnit`s, so targets that project to the one unit this
-                    // scan is about are not alternatives to it. Two `pub fn
-                    // value` in one `impl`, or one item declared under two
-                    // `cfg`s, are one overload set and every use of the name
-                    // would otherwise be ambiguous against itself. `names`
-                    // keeps a row per target, so the two counts agreeing is
-                    // what says every target projected to a unit rather than
-                    // one of them having no `CodeUnit` at all.
-                    let every_target_is_this_unit = answer.definitions.as_slice()
-                        == std::slice::from_ref(target)
-                        && answer.lexical_definitions.is_empty()
-                        && (answer.definition_names.len()
-                            == answer.resolution.binding().targets().len()
-                            || (answer.resolution.binding().targets().is_empty()
-                                && !answer.definition_names.is_empty()
-                                && answer
-                                    .definition_names
-                                    .iter()
-                                    .all(|(_, name)| name == target.fq_name().as_str())));
-                    // Cfg alternatives of one declaration project to one
-                    // CodeUnit. The selected target may be one alternative
-                    // while this site's active binding names its sibling.
-                    // Macro-use lookup can project an exact target without
-                    // listing it in the binding's target set. Its witnesses
-                    // still control whether that candidate closes inventory.
-                    let binds_target_unit = every_target_is_this_unit;
-                    // A site that reached a block-local item names that item,
-                    // which is never this target: it has no `CodeUnit`.
-                    let block_local = super::rust_block_local_binding_is_decided(
-                        &answer.definitions,
-                        &answer.lexical_definitions,
-                        answer.resolution.binding().completion(),
-                    );
-                    let answer = answer.resolution;
-                    // One answer is one Cargo target's view of this site. Its
-                    // alternatives and its completion belong to that view:
-                    // another target's answer is a different compilation of the
-                    // same file, not an alternative reading of this one. They
-                    // are merged below, and only the views that bound the
-                    // definition are published with it.
-                    let mut answer_targets = BTreeSet::new();
-                    let mut answer_completion = ResolutionCompletionAccumulator::default();
-                    let mut answer_bound = false;
-                    if every_target_is_this_unit {
-                        answer_targets.insert(definition);
-                    } else {
-                        answer_targets.extend(answer.binding().targets().iter().copied());
-                    }
-                    answer_completion.include(
-                        if (block_local && !type_prefix_references.contains(&reference))
-                            || local_type_prefix
-                        {
-                            &ResolutionCompletion::Complete
-                        } else {
-                            answer.binding().completion()
-                        },
-                    );
-                    witnesses.extend(
-                        answer
-                            .binding()
-                            .witnesses()
-                            .iter()
-                            .filter(|witness| witness.target() == definition)
-                            .cloned(),
-                    );
-                    let candidate_binding =
-                        FactReverseReferenceBinding::from_forward(reference, &answer);
-                    if answer.binding().targets().contains(&definition) || binds_target_unit {
-                        answer_bound = true;
-                        binding = Some(candidate_binding);
-                    } else if answer.binding().targets().is_empty()
-                        && (candidate_binding.type_bound_receiver()
-                            || undecided_callable_receiver(&answer))
-                    {
-                        let completion = candidate_binding.completion().combine(
-                            &ResolutionCompletion::incomplete([
-                                ResolutionIncompleteReason::UnsupportedSemantic(definition),
-                            ]),
-                        );
-                        answer_completion.include(&completion);
-                        witnesses.push(crate::analyzer::resolution::ResolutionWitness::new(
-                            reference,
-                            definition,
-                            Vec::new(),
-                            completion,
-                        ));
-                        answer_bound = true;
-                        binding = Some(candidate_binding);
-                    } else {
-                        for &implementation in answer.binding().targets() {
-                            if contract_time_budget_exceeded {
-                                continue;
-                            }
-                            match Self::contract_completion(
-                                self.selected,
-                                self.cancellation,
-                                self.confirm,
-                                definition,
-                                implementation,
-                                &mut evaluation_count,
-                            )? {
-                                RustContractCompletion::TimeBudgetExceeded => {
-                                    contract_time_budget_exceeded = true;
-                                    time_budget_exceeded = true;
-                                    inventory.include(&ResolutionCompletion::incomplete([
-                                        ResolutionIncompleteReason::TimeBudgetExceeded(definition),
-                                    ]));
-                                }
-                                RustContractCompletion::Incomplete(completion) => {
-                                    inventory.include(&completion);
-                                }
-                                RustContractCompletion::Cancelled => {
-                                    return Ok(SelectedRustReverseBatchOutcome::Cancelled);
-                                }
-                                RustContractCompletion::Confirmed(Some(provenance)) => {
-                                    answer_completion.include(&provenance);
-                                    for witness in answer
-                                        .binding()
-                                        .witnesses()
-                                        .iter()
-                                        .filter(|witness| witness.target() == implementation)
-                                    {
-                                        let source = witness.reference();
-                                        let completion = witness.completion();
-                                        let mut steps = witness.steps().to_vec();
-                                        steps
-                                        .push(crate::analyzer::resolution::WitnessStep::Candidate {
-                                        semantic: definition,
-                                        outcome:
-                                            crate::analyzer::structural::CandidateOutcome::Selected,
-                                    });
-                                        witnesses.push(
-                                            crate::analyzer::resolution::ResolutionWitness::new(
-                                                source,
-                                                definition,
-                                                steps,
-                                                completion.combine(&provenance),
-                                            ),
-                                        );
-                                    }
-                                    answer_bound = true;
-                                    binding = Some(candidate_binding.clone());
-                                }
-                                RustContractCompletion::Confirmed(None) => {}
-                            }
-                        }
-                    }
-                    // A retained binding accounts for this view's source site
-                    // even when its receiver remains unproven. Other views
-                    // must independently bind or prove exclusion; publishing
-                    // one view never discards another root's unresolved route.
-                    let answer_completion = answer_completion.finish();
-                    // Point evaluation can emit an operation-local reason
-                    // while rejecting a concrete unrelated member. It is not
-                    // a source inventory gap in this selected reader. Apply
-                    // the same ownership check before per-root closure, while
-                    // keeping the original binding evidence for retained hits.
-                    let proven_other_binding = !answer_bound
-                        && !answer.binding().targets().is_empty()
-                        && answer.binding().targets().iter().all(|target| {
-                            answer.binding().witnesses().iter().any(|witness| {
-                                witness.reference() == reference
-                                    && witness.target() == *target
-                                    && *witness.completion() == ResolutionCompletion::Complete
-                            })
-                        });
-                    let mut completion = if proven_other_binding {
-                        retain_owned_reverse_rejection(self.selected, answer_completion.clone())
-                    } else {
-                        answer_completion.clone()
-                    };
-                    let wrong_target_dependency = wrong_target_workspace_dependency(
+                    let group = admitted_sites[blob_start..blob_end]
+                        .iter()
+                        .map(|&(locator, _)| locator)
+                        .collect::<Vec<_>>();
+                    let auxiliary_locators = admitted_sites[blob_start..blob_end]
+                        .iter()
+                        .filter(|(_, reference)| {
+                            auxiliary_type_prefix_references.contains(reference)
+                        })
+                        .map(|&(locator, _)| locator)
+                        .collect::<HashSet<_>>();
+                    match Self::confirm_locators(
                         self.selected,
-                        locator,
-                        reference,
-                        &answer,
                         self.cancellation,
-                    )?;
-                    let target_inaccessible = !answer_bound
-                        && answer_targets.is_empty()
-                        && completion == ResolutionCompletion::Complete
-                        && target_access_denied_at(
-                            self.selected,
-                            locator,
-                            definition,
-                            reference,
-                            self.cancellation,
-                        )?;
-                    let open_surface = ResolutionIncompleteReason::OpenBoundary {
-                        semantic: reference,
-                        status:
-                            crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
-                    };
-                    let mut owner_excluded = false;
-                    if !answer_bound
-                        && let ResolutionCompletion::Incomplete(reasons) = &completion
-                        && reasons.contains(&open_surface)
-                        && member_owner_unnameable_at(
-                            self.selected,
-                            definition,
-                            reference,
-                            self.cancellation,
-                        )?
-                    {
-                        completion = reasons.without_reasons([open_surface]).map_or(
-                            ResolutionCompletion::Complete,
-                            ResolutionCompletion::Incomplete,
-                        );
-                        // This exact trait cannot supply the call even though
-                        // another unindexed trait may. Its absence is scoped
-                        // to this target and leaves point uncertainty intact.
-                        owner_excluded = completion == ResolutionCompletion::Complete;
-                    }
-                    if wrong_target_dependency {
-                        completion = ResolutionCompletion::Complete;
-                    } else {
-                        concrete_prefix_views &= !answer_targets.is_empty();
-                    }
-                    prefix_completion.include(&completion);
-                    // A complete empty binding can close local applicability,
-                    // but does not prove an unresolved qualified route absent.
-                    // Require evidence in every root before closing that
-                    // independent inventory placeholder.
-                    qualified_views &= answer_bound
-                        || !answer_targets.is_empty()
-                        || wrong_target_dependency
-                        || target_inaccessible
-                        || owner_excluded;
-                    // Inventory completion tracks whether this source site
-                    // was accounted for. The retained binding carries its
-                    // own forward uncertainty and does not make the scan
-                    // incomplete.
-                    closure_completion.include(if answer_bound {
-                        &ResolutionCompletion::Complete
-                    } else {
-                        &completion
-                    });
-                    // Publish the evidence of the views that bound the
-                    // definition, and only those. A view that did not bind it
-                    // is another Cargo target's compilation of the same file;
-                    // its targets are not alternatives to this one and its
-                    // doubt is not doubt about this one. The first binding view
-                    // discards whatever earlier non-binding views accumulated.
-                    if answer_bound {
-                        if !bound {
-                            bound = true;
-                            forward_targets.clear();
-                            forward_completion = ResolutionCompletionAccumulator::default();
+                        self.confirm,
+                        &group,
+                        &auxiliary_locators,
+                        &mut evaluation_count,
+                    )? {
+                        RustReverseConfirmation::Confirmed(answers) => {
+                            confirmed_site_count += answers.len();
+                            confirmed.extend(answers);
                         }
-                        forward_targets.extend(answer_targets);
-                        forward_completion.include(&answer_completion);
-                    } else if !bound {
-                        forward_targets.extend(answer_targets);
-                        forward_completion.include(&completion);
-                        rejected_completion.include(&completion);
+                        RustReverseConfirmation::Cancelled => {
+                            return Ok(SelectedRustReverseBatchOutcome::Cancelled);
+                        }
+                        // The declared budget stopped this blob. Its sites stay
+                        // unproven and say so; the target keeps every other blob's
+                        // proved answers instead of losing the whole scan.
+                        RustReverseConfirmation::Bounded { .. } => {
+                            inventory.include(&ResolutionCompletion::incomplete([
+                                ResolutionIncompleteReason::ReceiverBudgetExhausted(definition),
+                            ]));
+                            confirmed_site_count += group.len();
+                            confirmed.extend(std::iter::repeat_with(Vec::new).take(group.len()));
+                        }
+                        RustReverseConfirmation::TimeBudgetExceeded => {
+                            inventory.include(&ResolutionCompletion::incomplete([
+                                ResolutionIncompleteReason::TimeBudgetExceeded(definition),
+                            ]));
+                            time_budget_exceeded = true;
+                            break;
+                        }
                     }
+                    blob_start = blob_end;
                 }
-                if auxiliary_type_prefix_references.contains(&reference) {
-                    if observed && local_type_prefix_views {
-                        proven_prefixes.insert(reference);
-                        proven_local_type_prefixes.insert(reference);
-                    }
-                    continue;
-                }
-                let forward_completion = forward_completion.finish();
-                if observed && closure_completion.finish() == ResolutionCompletion::Complete {
-                    accounted_references.push(reference);
-                    if qualified_views {
-                        qualified_references.push(reference);
-                    }
-                }
-                if observed
-                    && concrete_prefix_views
-                    && prefix_completion.finish() == ResolutionCompletion::Complete
-                {
-                    proven_prefixes.insert(reference);
-                }
-                if observed && local_type_prefix_views {
-                    proven_local_type_prefixes.insert(reference);
-                }
-                if binding.is_none() {
-                    // Crate-root rows nominate every structured component of a
-                    // qualified route. Forward confirmation rejects prefix
-                    // components. An unowned gap from that negative point has
-                    // no producer row capable of weakening the complete
-                    // target-index relation; retain only source-owned gaps.
-                    let mut rejected =
-                        retain_owned_reverse_rejection(self.selected, rejected_completion.finish());
-                    if type_terminal_prefixes.contains_key(&reference) {
-                        // Defer the original boundary until all authored
-                        // prefixes have independent proof in every Cargo root.
-                        type_terminal_rejections.push((reference, rejected));
-                        continue;
-                    }
-                    let open_surface = ResolutionIncompleteReason::OpenBoundary {
-                        semantic: reference,
-                        status:
-                            crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
-                    };
-                    if let ResolutionCompletion::Incomplete(reasons) = &rejected
-                        && reasons.contains(&open_surface)
-                        && member_owner_unnameable_at(
-                            self.selected,
-                            definition,
-                            reference,
-                            self.cancellation,
-                        )?
-                    {
-                        rejected = reasons.without_reasons([open_surface]).map_or(
-                            ResolutionCompletion::Complete,
-                            ResolutionCompletion::Incomplete,
-                        );
-                    }
-                    inventory.include(&rejected);
-                    continue;
-                }
-                if let Some(binding) = binding {
-                    // Preserve alternate forward targets and their completion;
-                    // querying one overload must never erase ambiguity.
-                    bindings.push(binding.with_alternatives(
-                        forward_targets.into_iter().collect(),
-                        forward_completion,
-                    ));
-                    references.push(reference);
-                }
-            }
+                assert_eq!(confirmed.len(), confirmed_site_count);
+                assert!(confirmed_site_count <= admitted_sites.len());
+                let Some(retained) = Self::retain_confirmed_sites(
+                    self.selected,
+                    self.cancellation,
+                    self.confirm,
+                    RustReverseRetentionInput {
+                        target,
+                        definition,
+                        type_terminal_references: &type_terminal_prefixes.keys().copied().collect(),
+                        type_prefix_references: &type_prefix_references,
+                        auxiliary_type_prefix_references: &auxiliary_type_prefix_references,
+                    },
+                    admitted_sites,
+                    confirmed,
+                    RustReverseRetained {
+                        time_budget_exceeded,
+                        evaluation_count,
+                        ..RustReverseRetained::default()
+                    },
+                )?
+                else {
+                    return Ok(SelectedRustReverseBatchOutcome::Cancelled);
+                };
+                retained
+            } else {
+                let Some(retained) = self.confirm_partitions(
+                    &admitted_sites,
+                    RustReverseRetentionInput {
+                        target,
+                        definition,
+                        type_terminal_references: &type_terminal_prefixes.keys().copied().collect(),
+                        type_prefix_references: &type_prefix_references,
+                        auxiliary_type_prefix_references: &auxiliary_type_prefix_references,
+                    },
+                )?
+                else {
+                    return Ok(SelectedRustReverseBatchOutcome::Cancelled);
+                };
+                retained
+            };
+            let RustReverseRetained {
+                references,
+                witnesses,
+                bindings,
+                accounted_references,
+                qualified_references,
+                inventory: retained_inventory,
+                mut confirmed_enumeration,
+                evaluated_type_terminals,
+                type_terminal_rejections,
+                proven_prefixes,
+                proven_local_type_prefixes,
+                local_prefix_reasons,
+                time_budget_exceeded,
+                evaluation_count,
+            } = retained;
+            inventory.include(&retained_inventory.finish());
             let mut accounted_references = accounted_references.into_iter().collect::<HashSet<_>>();
             let mut qualified_references = qualified_references.into_iter().collect::<HashSet<_>>();
             let mut proven_type_terminals = HashSet::default();
@@ -2959,7 +3441,7 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
             let Some(mut source_sites) = source_sites else {
                 return Ok(SelectedRustReverseBatchOutcome::Cancelled);
             };
-            let accounted_reference_sites = source_sites
+            let mut accounted_reference_sites = source_sites
                 .iter()
                 .filter(|site| accounted_references.contains(&site.reference()))
                 .filter_map(|source_site| {
@@ -2969,7 +3451,8 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
                     ))
                 })
                 .collect::<Vec<_>>();
-            let qualified_reference_sites = source_sites
+            accounted_reference_sites.extend(call_shape_rejections.iter().copied());
+            let mut qualified_reference_sites = source_sites
                 .iter()
                 .filter(|site| qualified_references.contains(&site.reference()))
                 .filter_map(|source_site| {
@@ -2979,6 +3462,7 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
                     ))
                 })
                 .collect::<Vec<_>>();
+            qualified_reference_sites.extend(call_shape_rejections);
             let published_references = references.iter().copied().collect::<HashSet<_>>();
             source_sites = source_sites
                 .into_vec()
@@ -3185,12 +3669,12 @@ impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
         mut self,
         admitted: Option<&'a HashSet<ProjectFile>>,
         cancellation: &'a CancellationToken,
-        mut confirm: impl for<'confirm_store, 'confirm_input> FnMut(
+        confirm: impl for<'confirm_store, 'confirm_input> Fn(
             &mut SelectedResolutionOperation<'confirm_store, 'confirm_input>,
             &Path,
             &[&SelectedSemanticLocator],
-        )
-            -> Result<RustReverseConfirmation>,
+        ) -> Result<RustReverseConfirmation>
+        + Sync,
         run: impl FnOnce(&mut dyn SelectedRustReverseQueries) -> Result<T>,
     ) -> Result<SelectedResolutionOperationOutcome<T>> {
         self.ready
@@ -3201,13 +3685,15 @@ impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
             selected: &mut self,
             cancellation,
             admitted,
-            confirm: &mut confirm,
+            confirm: &confirm,
             unavailable: None,
+            stale: None,
             #[cfg(test)]
             definition_mounts: HashSet::default(),
         };
         let result = run(&mut queries)?;
         let unavailable = queries.unavailable.take();
+        let stale = queries.stale.take();
         drop(queries);
         self.ready.inventory.with_owned_temp_write(|connection| {
             connection.execute(CLEAR_GAP_CANDIDATE_SITES_SQL, [])?;
@@ -3222,6 +3708,9 @@ impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
         );
         if let Some(reason) = unavailable {
             return Ok(SelectedResolutionOperationOutcome::Unavailable(reason));
+        }
+        if let Some(reason) = stale {
+            return Ok(SelectedResolutionOperationOutcome::Stale(reason));
         }
         self.ready
             .finish(result, &ResolutionCompletion::Complete, cancellation)
@@ -3354,6 +3843,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#5142: reverse name closure walked all hosts once per queued name")]
     fn target_scoped_inventory_query_uses_candidate_and_route_indexes() {
         let store = crate::analyzer::store::AnalyzerStore::open_ephemeral().unwrap();
         let connection = store.conn.lock().unwrap();
@@ -3394,11 +3884,9 @@ mod tests {
             );
             assert!(
                 plan.iter().any(|line| {
-                    line.contains(
-                        "rust_resolution_unit_summary_placements_member (summary_id=? AND member_ordinal=?)",
-                    )
+                    line.contains("selected_rust_module_placements_mount (mount_ordinal=?)")
                 }),
-                "{state:?}: selected module placements must seek summary placements by member: {plan:?}"
+                "{state:?}: selected module placements must seek materialized rows by mount: {plan:?}"
             );
             assert!(
                 plan.iter().any(|line| {
@@ -3452,24 +3940,54 @@ mod tests {
                 }),
                 "{state:?}: unresolved import aliases must seek by name and host blob: {plan:?}"
             );
-            // The unresolved-alias closure arm drives from the unresolved source
-            // imports, so each alias is reached by its source import key. Driving
-            // from the names instead scanned every aliased import of the blob.
+            // The unresolved-source alias arm is the third recursive arm. Its
+            // current name row must drive the host and import lookups, so each
+            // queued name seeks only its matching host before reading imports.
+            let recursive_name = plan
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.as_str() == "SCAN names")
+                .nth(2)
+                .map(|(index, _)| index)
+                .unwrap_or_else(|| {
+                    panic!("{state:?}: third recursive name scan missing: {plan:?}")
+                });
+            let host = plan
+                .iter()
+                .enumerate()
+                .skip(recursive_name + 1)
+                .find(|(_, line)| line.contains("SEARCH host USING"))
+                .map(|(index, _)| index)
+                .unwrap_or_else(|| {
+                    panic!("{state:?}: recursive name must seek its host: {plan:?}")
+                });
+            let unresolved = plan
+                .iter()
+                .enumerate()
+                .skip(host + 1)
+                .find(|(_, line)| line.contains("SEARCH unresolved USING"))
+                .map(|(index, _)| index)
+                .unwrap_or_else(|| {
+                    panic!("{state:?}: host must drive unresolved imports: {plan:?}")
+                });
+            let imported = plan
+                .iter()
+                .enumerate()
+                .skip(unresolved + 1)
+                .find(|(_, line)| line.contains("SEARCH imported USING"))
+                .map(|(index, _)| index)
+                .unwrap_or_else(|| {
+                    panic!("{state:?}: unresolved imports must drive aliases: {plan:?}")
+                });
             assert!(
-                plan.iter().any(|line| {
-                    line.contains(
-                        "SEARCH imported USING COVERING INDEX idx_rust_import_targets_unresolved_source_alias (blob_id=? AND source_import_id=?",
-                    )
-                }),
-                "{state:?}: unresolved alias closure must seek aliases by source import: {plan:?}"
+                recursive_name < host && host < unresolved && unresolved < imported,
+                "{state:?}: unresolved alias closure must read the recursive name, matching host, and import tables in that order: {plan:?}"
             );
             assert!(
-                !plan.iter().any(|line| {
-                    line.contains(
-                        "SEARCH imported USING COVERING INDEX idx_rust_import_targets_unresolved_source_alias (blob_id=?)",
-                    )
-                }),
-                "{state:?}: unresolved alias closure must not scan the blob's aliases per name: {plan:?}"
+                !plan[unresolved..=imported]
+                    .iter()
+                    .any(|line| line.contains("AUTOMATIC")),
+                "{state:?}: unresolved source and alias imports must not need automatic indexes: {plan:?}"
             );
 
             // The gap query, asked twice per target, reads those sites by key
@@ -3528,6 +4046,67 @@ mod tests {
                     .any(|line| { line.contains("SCAN gap USING INDEX resolution_gaps_identity") }),
                 "{state:?}: candidate completeness must not scan every gap: {plan:?}"
             );
+        }
+    }
+
+    #[test]
+    fn rust_reverse_call_shape_queries_seek_candidate_and_signature_keys() {
+        let store = crate::analyzer::store::AnalyzerStore::open_ephemeral().unwrap();
+        let connection = store.conn.lock().unwrap();
+        store
+            .select_writer_workspace_snapshots(&connection, &HashMap::default())
+            .unwrap();
+        prepare_pin_context(&connection);
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&connection);
+            for (name, required) in [
+                (
+                    "rust_reverse_call_arity",
+                    &[
+                        "SEARCH alternative USING COVERING INDEX source_declaration_units_unit (blob_id=? AND unit_key=?)",
+                        "SEARCH signature USING PRIMARY KEY (blob_id=? AND definition=?)",
+                        "SEARCH parameter USING PRIMARY KEY (blob_id=? AND declaration_id=?)",
+                        "SEARCH receiver USING PRIMARY KEY (blob_id=? AND declaration_id=?)",
+                    ][..],
+                ),
+                (
+                    "rust_reverse_call_shape",
+                    &[
+                        "SEARCH site USING PRIMARY KEY (blob_id=? AND site=?)",
+                        "SEARCH obligation USING PRIMARY KEY (blob_id=? AND callee_reference=?)",
+                        "SEARCH gap USING COVERING INDEX resolution_rust_reverse_gap_candidates_site (blob_id=? AND site=?)",
+                    ][..],
+                ),
+            ] {
+                let plan = explain_pin(&connection, &pinned(name));
+                for required in required {
+                    assert!(
+                        plan.iter().any(|line| line.contains(required)),
+                        "{state:?}: {name} requires {required}: {plan:?}"
+                    );
+                }
+                assert!(
+                    !plan.iter().any(|line| line.contains("AUTOMATIC")),
+                    "{state:?}: {name} must use owned indexes: {plan:?}"
+                );
+                for table in [
+                    "site",
+                    "signature",
+                    "parameter",
+                    "receiver",
+                    "obligation",
+                    "gap",
+                    "alternative",
+                ] {
+                    assert!(
+                        !plan
+                            .iter()
+                            .any(|line| line.contains(&format!("SCAN {table} "))
+                                || line.ends_with(&format!("SCAN {table}"))),
+                        "{state:?}: {name} must not scan {table}: {plan:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -3800,8 +4379,10 @@ mod tests {
             conn.execute("DELETE FROM selected_workspace_revisions", [])
                 .unwrap();
             conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+            crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
             prepare_pin_context(&conn);
             conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,persisted_relative_path) SELECT row_number() OVER(),blob_id,'rust',rel_path FROM (SELECT DISTINCT blob_id,rel_path FROM rust_crate_container_sources)", []).unwrap();
+            conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
             for state in PlannerStatisticsState::BOTH {
                 state.install(&conn);
                 let key: Vec<u8> = conn
@@ -3882,8 +4463,10 @@ mod tests {
             conn.execute("DELETE FROM selected_workspace_revisions", [])
                 .unwrap();
             conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+            crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
             prepare_pin_context(&conn);
             conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,persisted_relative_path) SELECT row_number() OVER(),blob_id,'rust',rel_path FROM (SELECT DISTINCT blob_id,rel_path FROM rust_crate_container_sources)", []).unwrap();
+            conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
             for state in PlannerStatisticsState::BOTH {
                 state.install(&conn);
                 let key: Vec<u8> = conn
@@ -4127,6 +4710,7 @@ mod tests {
         conn.execute("DELETE FROM selected_workspace_revisions", [])
             .unwrap();
         conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
         prepare_pin_context(&conn);
 
         let declarations: Vec<(i64, i64)> = conn
@@ -4322,6 +4906,7 @@ mod tests {
         conn.execute("DELETE FROM selected_workspace_revisions", [])
             .unwrap();
         conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
         prepare_pin_context(&conn);
         conn.execute(
             "INSERT INTO temp.selected_resolution_mounts(
@@ -4331,6 +4916,7 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
 
         let legacy_sql = r#"
 SELECT
@@ -4434,8 +5020,10 @@ SELECT
             conn.execute("DELETE FROM selected_workspace_revisions", [])
                 .unwrap();
             conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+            crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
             prepare_pin_context(&conn);
             conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,semantic_language,producer_epoch,interior_digest,persisted_relative_path) SELECT row_number() OVER(), member.blob_id, 'rust', interior.semantic_language, interior.producer_epoch, interior.interior_digest, member.rel_path FROM (SELECT DISTINCT blob_id,rel_path FROM selected_rust_crate_containers) AS member JOIN resolution_fragment_interiors AS interior USING(blob_id)", []).unwrap();
+            conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
 
             let (blob, site): (i64, i64) = conn.query_row("SELECT declaration_blob_id,declaration_site FROM rust_crate_exports e JOIN rust_crate_topologies t USING(topology_id) WHERE t.crate_name='api' AND e.name='target'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
             let key: Vec<u8> = conn
@@ -4853,8 +5441,7 @@ WHERE roots.source_kind='declared'
                                     ResolutionNamespace::Callable,
                                     "target",
                                 )
-                                .semantic(crate::analyzer::resolution::test_shared_names())
-                                .as_bytes()
+                                .name_digest()
                                 .to_vec(),
                             )];
                             p

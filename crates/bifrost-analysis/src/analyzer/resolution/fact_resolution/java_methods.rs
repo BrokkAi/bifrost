@@ -603,11 +603,12 @@ impl FactEvaluation<'_, '_> {
         }
         let (targets, witnesses, mut completion) = answer.into_parts();
         if unresolved {
-            completion = completion.combine(&incomplete(service_reason(
+            completion = completion.combine(&incomplete(canonical_service_reason(
+                self.session,
                 &*self.hierarchy,
                 b"java-method-inheritance-unproven",
-                &[self.root.as_bytes().as_slice()],
-            )));
+                &[CanonicalIdentityPart::identity(self.root)],
+            )?));
         }
         let targets = targets
             .into_vec()
@@ -1497,6 +1498,9 @@ impl FactEvaluation<'_, '_> {
                     let row = row.get(self.session).row();
                     (row.kind(), row.frontier())
                 };
+                if kind == ResolutionSupertypeKind::SelfType {
+                    continue;
+                }
                 self.demand_slot(frontier);
                 let resolved = states.get(&frontier).and_then(|state| {
                     match (state.completion(), state.possible_values()) {
@@ -1606,59 +1610,5 @@ fn java_invocation_argument_type(
     match state.possible_values() {
         [ResolutionSlotValue::Runtime { ty, .. }] => Some(*ty),
         _ => None,
-    }
-}
-
-impl FactEvaluation<'_, '_> {
-    /// Java primitive widening (JLS 5.1.2) for call candidates whose actuals
-    /// and formals all have exact primitive types: proven applicable when
-    /// every pair converts, a mismatch when every pair is primitive but some
-    /// pair does not, and unresolved otherwise.
-    pub(crate) fn classify_java_primitive_pairs(
-        &mut self,
-        primitive_pairs: &[(SemanticId, SemanticId)],
-    ) -> StoreResult<Option<CallCandidateApplicability>> {
-        let identities = primitive_pairs
-            .iter()
-            .flat_map(|(argument, parameter)| [*argument, *parameter])
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let Some(intrinsics) = self.session.intrinsic_type_descriptors(&identities)? else {
-            return Ok(None);
-        };
-        let mut primitives = HashMap::default();
-        for intrinsic in intrinsics {
-            if self.poll_cancelled() {
-                return Ok(None);
-            }
-            if intrinsic.kind() != IntrinsicTypeKind::Primitive {
-                continue;
-            }
-            let Some(primitive) = crate::analyzer::java::primitive_for_name(intrinsic.spelling())
-            else {
-                continue;
-            };
-            primitives.insert(intrinsic.identity(), primitive);
-        }
-        let applicable = primitive_pairs.iter().all(|(argument, parameter)| {
-            primitives
-                .get(argument)
-                .zip(primitives.get(parameter))
-                .is_some_and(|(&source, &target)| {
-                    crate::analyzer::java::primitive_converts(source, target)
-                })
-        });
-        if applicable {
-            return Ok(Some(CallCandidateApplicability::ProvenApplicable));
-        }
-        let every_pair_is_primitive = primitive_pairs.iter().all(|(argument, parameter)| {
-            primitives.contains_key(argument) && primitives.contains_key(parameter)
-        });
-        Ok(Some(if every_pair_is_primitive {
-            CallCandidateApplicability::PrimitiveTypeMismatch
-        } else {
-            CallCandidateApplicability::Unresolved
-        }))
     }
 }

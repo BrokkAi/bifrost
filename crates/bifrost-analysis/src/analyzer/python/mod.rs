@@ -166,9 +166,8 @@ pub struct PythonAnalyzer {
     // workspace listing, but every import that names no indexed module asks
     // for it, so it must not be recomputed per import.
     module_spellings: Arc<PoolSafeMemo<PythonModuleSpellings>>,
-    // Cache only the all-closed fast path. Detailed per-function evidence stays
-    // query-local so it cannot retain a workspace-sized map.
-    saved_default_arguments: Arc<PoolSafeMemo<bool>>,
+    // Share capped per-kind evidence across oracles in this generation (#5112).
+    saved_default_arguments: Arc<PoolSafeMemo<SavedDefaultArgumentSafety>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(PythonAnalyzer);
@@ -384,22 +383,14 @@ impl PythonAnalyzer {
         }
     }
 
-    /// Query-local, scoped mutability evidence for Python's saved defaults.
-    /// An incomplete bounded scan returns `None` and cannot authorize a
-    /// default binding.
-    pub(crate) fn saved_default_argument_safety(&self) -> Option<SavedDefaultArgumentSafety> {
-        if self.saved_default_arguments.is_ready() {
-            return Some(SavedDefaultArgumentSafety::default());
-        }
-
-        let safety = default_arguments::saved_default_argument_safety(self)?;
-        if safety.all_defaults_available() {
-            let cached_available = self
-                .saved_default_arguments
-                .get_or_build_pool_independent(|| true);
-            assert!(*cached_available);
-        }
-        Some(safety)
+    /// Bounded metadata evidence is scanned once per analyzer generation.
+    /// `update` constructs a fresh analyzer with fresh memo cells, so edits
+    /// invalidate this evidence without a separate invalidation protocol (#5112).
+    pub(crate) fn saved_default_argument_safety(&self) -> Arc<SavedDefaultArgumentSafety> {
+        self.saved_default_arguments
+            .get_or_build_pool_independent(|| {
+                default_arguments::saved_default_argument_safety(self)
+            })
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -1139,6 +1130,25 @@ impl LanguageSupport for PythonSupport {
         Some(semantic::PROCEDURE_SYNTAX_ROLES)
     }
 
+    fn qualified_hierarchy_target(
+        &self,
+        declaring_locator_path: Option<&str>,
+        declaring_qualified_name: &str,
+        target: &str,
+    ) -> Option<String> {
+        if target.contains('.') {
+            return None;
+        }
+        let module = declaring_locator_path
+            .and_then(|path| external::python_module_name_from_relative(std::path::Path::new(path)))
+            .or_else(|| {
+                declaring_qualified_name
+                    .rsplit_once('.')
+                    .map(|(module, _)| module.to_owned())
+            })?;
+        Some(external::python_qualified_base_name(target, &module).into_owned())
+    }
+
     fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
         use brokk_bifrost_python::declarations::{module_code_unit, python_module_name};
         module_code_unit(file, &python_module_name(file))
@@ -1216,9 +1226,9 @@ impl LanguageSupport for PythonSupport {
     fn saved_default_argument_safety(
         &self,
         analyzer: &dyn IAnalyzer,
-    ) -> Option<SavedDefaultArgumentSafety> {
+    ) -> Option<Arc<SavedDefaultArgumentSafety>> {
         resolve_analyzer::<PythonAnalyzer>(analyzer)
-            .and_then(PythonAnalyzer::saved_default_argument_safety)
+            .map(PythonAnalyzer::saved_default_argument_safety)
     }
 
     fn ecosystem(&self) -> UsageEcosystem {

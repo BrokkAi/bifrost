@@ -240,6 +240,13 @@ pub(crate) fn go_entries() -> impl Iterator<Item = UniverseEntry> {
     table(Language::Go).iter().copied()
 }
 
+pub(crate) fn jvm_entries() -> impl Iterator<Item = UniverseEntry> {
+    [Language::Java, Language::Kotlin, Language::Scala]
+        .into_iter()
+        .flat_map(table)
+        .copied()
+}
+
 pub(crate) fn go_types() -> impl Iterator<Item = UniverseEntry> {
     go_entries().filter(|entry| {
         matches!(entry.identity_kind, UniverseIdentityKind::Type(_))

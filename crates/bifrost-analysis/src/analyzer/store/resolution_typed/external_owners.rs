@@ -8,6 +8,107 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
 use std::sync::Arc;
 
 impl SelectedResolutionTypedSource<'_, '_> {
+    pub(super) fn external_callable_result_type_identities(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(SemanticId, SemanticId)>>> {
+        let mut requested = std::collections::BTreeMap::new();
+        for &definition in definitions {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            if let Some((owner, ordinal)) =
+                self.context_identities.external_member_identity(definition)
+            {
+                requested.insert(
+                    (
+                        owner.provider_id.to_string(),
+                        owner.owner_fqn.to_string(),
+                        ordinal,
+                    ),
+                    definition,
+                );
+            }
+        }
+        if requested.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let coordinates = requested.keys().collect::<Vec<_>>();
+        let coordinates = serde_json::to_string(&coordinates)
+            .map_err(|error| StoreError::new(error.to_string()))?;
+        let providers = serde_json::to_string(&self.external_providers)
+            .map_err(|error| StoreError::new(error.to_string()))?;
+        let rows = self.read_statement(cancellation, |conn| {
+            let mut statement = conn.prepare_cached(
+                "WITH requested AS (
+                   SELECT json_extract(value, '$[0]') provider_id,
+                          json_extract(value, '$[1]') owner_fqn,
+                          json_extract(value, '$[2]') ordinal
+                   FROM json_each(?1)
+                 )
+                 SELECT member.provider_id,member.owner_fqn,member.ordinal,
+                        json_extract(member.return_type_jsonb, '$.name'),
+                        (SELECT CASE WHEN count(*)=1 THEN min(owner.provider_id) END
+                           FROM jvm_external_owners owner
+                          WHERE owner.owner_fqn=json_extract(member.return_type_jsonb, '$.name')
+                            AND owner.provider_id IN (SELECT value FROM json_each(?2)))
+                   FROM requested
+                   JOIN jvm_external_owner_members member
+                     ON member.provider_id=requested.provider_id
+                    AND member.owner_fqn=requested.owner_fqn
+                    AND member.ordinal=requested.ordinal
+                  WHERE member.member_kind IN ('method','function')
+                    AND json_extract(member.return_type_jsonb, '$.kind')='named'
+                    AND member.provider_id IN (SELECT value FROM json_each(?2))
+                  ORDER BY member.provider_id,member.owner_fqn,member.ordinal",
+            )?;
+            let mut rows = statement.query([coordinates, providers])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                let provider: String = row.get(0)?;
+                let owner_fqn: String = row.get(1)?;
+                let ordinal: u32 = row.get(2)?;
+                let Some(type_fqn) = row.get::<_, Option<String>>(3)? else {
+                    continue;
+                };
+                let Some(type_provider) = row.get::<_, Option<String>>(4)? else {
+                    continue;
+                };
+                let definition = requested
+                    .get(&(provider.clone(), owner_fqn, ordinal))
+                    .copied()
+                    .expect("external result row matches one requested member coordinate");
+                result.push((definition, type_provider, type_fqn));
+            }
+            Ok(Some(result))
+        })?;
+        let Some(rows) = rows else {
+            return Ok(None);
+        };
+        let names = self
+            .selection
+            .shared_name_table()
+            .interner(self.selection.connection());
+        Ok(Some(
+            rows.into_iter()
+                .map(|(definition, provider_id, owner_fqn)| {
+                    let identity = self.context_identities.external_owner_semantic(
+                        &ExternalOwnerIdentity {
+                            provider_id: Arc::<str>::from(provider_id),
+                            owner_fqn: Arc::<str>::from(owner_fqn),
+                        },
+                        &names,
+                    );
+                    (definition, identity)
+                })
+                .collect(),
+        ))
+    }
+
     fn visit_external_rows<T>(
         &self,
         definitions: &[SemanticId],
@@ -106,11 +207,13 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 let is_static: bool = row.get(4)?;
                 let kind = match kind.as_str() { "method"|"function" => ResolutionMemberKind::Method, "constructor" => ResolutionMemberKind::Constructor, "nested_type" => ResolutionMemberKind::NestedType, _ => ResolutionMemberKind::Field };
                 let visibility = DeclaredVisibility::from_label(&visibility).ok_or_else(|| invalid_fact(format!("invalid external member visibility {visibility:?}")))?;
-                let namespaces = [ResolutionNamespace::Callable, ResolutionNamespace::Value, ResolutionNamespace::Constant, ResolutionNamespace::TypeOrValue, ResolutionNamespace::Type];
+                // External member lookup identities use effective namespaces;
+                // TypeOrValue is a source-site union and cannot form a lookup recipe.
+                let namespaces = [ResolutionNamespace::Callable, ResolutionNamespace::Value, ResolutionNamespace::Constant, ResolutionNamespace::Type, ResolutionNamespace::Type];
                 let languages = [Language::Java,Language::Kotlin,Language::Scala];
                 let lookups = std::array::from_fn(|i| crate::analyzer::resolution::lookup_semantic(&names,languages[i/5],namespaces[i%5],&name));
                 let member = self.context_identities.external_member_semantic(owner, ordinal, &names);
-                Ok(SelectedTypedRow::external_member(owner.clone(), ordinal, LoweredMemberOwnerProperty::external(member, definition, kind,
+                Ok(SelectedTypedRow::external_member(owner.clone(), ordinal, LoweredMemberOwnerProperty::external(member, definition, name.as_str(), kind,
                     if is_static || kind == ResolutionMemberKind::NestedType { ResolutionMemberAccess::Type } else { ResolutionMemberAccess::Instance },
                     if is_static || kind == ResolutionMemberKind::NestedType { ResolutionMemberQualifierCompatibility::RuntimeOrType } else { ResolutionMemberQualifierCompatibility::RuntimeOnly }, lookups, visibility)))
             })

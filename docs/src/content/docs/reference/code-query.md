@@ -1023,6 +1023,11 @@ Iterator return rows expose `returns_receiver` as `true` for a direct return of
 the first receiver parameter, `false` for another exact selected return
 expression, and omit it when receiver identity is unresolved.
 
+For C# `call_binding` rows, `conversion: "csharp_implicit_numeric"` currently
+means only a proven `char` actual converted to an `int` formal. Other C# numeric
+pairs require distinct conversion kinds and wire labels. When the adapter cannot
+prove a pair, the row keeps `conversion_status: "unknown"` and its typed reason.
+
 Two other sources describe result rows:
 
 - `bifrost --list-row-schemas` prints the typed fields that `filter`,

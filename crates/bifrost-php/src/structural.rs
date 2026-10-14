@@ -2,8 +2,8 @@
 
 use brokk_bifrost_core::analyzer::common::try_node_source_text as node_text;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_role_with_derived_name, attach_terminal_callee, field_name_in_parent, first_named_child,
-    is_spread_argument_node, nearest_ancestor,
+    CalleeSpineStep, attach_role_with_derived_name, attach_terminal_callee, field_name_in_parent,
+    first_named_child, is_spread_argument_node, nearest_ancestor, terminal_callee_leaf,
 };
 use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::edges::{
@@ -211,6 +211,19 @@ pub const PHP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
 ];
 
 use brokk_bifrost_core::analyzer::tree_walk::{expression_target_node, last_named_child};
+
+/// Grammar steps for the shared call-callee spine. A value expression has no step.
+pub fn callee_spine_step(kind: &str) -> Option<CalleeSpineStep> {
+    use CalleeSpineStep::{ChildKind, Field, Name};
+    match kind {
+        "name" | "relative_scope" => Some(Name),
+        "member_access_expression"
+        | "nullsafe_member_access_expression"
+        | "scoped_property_access_expression" => Some(Field("name")),
+        "qualified_name" | "relative_name" => Some(ChildKind("name")),
+        _ => None,
+    }
+}
 
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = expression_target_node(expression);
@@ -969,11 +982,11 @@ impl StructuralSpec for PhpStructuralSpec {
                         .or_else(|| node.child_by_field_name("name"))
                 };
                 if let Some(function) = function {
-                    let target = expression_target_node(function);
-                    let name = (target.kind() == "variable_name")
-                        .then_some(target)
-                        .or_else(|| expression_name_node(target));
-                    attach_terminal_callee(sink, target, name);
+                    attach_terminal_callee(
+                        sink,
+                        function,
+                        terminal_callee_leaf(function, callee_spine_step),
+                    );
                 }
                 let receiver = match node.kind() {
                     "member_call_expression" | "nullsafe_member_call_expression" => {

@@ -35,7 +35,11 @@ use brokk_bifrost_csharp::syntax::{
     csharp_is_member_variable_owner_kind, variable_declarator_initializer,
 };
 
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v21";
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v22";
 
 /// How many declared slots one value-type copy duplicates.
 ///

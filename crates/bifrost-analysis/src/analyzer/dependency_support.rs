@@ -151,16 +151,7 @@ pub(crate) fn append_producer_diagnostics(
     bounded: &mut BoundedProducerDiagnostics,
     diagnostics: Vec<ProducerDiagnostic>,
 ) {
-    for diagnostic in diagnostics {
-        match diagnostic.severity {
-            ProducerDiagnosticSeverity::Warning => {
-                bounded.warning(diagnostic.code, diagnostic.location, diagnostic.message)
-            }
-            ProducerDiagnosticSeverity::Error => {
-                bounded.error(diagnostic.code, diagnostic.location, diagnostic.message)
-            }
-        }
-    }
+    bounded.absorb(diagnostics);
 }
 
 pub(crate) fn failed_dependency_pack_production(
@@ -213,7 +204,10 @@ mod tests {
     use std::cell::Cell;
     use std::io::{self, Cursor, Read};
 
-    use super::{BoundedReadError, read_bounded_bytes};
+    use super::{
+        ArtifactProducerLimits, BoundedProducerDiagnostics, BoundedReadError, ProducerDiagnostic,
+        ProducerDiagnosticSeverity, append_producer_diagnostics, read_bounded_bytes,
+    };
 
     struct CountingReader<'a> {
         inner: Cursor<&'a [u8]>,
@@ -245,5 +239,86 @@ mod tests {
             Err(BoundedReadError::LimitExceeded)
         ));
         assert_eq!(bytes_read.get(), 4);
+    }
+
+    #[test]
+    fn appending_producer_diagnostics_preserves_subjects_and_bounds() {
+        let limits = ArtifactProducerLimits {
+            max_diagnostics: 2,
+            ..ArtifactProducerLimits::default()
+        };
+        let mut bounded = BoundedProducerDiagnostics::new(&limits);
+        append_producer_diagnostics(
+            &mut bounded,
+            vec![
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Warning,
+                    code: "php.source.syntax".to_owned(),
+                    location: Some("php-stub+sha256:abc!/src/Bad.php".to_owned()),
+                    source_entry: Some("src/Bad.php".into()),
+                    declaration: None,
+                    message: "syntax recovery".to_owned(),
+                },
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Warning,
+                    code: "php.stub.incomplete".to_owned(),
+                    location: Some("php-stub+sha256:abc!/src/Good.php".to_owned()),
+                    source_entry: None,
+                    declaration: Some("php:declaration:Good".to_owned()),
+                    message: "version-specific declaration".to_owned(),
+                },
+            ],
+        );
+        let (retained, suppressed) = bounded.finish();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].source_entry.as_deref(), Some("src/Bad.php"));
+        assert_eq!(retained[0].declaration, None);
+        assert_eq!(retained[1].source_entry, None);
+        assert_eq!(
+            retained[1].declaration.as_deref(),
+            Some("php:declaration:Good")
+        );
+        assert_eq!(suppressed, Default::default());
+
+        let limits = ArtifactProducerLimits {
+            max_diagnostics: 1,
+            ..ArtifactProducerLimits::default()
+        };
+        let mut bounded = BoundedProducerDiagnostics::new(&limits);
+        append_producer_diagnostics(
+            &mut bounded,
+            vec![
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Warning,
+                    code: "warning".to_owned(),
+                    location: None,
+                    source_entry: Some("src/Bad.php".into()),
+                    declaration: None,
+                    message: "warning".to_owned(),
+                },
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "error".to_owned(),
+                    location: None,
+                    source_entry: None,
+                    declaration: None,
+                    message: "error".to_owned(),
+                },
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "extra-error".to_owned(),
+                    location: None,
+                    source_entry: None,
+                    declaration: None,
+                    message: "extra error".to_owned(),
+                },
+            ],
+        );
+        let (retained, suppressed) = bounded.finish();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].severity, ProducerDiagnosticSeverity::Error);
+        assert_eq!(retained[0].code, "error");
+        assert_eq!(suppressed.warnings, 1);
+        assert_eq!(suppressed.errors, 1);
     }
 }

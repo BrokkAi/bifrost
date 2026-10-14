@@ -192,6 +192,7 @@ DELETE FROM temp.selected_resolution_stage_producers;
 DELETE FROM temp.selected_resolution_stage_nodes;
 DELETE FROM temp.selected_resolution_admissions;
 DELETE FROM temp.selected_resolution_scope_mounts;
+DELETE FROM temp.selected_rust_module_placements;
 DELETE FROM temp.selected_resolution_mounts;
 DELETE FROM temp.selected_resolution_typed_requests_1;
 DELETE FROM temp.selected_resolution_typed_requests_2;
@@ -199,6 +200,8 @@ DELETE FROM temp.selected_resolution_overlay_masks;
 DELETE FROM temp.selected_resolution_content_mounts;
 DELETE FROM temp.selected_resolution_languages;
 DELETE FROM temp.selected_resolution_context;
+DELETE FROM temp.selected_rust_unit_closure;
+DELETE FROM temp.selected_rust_unit_summaries;
 DELETE FROM temp.selected_workspace_revisions;
 "#;
 
@@ -2318,15 +2321,11 @@ fn read_change_stamp(
 ) -> Result<SelectedResolutionReadStamp> {
     // Table-valued pragmas prepare an inner statement on every scan, even when
     // their outer SELECT is cached. Cache the direct pragmas instead.
-    let main_data_version = conn
-        .prepare_cached("PRAGMA main.data_version")?
-        .query_row([], |row| row.get(0))?;
-    let main_schema_version = conn
-        .prepare_cached("PRAGMA main.schema_version")?
-        .query_row([], |row| row.get(0))?;
-    let temp_schema_version = conn
-        .prepare_cached("PRAGMA temp.schema_version")?
-        .query_row([], |row| row.get(0))?;
+    let super::WorkspaceSelectionStamp {
+        main_data_version,
+        main_schema_version,
+        temp_schema_version,
+    } = super::workspace_selection_stamp(conn)?;
     let unowned_changes = conn
         .total_changes()
         .checked_sub(owned_change_baseline)
@@ -2893,6 +2892,24 @@ fn insert_selection_input(
     if cancellation.is_cancelled() {
         return Ok(false);
     }
+    debug_assert_eq!(
+        tx.query_row(
+            "SELECT count(*) FROM temp.selected_rust_module_placements",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        0,
+        "selection inputs must be installed before materializing module placements"
+    );
+    debug_assert_eq!(
+        tx.query_row(
+            "SELECT count(*) FROM temp.selected_rust_unit_summaries",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        0,
+        "selection revisions must precede materializing Rust units"
+    );
     tx.execute(
         "INSERT INTO temp.selected_resolution_context(singleton, workspace_id) VALUES(0, ?1)",
         [workspace_id],
@@ -2915,6 +2932,7 @@ fn insert_selection_input(
             ])?;
         }
     }
+    super::fill_selected_rust_units(tx)?;
     {
         let mut insert = tx.prepare_cached(
             "INSERT INTO temp.selected_resolution_languages(
@@ -3607,6 +3625,15 @@ fn persist_selected_inventory(
     staged: &StagedReadySelection,
     cancellation: &CancellationToken,
 ) -> Result<bool> {
+    debug_assert_eq!(
+        tx.query_row(
+            "SELECT count(*) FROM temp.selected_rust_module_placements",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        0,
+        "selected mounts must be installed before materializing module placements"
+    );
     {
         let mut update = tx.prepare_cached(
             "UPDATE temp.selected_resolution_languages
@@ -3711,6 +3738,13 @@ fn persist_selected_inventory(
         insert.execute(params_from_iter(values))?;
     }
     tx.execute_batch(RESET_SELECTED_RESOLUTION_SCOPE_SQL)?;
+    // Selection completion: revisions, overlay masks, and every persisted or
+    // content mount are installed. Consumers only change request/stage rows;
+    // changed inputs acquire a new selection, and retained reuse validates its
+    // TEMP input rows and main-store change stamp before serving them.
+    tx.execute_batch(
+        super::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL,
+    )?;
     Ok(!cancellation.is_cancelled())
 }
 
@@ -3781,7 +3815,8 @@ fn selection_fingerprint(
         if cancellation.is_cancelled() {
             return None;
         }
-        hasher.field("ordinal", &mount.ordinal.get().to_be_bytes());
+        // Placement ordinals are selection-local aliases. The content digest
+        // and placement fields below already identify this mount completely.
         hasher.field("fragment_id", &mount.fragment_digest.as_bytes());
         hasher.field("workspace_id", mount.workspace_id.as_bytes());
         hasher.field("revision", &mount.revision.to_be_bytes());
@@ -4007,6 +4042,21 @@ pub(super) mod tests {
             source: &str,
         ) -> Self {
             Self::custom_language_source(mount_count, source, "rust", Language::Rust)
+        }
+
+        pub(in crate::analyzer::store) fn shared_rust_source(
+            mount_count: usize,
+            source: &str,
+        ) -> Self {
+            Self::with_store(
+                AnalyzerStore::open_ephemeral().unwrap(),
+                mount_count,
+                "rust",
+                Language::Rust,
+                true,
+                false,
+                Some(source),
+            )
         }
 
         fn custom_language_source(
@@ -5360,6 +5410,7 @@ pub(super) mod tests {
             "selected_resolution_overlay_masks",
             "selected_resolution_content_mounts",
             "selected_resolution_mounts",
+            "selected_rust_module_placements",
             "selected_resolution_typed_requests_1",
             "selected_resolution_typed_requests_2",
             "selected_workspace_revisions",

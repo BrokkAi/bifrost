@@ -372,6 +372,19 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         state.into_public()
     }
 
+    /// Classify a local nominal declaration for destructor queries.
+    ///
+    /// Unlike a transfer, destructor behavior does not depend on whether the
+    /// type mention is inside unsafe code. A raw-pointer read can duplicate
+    /// storage, but cannot change the declaration's Copy or Drop evidence.
+    /// Macro expansion remains incomplete, as it does for transfer queries.
+    pub fn classify_nominal_type_for_drop(&self, type_node: Node<'tree>) -> RustOwnershipClass {
+        if has_macro_ancestor(type_node) {
+            return RustOwnershipClass::Incomplete(RustOwnershipIncomplete::MacroExpansion);
+        }
+        self.classify_nominal_reference(type_node).into_public()
+    }
+
     /// Resolve a local nominal type's exact, nongeneric `Drop::drop` body.
     ///
     /// This returns a method only when the impl's trait path resolved to the
@@ -1814,6 +1827,45 @@ mod tests {
             index.classify_type(type_named(tree.root_node(), source, "S")),
             RustOwnershipClass::Incomplete(RustOwnershipIncomplete::AmbiguousIdentity)
         ));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4975: unsafe type mentions suppressed declaration-based destructor proofs"
+    )]
+    fn destructor_classification_preserves_unsafe_transfer_and_macro_boundaries() {
+        let source = "#[derive(core::marker::Copy, core::clone::Clone)] struct Pair(u32); unsafe fn f(value: Pair, unknown: Missing) {} opaque!(Pair);";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+        let ty = all_type_nodes(tree.root_node())
+            .into_iter()
+            .find(|node| rust_node_text(*node, source) == "Pair" && has_unsafe_ancestor(*node))
+            .expect("unsafe parameter type");
+        assert_eq!(
+            index.classify_type(ty),
+            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::UnsupportedType)
+        );
+        assert_eq!(
+            index.classify_nominal_type_for_drop(ty),
+            RustOwnershipClass::AggregateCopy
+        );
+        assert_eq!(
+            index.classify_nominal_type_for_drop(type_named(tree.root_node(), source, "Missing")),
+            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::UnresolvedPath)
+        );
+        let mut stack = vec![tree.root_node()];
+        let macro_type = loop {
+            let node = stack.pop().expect("macro argument exists");
+            if has_macro_ancestor(node) && rust_node_text(node, source) == "Pair" {
+                break node;
+            }
+            stack.extend(named_children(node));
+        };
+        assert_eq!(
+            index.classify_nominal_type_for_drop(macro_type),
+            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::MacroExpansion)
+        );
     }
 
     #[test]

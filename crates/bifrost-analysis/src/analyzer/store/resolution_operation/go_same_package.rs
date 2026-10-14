@@ -138,25 +138,54 @@ WHERE provider.context_id=?1 AND provider.package_id=?2
  AND provider.source_role IN ('go',?3)
 "#;
 
-const PACKAGE_HAS_BUILD_CONSTRAINED_SIBLING: &str = r#"
-SELECT EXISTS(
-  SELECT 1
-  FROM main.go_context_source_files AS caller
-  JOIN main.go_package_files AS sibling
-    ON sibling.package_id=caller.package_id
-  JOIN main.workspace_file_versions AS version
-    ON version.file_version_id=sibling.file_version_id
-  JOIN main.blobs AS blob
-    ON blob.blob_oid=version.blob_oid
-   AND blob.lang=version.lang
-   AND blob.generation=version.generation
-  JOIN main.source_go_manifests AS facts ON facts.blob_id=blob.id
-  WHERE caller.context_id=?1
-    AND caller.file_version_id=?2
-    AND sibling.source_role IN ('go',caller.source_role)
-    AND sibling.file_version_id<>caller.file_version_id
-    AND facts.has_build_constraints=1
-)
+// Inventory membership is diagnostic evidence, not selected candidate authority.
+// Bind the inventory publication to the selected context's exact source revision.
+const POINT_PACKAGE_WITH_UNSELECTED_SOURCE: &str = r#"
+SELECT DISTINCT package.tool_import_path
+FROM main.go_context_source_files AS caller
+JOIN main.go_package_instances AS package
+  ON package.package_id=caller.package_id
+JOIN main.go_context_publications AS publication
+  ON publication.context_id=caller.context_id
+JOIN main.go_context_selections AS selection
+  ON selection.selection_id=publication.selection_id
+WHERE caller.context_id=?1 AND caller.file_version_id=?2
+ AND caller.package_id=?4
+ AND (
+  EXISTS(
+    SELECT 1 FROM json_each(package.gaps) AS gap
+    WHERE json_extract(gap.value,'$.code')='unselected_source_input'
+  )
+  OR EXISTS(
+    SELECT 1
+    FROM main.go_context_selections AS inventory_selection
+    JOIN main.go_context_heads AS inventory_head
+      ON inventory_head.selection_id=inventory_selection.selection_id
+    JOIN main.go_context_source_files AS inventory_caller
+      ON inventory_caller.context_id=inventory_head.context_id
+     AND inventory_caller.file_version_id=caller.file_version_id
+     AND inventory_caller.source_role=caller.source_role
+    JOIN main.go_context_source_files AS sibling
+      ON sibling.context_id=inventory_caller.context_id
+     AND sibling.package_id=inventory_caller.package_id
+    JOIN main.workspace_file_versions AS version
+      ON version.file_version_id=sibling.file_version_id
+    JOIN main.blobs AS blob
+      ON blob.blob_oid=version.blob_oid
+     AND blob.lang=version.lang
+     AND blob.generation=version.generation
+    JOIN main.source_go_manifests AS facts ON facts.blob_id=blob.id
+    WHERE inventory_selection.workspace_id=selection.workspace_id
+      AND inventory_selection.lang=selection.lang
+      AND inventory_selection.generation=selection.generation
+      AND inventory_selection.revision=selection.revision
+      AND inventory_selection.derivation_version=selection.derivation_version
+      AND inventory_selection.profile_digest=?3
+      AND sibling.source_role IN ('go',caller.source_role)
+      AND sibling.file_version_id<>caller.file_version_id
+      AND facts.has_build_constraints=1
+  )
+ )
 "#;
 
 impl SelectedResolutionOperation<'_, '_> {
@@ -183,21 +212,21 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(Some(package_id))
     }
 
-    /// Whether a saved peer omitted from the selected build can add or shadow
-    /// a same-package member. Point lookup consults this only after the native
-    /// member answer is already incomplete; reverse inventory has its own
-    /// build-selection contract and must not use this predicate.
-    pub(crate) fn go_point_has_build_constrained_sibling(
+    /// Name the package whose own unselected-source gap or constrained source
+    /// inventory can add or shadow a same-package member. Point lookup consults
+    /// this only after the native member answer is already incomplete; reverse
+    /// inventory has its own build-selection contract and must not use this read.
+    pub(crate) fn go_point_package_with_unselected_source(
         &self,
         context_id: i64,
         caller_path: &str,
         cancellation: &CancellationToken,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         if cancellation.is_cancelled() {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(caller) = self.mount_table().mount_for_path("go", caller_path)? else {
-            return Ok(false);
+            return Ok(None);
         };
         let record = self
             .ready
@@ -208,14 +237,33 @@ impl SelectedResolutionOperation<'_, '_> {
             &record,
         )?
         else {
-            return Ok(false);
+            return Ok(None);
         };
-        let constrained: bool = self.ready.inventory.connection().query_row(
-            PACKAGE_HAS_BUILD_CONSTRAINED_SIBLING,
-            rusqlite::params![context_id, version],
-            |row| row.get(0),
-        )?;
-        Ok(constrained && !cancellation.is_cancelled())
+        let Some(unit) =
+            self.go_package_stage_unit_for_path(context_id, caller_path, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let package = self
+            .ready
+            .inventory
+            .connection()
+            .query_row(
+                POINT_PACKAGE_WITH_UNSELECTED_SOURCE,
+                rusqlite::params![
+                    context_id,
+                    version,
+                    super::super::go_package_context::source_inventory_profile(),
+                    unit.package_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(if cancellation.is_cancelled() {
+            None
+        } else {
+            package
+        })
     }
 
     /// Compose dot imports and protected same-package peers. Test files prefer

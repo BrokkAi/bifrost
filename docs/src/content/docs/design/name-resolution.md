@@ -293,10 +293,16 @@ selected file, linking its path to a complete publication. If a file has no
 complete publication under the active producer version, the query reports that
 the engine is unavailable for it, with the reason, instead of guessing.
 
-The mount table stays with the pooled connection after the query ends. A later
-query that selects the same revision reuses it, which makes the warm path a few
-statements instead of a rebuild. The connection discards the table when anything
-else has written to it.
+The mount table and its selected context rows stay with the pooled connection
+after the query ends. A later query that validates the same selection reuses
+them, which makes the warm path a few statements instead of a rebuild. Rust
+selections include indexed temporary rows for revision-valid unit summaries,
+workspace dependency reachability and module placements. The connection
+rebuilds these rows when the selection changes or its validity check fails. Ordinary
+workspace readers check both revision snapshots and SQLite publication freshness:
+summary publication can finish without changing the workspace revision. The
+writer fallback explicitly invalidates its selection after publication because
+SQLite's data version does not include that connection's own commits.
 
 A query can narrow which mounts a name may bind into. A forward Rust lookup,
 for example, binds only into the crates that the referencing crate can see. A
@@ -320,6 +326,17 @@ reused within it.
 
 The result is the set of candidate definitions, ordered by precedence, with
 the witness paths that support them and the answer's completion.
+
+JVM candidates carry a query-time rank derived from their binding origin. The
+shared engine compares that rank before its existing path ordering; equal ranks
+retain the existing nearest-scope and tie-break rules. Scala ranks local,
+inherited and same-compilation-unit package declarations first, then explicit
+imports, wildcard imports and package declarations from other files. Java ranks
+local declarations, explicit imports, package declarations and on-demand
+imports in that order. Kotlin ranks local declarations, explicit imports,
+same-package declarations and star imports. The language hook supplies these
+orders; the rank is neither persisted nor reconstructed from an import's own
+scope-choice step.
 
 ### Typed member lookup
 
@@ -348,6 +365,21 @@ blanket trait implementation, a derive, a `Deref` target, or a trait from an
 unindexed crate can each supply a method. When a lookup's member surface is
 open in this way, the answer is an *open boundary*, not a proof that the member
 does not exist.
+
+A member's logical name is stored separately from the declaration returned to
+the caller. Scala generated apply and extractor members can therefore match
+their logical names while returning the case class's primary constructor. A
+case class without an authored companion still publishes its companion and
+relationship rows, including when nested inside another owner.
+
+For a qualified call, a unique applicable direct member can close open hierarchy
+reasons when every supplied argument has a known exact type match after generic
+formal substitution. No ancestor can provide a more specific overload. This
+proof covers every receiver or companion root offered by origin planning and
+its established ancestors; it does not change that planning. Unknown arguments,
+conversions, defaults, expanded varargs and multiple applicable candidates do
+not establish the proof, and unrelated completion reasons stay attached. The
+proof keeps only query-local roots and ancestors and walks them iteratively.
 
 ### Reverse search
 
@@ -415,8 +447,8 @@ than returning an answer that mixes two states of the workspace. No other
 resolver steps in.
 
 The temporary tables that hold a query's working rows belong to its connection
-and are cleared when the query ends. Only the mount table can outlive the query,
-under the reuse rule in [Selection](#selection).
+and are cleared when the query ends. Selection-owned mount and context rows
+can outlive the query under the reuse rule in [Selection](#selection).
 
 ## Memory and storage discipline
 

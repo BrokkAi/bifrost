@@ -24,15 +24,14 @@
 
 use std::hash::Hash;
 
-use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
-
+#[cfg(test)]
 use crate::analyzer::structural::CandidateOutcome;
 use crate::hash::HashMap;
 
 use super::model::{
-    DerivationKey, PartialPath, PartialPathId, PrecedenceStep, ResolutionCompletion,
-    StackEffectAlphaKey, WitnessStep, clone_completion_with_poll,
-    completion_values_equal_with_poll, first_occurrences_with_poll,
+    PartialPath, PartialPathId, PrecedenceStep, ResolutionCompletion, StackEffectAlphaKey,
+    WitnessStep, clone_completion_with_poll, completion_values_equal_with_poll,
+    first_occurrences_with_poll,
 };
 use super::never_cancelled;
 
@@ -168,7 +167,7 @@ pub(super) enum SaturationDecision {
 /// no workspace-global state and is not a cache.
 #[derive(Debug)]
 pub(super) struct CycleCompletenessCertifier {
-    seen_by_digest: HashMap<DerivationKey, Vec<ObservablePathKey>>,
+    seen_by_key: HashMap<ObservablePathBucketKey, Vec<ResolutionCompletion>>,
 }
 
 impl CycleCompletenessCertifier {
@@ -201,7 +200,8 @@ impl CycleCompletenessCertifier {
     where
         P: FnMut() -> bool,
     {
-        let mut seen_by_digest: HashMap<DerivationKey, Vec<ObservablePathKey>> = HashMap::default();
+        let mut seen_by_key: HashMap<ObservablePathBucketKey, Vec<ResolutionCompletion>> =
+            HashMap::default();
         let mut path_count = 0_usize;
         for path in paths {
             if cancelled() {
@@ -209,20 +209,20 @@ impl CycleCompletenessCertifier {
             }
             path_count += 1;
             let observable = ObservablePathKey::of_with_poll(path, cancelled)?;
-            let digest = observable.digest_with_poll(cancelled)?;
-            let bucket = seen_by_digest.entry(digest).or_default();
+            let (key, completion) = observable.into_bucket_with_poll(cancelled)?;
+            let bucket = seen_by_key.entry(key).or_default();
             let mut duplicate = false;
             for prior in bucket.iter() {
                 if cancelled() {
                     return None;
                 }
-                if prior.equals_with_poll(&observable, cancelled)? {
+                if completion_values_equal_with_poll(prior, &completion, cancelled)? {
                     duplicate = true;
                     break;
                 }
             }
             if !duplicate {
-                bucket.push(observable);
+                bucket.push(completion);
             }
         }
         assert!(
@@ -232,7 +232,7 @@ impl CycleCompletenessCertifier {
         if cancelled() {
             return None;
         }
-        Some(Self { seen_by_digest })
+        Some(Self { seen_by_key })
     }
 
     /// Decide whether `path` may be expanded without making a heuristic cycle
@@ -266,7 +266,7 @@ impl CycleCompletenessCertifier {
         let stack_effect = path.stack_effect_alpha_key_with_poll(cancelled)?;
         let observable =
             ObservablePathKey::with_stack_effect_with_poll(path, stack_effect, cancelled)?;
-        let digest = observable.digest_with_poll(cancelled)?;
+        let (key, completion) = observable.into_bucket_with_poll(cancelled)?;
 
         // Branch history is only a termination certificate, never semantic
         // input to composition.  Once two prefixes have the same observable
@@ -276,21 +276,19 @@ impl CycleCompletenessCertifier {
         // but that rejection is explicitly incomplete; it cannot manufacture
         // a complete negative.  The convergent-history regression below pins
         // this conservative direction.
-        if let Some(bucket) = self.seen_by_digest.get(&digest) {
+        if let Some(bucket) = self.seen_by_key.get(&key) {
             for prior in bucket {
                 if cancelled() {
                     return None;
                 }
-                if prior.equals_with_poll(&observable, cancelled)? {
+                if completion_values_equal_with_poll(prior, &completion, cancelled)? {
                     return Some(SaturationDecision::Subsumed);
                 }
             }
         }
 
         let next_branch = match branch.checkpoint_with_poll(transition, cancelled)? {
-            Some(previous)
-                if !previous.equals_with_poll(&observable.stack_effect, cancelled)? =>
-            {
+            Some(previous) if !previous.equals_with_poll(&key.stack_effect, cancelled)? => {
                 return Some(SaturationDecision::Uncertified(UncertifiedCycle {
                     transition,
                 }));
@@ -298,7 +296,7 @@ impl CycleCompletenessCertifier {
             Some(_) => branch.clone_with_poll(cancelled)?,
             None => branch.with_checkpoint_with_poll(
                 transition,
-                observable.stack_effect.clone_with_poll(cancelled)?,
+                key.stack_effect.clone_with_poll(cancelled)?,
                 cancelled,
             )?,
         };
@@ -308,16 +306,13 @@ impl CycleCompletenessCertifier {
         if cancelled() {
             return None;
         }
-        self.seen_by_digest
-            .entry(digest)
-            .or_default()
-            .push(observable);
+        self.seen_by_key.entry(key).or_default().push(completion);
         Some(SaturationDecision::Expand(next_branch))
     }
 
     #[cfg(test)]
     fn state_count(&self) -> usize {
-        self.seen_by_digest.values().map(Vec::len).sum()
+        self.seen_by_key.values().map(Vec::len).sum()
     }
 }
 
@@ -334,6 +329,16 @@ struct ObservablePathKey {
     precedence: Box<[PrecedenceStep]>,
     witness_footprint: Box<[WitnessStep]>,
     completion: ResolutionCompletion,
+}
+
+/// Typed operation-local bucket. Completion's shared fingerprint preserves
+/// cheap base reuse; exact ordered completion comparison resolves collisions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ObservablePathBucketKey {
+    stack_effect: StackEffectAlphaKey,
+    precedence: Box<[PrecedenceStep]>,
+    witness_footprint: Box<[WitnessStep]>,
+    completion: Option<(usize, u64, u64)>,
 }
 
 impl ObservablePathKey {
@@ -361,41 +366,36 @@ impl ObservablePathKey {
         })
     }
 
-    fn digest_with_poll<P>(&self, cancelled: &mut P) -> Option<DerivationKey>
+    fn into_bucket_with_poll<P>(
+        self,
+        cancelled: &mut P,
+    ) -> Option<(ObservablePathBucketKey, ResolutionCompletion)>
     where
         P: FnMut() -> bool,
     {
-        let mut hasher = CanonicalHasher::new(b"bifrost-resolution-observable-path-key:v2");
-        hasher.field(
-            "stack-effect",
-            &self.stack_effect.canonical_digest_with_poll(cancelled)?,
-        );
-        hasher.field(
-            "precedence-count",
-            &(self.precedence.len() as u64).to_le_bytes(),
-        );
-        for step in self.precedence.iter() {
+        for _ in self.precedence.iter() {
             if cancelled() {
                 return None;
             }
-            hasher.value(step.tier.label().as_bytes());
-            hasher.value(&step.ordinal.to_le_bytes());
-            hasher.value(&step.semantic.as_bytes());
         }
-        hasher.field(
-            "witness-count",
-            &(self.witness_footprint.len() as u64).to_le_bytes(),
-        );
-        for step in self.witness_footprint.iter() {
+        for _ in self.witness_footprint.iter() {
             if cancelled() {
                 return None;
             }
-            hash_witness_step(&mut hasher, *step);
         }
-        hash_completion_with_poll(&mut hasher, &self.completion, cancelled)?;
-        Some(DerivationKey::new(hasher.finish()))
+        let completion = completion_bucket_key_with_poll(&self.completion, cancelled)?;
+        Some((
+            ObservablePathBucketKey {
+                stack_effect: self.stack_effect,
+                precedence: self.precedence,
+                witness_footprint: self.witness_footprint,
+                completion,
+            },
+            self.completion,
+        ))
     }
 
+    #[cfg(test)]
     fn equals_with_poll<P>(&self, other: &Self, cancelled: &mut P) -> Option<bool>
     where
         P: FnMut() -> bool,
@@ -432,54 +432,19 @@ impl ObservablePathKey {
     }
 }
 
-fn hash_witness_step(hasher: &mut CanonicalHasher, step: WitnessStep) {
-    match step {
-        WitnessStep::Node(node) => {
-            hasher.value(b"node");
-            hasher.value(&node.as_bytes());
-        }
-        WitnessStep::Candidate { semantic, outcome } => {
-            hasher.value(b"candidate");
-            hasher.value(&semantic.as_bytes());
-            match outcome {
-                CandidateOutcome::Selected => hasher.value(b"selected"),
-                CandidateOutcome::Rejected(reason) => {
-                    hasher.value(b"rejected");
-                    hasher.value(reason.label().as_bytes());
-                }
-            }
-        }
-        WitnessStep::Boundary { semantic, status } => {
-            hasher.value(b"boundary");
-            hasher.value(&semantic.as_bytes());
-            hasher.value(status.label().as_bytes());
-        }
-    }
-}
-
-fn hash_completion_with_poll<P>(
-    hasher: &mut CanonicalHasher,
+fn completion_bucket_key_with_poll<P>(
     completion: &ResolutionCompletion,
     cancelled: &mut P,
-) -> Option<()>
+) -> Option<Option<(usize, u64, u64)>>
 where
     P: FnMut() -> bool,
 {
-    match completion {
-        ResolutionCompletion::Complete => hasher.value(b"complete"),
+    Some(match completion {
+        ResolutionCompletion::Complete => None,
         ResolutionCompletion::Incomplete(reasons) => {
-            hasher.value(b"incomplete");
-            // This operation-local digest selects a collision bucket; exact
-            // ordered equality still decides whether a path is subsumed.
-            // Equal raw and shared values must choose the same bucket without
-            // rehashing the common base at every path transition.
-            let (len, sum, xor) = reasons.fingerprint_with_poll(cancelled)?;
-            hasher.value(&(len as u64).to_le_bytes());
-            hasher.value(&sum.to_le_bytes());
-            hasher.value(&xor.to_le_bytes());
+            Some(reasons.fingerprint_with_poll(cancelled)?)
         }
-    }
-    Some(())
+    })
 }
 
 #[cfg(test)]
@@ -536,21 +501,19 @@ mod tests {
                 .to_shared_with_poll(&mut || false)
                 .expect("the test does not cancel base promotion"),
         );
-        let mut raw_digest = CanonicalHasher::new(b"completion-digest-test");
         let mut raw_work = 0;
-        hash_completion_with_poll(&mut raw_digest, &raw, &mut || {
+        let raw_key = completion_bucket_key_with_poll(&raw, &mut || {
             raw_work += 1;
             false
         })
         .expect("the test does not cancel raw hashing");
-        let mut shared_digest = CanonicalHasher::new(b"completion-digest-test");
         let mut shared_work = 0;
-        hash_completion_with_poll(&mut shared_digest, &shared, &mut || {
+        let shared_key = completion_bucket_key_with_poll(&shared, &mut || {
             shared_work += 1;
             false
         })
         .expect("the test does not cancel shared hashing");
-        assert_eq!(raw_digest.finish(), shared_digest.finish());
+        assert_eq!(raw_key, shared_key);
         assert_eq!(raw_work, reasons.len());
         assert_eq!(shared_work, 1);
 
@@ -563,8 +526,14 @@ mod tests {
         let first_key = ObservablePathKey::of_with_poll(&first, &mut || false).unwrap();
         let second_key = ObservablePathKey::of_with_poll(&second, &mut || false).unwrap();
         assert_eq!(
-            first_key.digest_with_poll(&mut || false),
-            second_key.digest_with_poll(&mut || false),
+            first_key
+                .clone()
+                .into_bucket_with_poll(&mut || false)
+                .map(|(key, _)| key),
+            second_key
+                .clone()
+                .into_bucket_with_poll(&mut || false)
+                .map(|(key, _)| key),
         );
         assert!(
             !first_key

@@ -26,14 +26,14 @@ use std::sync::Arc;
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::packs_document::load_workspace_packs_config_at;
 use brokk_bifrost_analysis::analyzer::{
-    AnalyzerQueryScope, FilesystemProject, Project, WorkspaceAnalyzer,
+    AnalyzerConfig, AnalyzerQueryScope, FilesystemProject, Project, WorkspaceAnalyzer,
 };
 
 use crate::budget::{PolicyBatchBudget, PolicyBudget};
 use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
 use crate::coordinator::{
-    PolicyEvaluationInput, activate_owned_policy_workspace, owned_policy_analyzer_config,
-    policy_budget_for_workspace, ready_policy_semantic_model_snapshot,
+    PolicyEvaluationInput, activate_owned_policy_workspace, policy_budget_for_workspace,
+    ready_policy_semantic_model_snapshot,
 };
 use crate::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
 use crate::finding_identity::PolicyFindingId;
@@ -198,13 +198,14 @@ fn with_one_policy<T>(
             // explanation over a live root should read the cache the ordinary
             // run already warmed rather than re-parse the workspace.
             Some(
-                WorkspaceAnalyzer::build_persisted(project, owned_policy_analyzer_config())
-                    .map_err(|error| {
+                WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default()).map_err(
+                    |error| {
                         unavailable(format!(
                             "failed to build the analyzer workspace at {}: {error}",
                             root.display()
                         ))
-                    })?,
+                    },
+                )?,
             )
         }
     };

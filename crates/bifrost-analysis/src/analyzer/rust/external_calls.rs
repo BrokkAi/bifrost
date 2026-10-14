@@ -260,7 +260,7 @@ fn external_call_proof_and_identity(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factory>(
+pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factory, 'selection>(
     analyzer: &'analyzer dyn IAnalyzer,
     token: QueryToken<'_>,
     file: &ProjectFile,
@@ -273,7 +273,7 @@ pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factor
     mut operation: Option<
         &mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
             'analyzer,
-            'factory,
+            'selection,
         >,
     >,
 ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
@@ -495,7 +495,7 @@ pub(crate) fn rust_import_binder_external_callee(
 /// written arity. A concrete Rust receiver type dispatches statically, so the
 /// selected member is closed.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exact_rust_external_method_call_with_operation<'analyzer, 'factory>(
+pub(crate) fn exact_rust_external_method_call_with_operation<'analyzer, 'factory, 'selection>(
     analyzer: &'analyzer dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -505,7 +505,7 @@ pub(crate) fn exact_rust_external_method_call_with_operation<'analyzer, 'factory
     operation: Option<
         &mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
             'analyzer,
-            'factory,
+            'selection,
         >,
     >,
 ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {

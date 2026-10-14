@@ -653,6 +653,29 @@ fn project_scala_external_boundary(
 
     let scope = AnalyzerQueryScope::new(query.analyzer);
     let token = scope.token();
+    let incomplete_hierarchy_names = if value.status == DefinitionLookupStatus::Incomplete {
+        scala_enclosing_external_supertype_names(query, token, focus)
+    } else {
+        Vec::new()
+    };
+    let unindexed_diagnostic_names = incomplete_hierarchy_names
+        .iter()
+        .filter(|name| {
+            AnalyzerDefinitionLookup::new(query.analyzer, Language::Scala)
+                .fqn_in_any_language(name)
+                .is_empty()
+        })
+        .collect::<Vec<_>>();
+    if !unindexed_diagnostic_names.is_empty() {
+        let diagnostic = value
+            .diagnostics
+            .iter_mut()
+            .find(|diagnostic| diagnostic.kind == "incomplete_binding")
+            .expect("an incomplete native answer has an incomplete_binding diagnostic");
+        diagnostic.message = format!(
+            "selected native binding is incomplete: UnsupportedHierarchyTraversal for unindexed supertype(s) {unindexed_diagnostic_names:?}"
+        );
+    }
     if matches!(focus.kind(), "type_identifier" | "stable_type_identifier") {
         let segments = scala_type_lookup_segments_through_focus(focus, query.source);
         if !segments.is_empty() {
@@ -703,7 +726,10 @@ fn project_scala_external_boundary(
         {
             value.status = DefinitionLookupStatus::NoDefinition;
         }
-    } else if scala_identifier_is_implicit_root_reference(focus) {
+    } else if scala_identifier_is_implicit_root_reference(focus)
+        && !(value.status == DefinitionLookupStatus::Incomplete
+            && !incomplete_hierarchy_names.is_empty())
+    {
         let Some(name) = query
             .source
             .get(focus.start_byte()..focus.end_byte())
@@ -734,11 +760,117 @@ fn project_scala_external_boundary(
     BoundedResolution::Complete { value, work }
 }
 
-fn scala_identifier_is_implicit_root_reference(focus: tree_sitter::Node<'_>) -> bool {
-    if focus.kind() != "identifier" || scala_syntax::named_argument_label_owner(focus).is_some() {
-        return false;
+fn scala_enclosing_external_supertype_names(
+    query: BoundedReceiverQuery<'_>,
+    token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    focus: tree_sitter::Node<'_>,
+) -> Vec<String> {
+    let Some(tree) = query.tree else {
+        return Vec::new();
+    };
+    let Some(scala) =
+        crate::analyzer::resolve_analyzer::<crate::analyzer::scala::ScalaAnalyzer>(query.analyzer)
+    else {
+        return Vec::new();
+    };
+    let model = query.analyzer.semantic_model_overlay();
+    let mut names = Vec::new();
+    let mut ancestor = Some(focus);
+    while let Some(node) = ancestor {
+        if matches!(
+            node.kind(),
+            "class_definition" | "trait_definition" | "object_definition" | "enum_definition"
+        ) {
+            for (parent, _) in
+                brokk_bifrost_jvm::scala::supertypes::scala_supertype_lookup_nodes(node)
+            {
+                let segments =
+                    crate::analyzer::scala::scala_type_lookup_segments(parent, query.source);
+                if !segments.is_empty()
+                    && crate::analyzer::usages::get_definition::boundary_evidence(
+                        query.analyzer,
+                        query.file,
+                        &segments.join("."),
+                    )
+                    .0 == BoundaryStatus::ExternalDeclaredUnindexed
+                {
+                    let written = segments.join(".");
+                    let name = scala
+                        .external_type_name(token, model.clone(), query.file, &written)
+                        .or_else(|| scala_imported_supertype_name(scala, &query, token, &segments))
+                        .or_else(|| {
+                            if segments.len() > 1 {
+                                Some(written.clone())
+                            } else {
+                                brokk_bifrost_jvm::scala::wildcard_imports::
+                                    scala_package_prefixes_at(
+                                        tree.root_node(),
+                                        query.source,
+                                        parent.start_byte(),
+                                    )
+                                    .last()
+                                    .filter(|prefix| !prefix.is_empty())
+                                    .map(|prefix| format!("{prefix}.{written}"))
+                                    .or(Some(written))
+                            }
+                        });
+                    if let Some(name) = name {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        ancestor = node.parent();
     }
-    true
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+fn scala_imported_supertype_name(
+    scala: &crate::analyzer::scala::ScalaAnalyzer,
+    query: &BoundedReceiverQuery<'_>,
+    token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    segments: &[String],
+) -> Option<String> {
+    let [name] = segments else {
+        return None;
+    };
+    let mut candidates = Vec::new();
+    for import in scala
+        .import_info_of_limited(token, query.file, usize::MAX)
+        .rows
+    {
+        let Some(path) = brokk_bifrost_jvm::scala::wildcard_imports::scala_import_path(&import)
+        else {
+            continue;
+        };
+        if import.is_wildcard {
+            candidates.push(format!("{path}.{name}"));
+        } else if import.local_name() == Some(name.as_str()) {
+            candidates.push(path);
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    let mut declared_unindexed = candidates
+        .into_iter()
+        .filter(|candidate| {
+            crate::analyzer::usages::get_definition::boundary_evidence(
+                query.analyzer,
+                query.file,
+                candidate,
+            )
+            .0 == BoundaryStatus::ExternalDeclaredUnindexed
+        })
+        .collect::<Vec<_>>();
+    declared_unindexed.sort_unstable();
+    declared_unindexed.dedup();
+    (declared_unindexed.len() == 1).then(|| declared_unindexed.remove(0))
+}
+
+fn scala_identifier_is_implicit_root_reference(focus: tree_sitter::Node<'_>) -> bool {
+    focus.kind() == "identifier" && scala_syntax::named_argument_label_owner(focus).is_none()
 }
 
 fn scala_reference_is_export_or_package_syntax(mut focus: tree_sitter::Node<'_>) -> bool {

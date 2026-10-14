@@ -1,0 +1,41 @@
+{
+  "created_at": "<TIMESTAMP>",
+  "engine": {
+    "build_identity": "fixture-build",
+    "executable_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version": "9.9.0"
+  },
+  "failure": {
+    "class": "incompatible-strict-selection",
+    "message": "strictly selected release is incompatible with the request or engine",
+    "retryable": false
+  },
+  "inventory": {
+    "fetched_at": "<TIMESTAMP>",
+    "fetched_online": true,
+    "index_sha256": "24bd7c5d37c59e28600667496d74308279d8a42c85f6d488f242aa7366293be7"
+  },
+  "outcome_schema_version": 1,
+  "rejections": [
+    {
+      "detail": "missing capabilities {\"capability.strict-pin-cannot-use-alternative\"}; unsupported schema axes []; capability contract mismatch false; engine range mismatch false",
+      "pack_id": "bifrost.public.rules",
+      "reason": "engine-contract",
+      "release_version": "1.0.0",
+      "tag": "rules/v1.0.0"
+    }
+  ],
+  "request": {
+    "dependencies": [],
+    "pack_id": "bifrost.public.rules",
+    "repository": "https://github.com/BrokkAi/bifrost-packs",
+    "request_schema_version": 1,
+    "selection": {
+      "manifest_sha256": "ca07a380397a891b7e30edf3f73d5a7227f2de80b3a2369308e4bf3b8288c518",
+      "mode": "strict",
+      "release_version": "1.0.0"
+    }
+  },
+  "selection": null,
+  "status": "failed"
+}

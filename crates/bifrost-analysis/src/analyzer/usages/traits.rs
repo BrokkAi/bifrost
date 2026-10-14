@@ -155,6 +155,12 @@ where
 /// Implementations should favor false positives over false negatives — over-reporting
 /// candidates is fine; missing real call sites is not.
 pub trait CandidateFileProvider: Send + Sync {
+    /// Files named by the caller, whose publication is part of the request contract.
+    /// Discovery providers leave this absent even when they bound the complete scope.
+    fn explicit_candidate_files(&self) -> Option<&HashSet<ProjectFile>> {
+        None
+    }
+
     fn find_candidates(&self, target: &CodeUnit, analyzer: &dyn IAnalyzer) -> HashSet<ProjectFile>;
 
     /// Whether the returned files are the caller's complete execution scope.

@@ -33,18 +33,18 @@ use crate::analyzer::semantic::cfg_algorithms::{
 use crate::analyzer::semantic::derive_property_reaching_over_graph;
 use crate::analyzer::semantic::{
     BindingOriginIndex, CallContinuationKind, CallInvocationMode, CallSiteHandle, CallSiteId,
-    CallToReturnModel, CallTransferSet, CandidateCoverage, CapabilitySupport, ContentIdentity,
-    ControlContinuation, ControlEdgeHandle, ControlEdgeId, ControlEdgeKind, EvidenceCompleteness,
-    IcfgProvider, LengthDelimitedDigest, MemoryAccessKind, MemoryLocationId, MemoryLocationKind,
-    OracleCallContext, ProcedureHandle, ProcedureId, ProcedureSemantics, ProgramPointHandle,
-    ProgramPointId, ProofStatus, PropertyReachCertainty, PropertyReachingIncompleteReason,
-    PropertyReachingLimits, PropertyReachingResult, SemanticArtifact, SemanticArtifactKey,
-    SemanticBudget, SemanticCallSite, SemanticCapabilities, SemanticCapability, SemanticEffect,
-    SemanticGap, SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapKind,
-    SemanticGapSubject, SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork,
-    SourceMappingId, SourceMappingKind, SourceSpan, StableDigest, SynchronizationOperation,
-    SynchronizationPayload, TransferKind, ValueFlowKind, ValueFlowOracle, ValueId,
-    WorkspaceIcfgProvider,
+    CallToReturnModel, CallTransferSet, CallableTarget, CallableTargetResolution,
+    CandidateCoverage, CapabilitySupport, ContentIdentity, ControlContinuation, ControlEdgeHandle,
+    ControlEdgeId, ControlEdgeKind, EvidenceCompleteness, IcfgProvider, LengthDelimitedDigest,
+    MemoryAccessKind, MemoryLocationId, MemoryLocationKind, OracleCallContext, ProcedureHandle,
+    ProcedureId, ProcedureSemantics, ProgramPointHandle, ProgramPointId, ProofStatus,
+    PropertyReachCertainty, PropertyReachingIncompleteReason, PropertyReachingLimits,
+    PropertyReachingResult, SemanticArtifact, SemanticArtifactKey, SemanticBudget,
+    SemanticCallSite, SemanticCapabilities, SemanticCapability, SemanticEffect, SemanticGap,
+    SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
+    SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingId,
+    SourceMappingKind, SourceSpan, StableDigest, SynchronizationOperation, SynchronizationPayload,
+    TransferKind, ValueFlowKind, ValueFlowOracle, ValueId, ValueUseKind, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
@@ -661,6 +661,7 @@ pub enum LoopRepeatAnswer {
 struct BindingInitializationFacts {
     /// Reachable binding reads and establishments, before their own event.
     uninitialized_before_event: HashMap<usize, bool>,
+    correlated_before_event: HashMap<usize, BindingInitializationAnswer>,
 }
 
 /// The structured, flow-sensitive closure of one value through exact local
@@ -723,6 +724,45 @@ impl FlowStateDerivation {
     ) -> BindingInitializationAnswer {
         assert_eq!(self.event(read_event).event_class, StateEventClass::Read);
         self.binding_initialization_before_event(procedure, read_event)
+    }
+
+    /// Whether a modeled exceptional continuation from this local read goes
+    /// directly to an exception handler. The adapter publishes this route
+    /// only when a Python `NameError`/`UnboundLocalError` or catch-all handler
+    /// is proven to match the local-read failure.
+    pub fn binding_read_failure_is_handled(
+        &self,
+        procedure: &ProcedureHandle,
+        read_event: usize,
+    ) -> bool {
+        assert_eq!(self.event(read_event).event_class, StateEventClass::Read);
+        assert!(
+            matches!(self.event(read_event).subject, FlowSubject::Binding { .. }),
+            "handled local-read proof requires a binding event"
+        );
+        assert_eq!(self.procedure, procedure.id());
+        assert!(
+            self.procedure_artifact
+                .upgrade()
+                .is_some_and(|artifact| Arc::ptr_eq(&artifact, procedure.artifact())),
+            "read exception proof requires the derivation's exact artifact"
+        );
+        let semantics = procedure.semantics();
+        let read_point = self.event(read_event).point;
+        semantics
+            .successor_edges(read_point)
+            .filter(|(_, edge)| edge.kind == ControlEdgeKind::Exceptional)
+            .any(|(_, edge)| {
+                // A general exception dispatcher also has switch-case edges,
+                // but retains an exceptional edge for an unmatched exception.
+                // Only the direct, proven local-read handler route is safe.
+                semantics
+                    .successor_edges(edge.target_point)
+                    .any(|(_, handler_edge)| handler_edge.kind == ControlEdgeKind::SwitchCase)
+                    && !semantics
+                        .successor_edges(edge.target_point)
+                        .any(|(_, handler_edge)| handler_edge.kind == ControlEdgeKind::Exceptional)
+            })
     }
 
     /// Prove that an ordinary local was initialized before a projected write.
@@ -817,6 +857,9 @@ impl FlowStateDerivation {
             // completeness and would have returned above.
             unreachable!("covered binding reaching has initialization facts");
         };
+        if let Some(answer) = facts.correlated_before_event.get(&event) {
+            return answer.clone();
+        }
         match facts.uninitialized_before_event.get(&event) {
             Some(false) => BindingInitializationAnswer::Proven,
             Some(true) => BindingInitializationAnswer::MayBeUninitialized,
@@ -850,6 +893,10 @@ impl FlowStateDerivation {
     ///   only a route that leaves the procedure without entering a handler or
     ///   cleanup. No read of this procedure lies on that route, so it cannot
     ///   change any read's initialization.
+    /// - A retained-control-topology exception-selection gap cannot affect
+    ///   initialization when its dispatcher is unreachable from the entry.
+    ///   A proven unbound-local read may route directly to its matching handler,
+    ///   leaving the generic dispatcher available only to other exceptions.
     ///
     /// Every other gap stays open. In particular, any other exceptional-control
     /// gap is not discharged here: some producers publish one for an operation
@@ -864,6 +911,15 @@ impl FlowStateDerivation {
             && gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
         {
             return true;
+        }
+        if gap.capability == SemanticCapability::ExceptionalControlFlow
+            && gap.discharge == SemanticGapDischarge::RetainedControlTopology
+        {
+            return self.dominance.as_ref().is_some_and(|dominance| {
+                with_control_graph!(semantics, &self.control_edge_mask, |graph| {
+                    !dominance.dominates(graph, semantics.entry_point(), gap.point)
+                })
+            });
         }
         match gap.capability {
             SemanticCapability::Captures => match gap.subject {
@@ -920,17 +976,10 @@ impl FlowStateDerivation {
             return false;
         };
         let moved_out = semantics.points().iter().any(|point| {
-            point.events.iter().any(|event| {
-                matches!(
-                    &event.effect,
-                    SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Transfer(transfer),
-                        source,
-                        ..
-                    } if *source == binding
-                        && matches!(transfer.kind, TransferKind::Move { .. })
-                )
-            })
+            point
+                .events
+                .iter()
+                .any(|event| binding_is_invalidated_by(&event.effect, binding))
         });
         !moved_out
             && with_control_graph!(semantics, &self.control_edge_mask, |graph| {
@@ -4991,24 +5040,26 @@ fn derive_workspace_nonreturn_projection(
     file: &ProjectFile,
     artifact: &Arc<SemanticArtifact>,
     requested_procedure: Option<ProcedureId>,
-    snapshot: &Arc<ActiveSemanticModelSnapshot>,
+    snapshot: Option<&Arc<ActiveSemanticModelSnapshot>>,
     semantic_budget: &mut SemanticBudget,
     cfg_budget: &mut CfgAlgorithmBudget,
     cancellation: &CancellationToken,
 ) -> ModeledControlProjectionDerivation {
-    if crate::analyzer::common::language_for_file(file) != Language::Go
-        || !snapshot
-            .active_models()
-            .has_normal_continuation_absence_candidates(Language::Go.config_label())
-        || cancellation.is_cancelled()
-    {
+    let language = crate::analyzer::common::language_for_file(file);
+    let go_models_can_diverge = language == Language::Go
+        && snapshot.is_some_and(|snapshot| {
+            snapshot
+                .active_models()
+                .has_normal_continuation_absence_candidates(Language::Go.config_label())
+        });
+    let python_source_can_diverge = language == Language::Python
+        && python_has_local_nonreturn_candidate(artifact, requested_procedure);
+    if !(go_models_can_diverge || python_source_can_diverge) || cancellation.is_cancelled() {
         return ModeledControlProjectionDerivation::default();
     }
 
-    let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
-        workspace,
-        Some(Arc::clone(snapshot)),
-    );
+    let provider =
+        WorkspaceIcfgProvider::with_active_semantic_model_snapshot(workspace, snapshot.cloned());
     let roots = artifact
         .procedures()
         .iter()
@@ -5027,6 +5078,51 @@ fn derive_workspace_nonreturn_projection(
         cfg_budget,
         cancellation,
     )
+}
+
+fn python_has_local_nonreturn_candidate(
+    artifact: &SemanticArtifact,
+    requested_procedure: Option<ProcedureId>,
+) -> bool {
+    let roots = requested_procedure
+        .map(|procedure| vec![procedure])
+        .unwrap_or_else(|| {
+            artifact
+                .procedures()
+                .iter()
+                .map(|procedure| procedure.id())
+                .collect()
+        });
+    let mut scheduled = roots.iter().copied().collect::<HashSet<_>>();
+    let mut pending = VecDeque::from(roots);
+    // This is only a cheap gate for the CFG proof below. A local call graph
+    // candidate avoids constructing an interprocedural provider for every
+    // Python procedure; the provider still proves actual control reachability.
+    while let Some(procedure_id) = pending.pop_front() {
+        let procedure = artifact
+            .procedure(procedure_id)
+            .expect("a local Python call target names a materialized procedure");
+        if procedure.points().iter().any(|point| {
+            point
+                .events
+                .iter()
+                .any(|event| matches!(&event.effect, SemanticEffect::Throw { .. }))
+        }) {
+            return true;
+        }
+        for call in procedure.call_sites() {
+            if call.normal_continuation == ControlContinuation::Absent {
+                return true;
+            }
+            if let CallableTargetResolution::Proven(CallableTarget::Local(callee)) =
+                &call.declared_targets
+                && scheduled.insert(*callee)
+            {
+                pending.push_back(*callee);
+            }
+        }
+    }
+    false
 }
 
 /// Exact, request-local absent normal continuations for one immutable procedure.
@@ -5706,7 +5802,17 @@ fn flow_state_for_materialized_outcome(
                 request.cancellation,
             )
         });
-    if let Some(snapshot) = active_snapshot.as_ref() {
+    let language = crate::analyzer::common::language_for_file(file);
+    let python_has_modeled_or_source_nonreturn = language == Language::Python
+        && python_has_local_nonreturn_candidate(&artifact, requested_procedure);
+    let go_has_nonreturn_models = active_snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot
+            .active_models()
+            .has_normal_continuation_absence_candidates(Language::Go.config_label())
+    });
+    if python_has_modeled_or_source_nonreturn
+        || (language == Language::Go && go_has_nonreturn_models)
+    {
         // The optional control proof obeys the request's CFG limits but owns a
         // separate ledger. Exhausting wrapper discovery must retain raw edges;
         // it must not consume the budget for the ordinary flow relations that
@@ -5718,7 +5824,7 @@ fn flow_state_for_materialized_outcome(
             file,
             &artifact,
             requested_procedure,
-            snapshot,
+            active_snapshot.as_ref(),
             budget,
             &mut nonreturn_cfg_budget,
             request.cancellation,
@@ -6115,7 +6221,7 @@ fn derive_procedure(
     };
     let mut builder = EventBuilder {
         procedure: procedure.id(),
-        procedure_handle,
+        procedure_handle: procedure_handle.clone(),
         file,
         facts,
         site_index,
@@ -6158,7 +6264,7 @@ fn derive_procedure(
         });
     }
 
-    let (relations, dominance, binding_initialization) = derive_relations(
+    let (relations, dominance, mut binding_initialization) = derive_relations(
         procedure,
         &control_edge_mask,
         &events,
@@ -6168,6 +6274,64 @@ fn derive_procedure(
         request,
         &mut reasons,
     );
+    if crate::analyzer::common::language_for_file(file) == Language::Python
+        && let Some(facts) = binding_initialization.as_mut()
+    {
+        let invalidated_bindings = events
+            .iter()
+            .filter(|event| event.event_class == StateEventClass::Kill)
+            .filter_map(|event| match event.subject {
+                FlowSubject::Binding { value } => Some(value),
+                FlowSubject::Property { .. } => None,
+            })
+            .collect::<HashSet<_>>();
+        let potentially_uninitialized_reads = facts
+            .uninitialized_before_event
+            .iter()
+            .filter_map(|(&event, &uninitialized)| {
+                let row = events.get(event)?;
+                let FlowSubject::Binding { value } = row.subject else {
+                    return None;
+                };
+                (uninitialized
+                    && row.event_class == StateEventClass::Read
+                    && (procedure_handle
+                        .semantics()
+                        .value(value)
+                        .is_some_and(|value| value.kind == SemanticValueKind::Local)
+                        || invalidated_bindings.contains(&value)))
+                .then_some(event)
+            })
+            .collect::<HashSet<_>>();
+        match correlated_initialization_answers(
+            &procedure_handle,
+            &events,
+            &event_keys,
+            &control_edge_mask,
+            &potentially_uninitialized_reads,
+            semantic_budget,
+            request.cancellation,
+        ) {
+            Ok(answers) => {
+                for (event, answer) in answers {
+                    let previous = facts.correlated_before_event.insert(event, answer);
+                    assert!(
+                        previous.is_none(),
+                        "one source-backed read has one correlated initialization answer"
+                    );
+                }
+            }
+            Err(crate::type_flow::CorrelationError::Budget(error)) => {
+                reasons.push(FlowStateIncompleteReason::BudgetExhausted {
+                    axis: FlowStateAxis::ReachingRelation,
+                    detail: format!("path-sensitive binding initialization: {error}"),
+                });
+            }
+            Err(crate::type_flow::CorrelationError::Cancelled { .. }) => {
+                reasons.push(FlowStateIncompleteReason::Cancelled);
+            }
+        }
+    }
 
     FlowStateDerivation {
         procedure: procedure.id(),
@@ -6181,6 +6345,209 @@ fn derive_procedure(
         binding_initialization,
         event_keys,
     }
+}
+
+fn correlated_initialization_answers(
+    procedure: &ProcedureHandle,
+    events: &[StateEventRow],
+    event_keys: &[SemanticEventKey],
+    control_edge_mask: &ControlEdgeMask,
+    potentially_uninitialized_reads: &HashSet<usize>,
+    budget: &mut SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<HashMap<usize, BindingInitializationAnswer>, crate::type_flow::CorrelationError> {
+    let semantics = procedure.semantics();
+    if potentially_uninitialized_reads.is_empty() {
+        return Ok(HashMap::default());
+    }
+    let invalidated_bindings = events
+        .iter()
+        .filter(|event| event.event_class == StateEventClass::Kill)
+        .filter_map(|event| match event.subject {
+            FlowSubject::Binding { value } => Some(value),
+            FlowSubject::Property { .. } => None,
+        })
+        .collect::<HashSet<_>>();
+    let candidate_bindings = events
+        .iter()
+        .filter(|event| {
+            potentially_uninitialized_reads.contains(&event.event)
+                && event.event_class == StateEventClass::Read
+        })
+        .filter_map(|event| match event.subject {
+            FlowSubject::Binding { value }
+                if semantics.value(value).is_some_and(|value| {
+                    value.kind == SemanticValueKind::Local
+                        || invalidated_bindings.contains(&value.id)
+                }) =>
+            {
+                Some(value)
+            }
+            FlowSubject::Binding { .. } | FlowSubject::Property { .. } => None,
+        })
+        .collect::<HashSet<_>>();
+    if candidate_bindings.is_empty() {
+        return Ok(HashMap::default());
+    }
+    let uninitialized_entry_bindings = candidate_bindings
+        .iter()
+        .copied()
+        .filter(|&binding| {
+            semantics
+                .value(binding)
+                .is_some_and(|value| value.kind == SemanticValueKind::Local)
+        })
+        .collect::<HashSet<_>>();
+    let mut data_bindings = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_class,
+                StateEventClass::Read | StateEventClass::Establish | StateEventClass::Kill
+            )
+        })
+        .filter_map(|event| match event.subject {
+            FlowSubject::Binding { value }
+                if candidate_bindings.contains(&value)
+                    && semantics.value(value).is_some_and(|value| {
+                        value.kind == SemanticValueKind::Local
+                            || invalidated_bindings.contains(&value.id)
+                    }) =>
+            {
+                Some(value)
+            }
+            FlowSubject::Property { .. } => None,
+            FlowSubject::Binding { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    data_bindings.sort_unstable();
+    data_bindings.dedup();
+    if data_bindings.is_empty() {
+        return Ok(HashMap::default());
+    }
+
+    let read_events = events
+        .iter()
+        .zip(event_keys)
+        .filter_map(|(event, key)| {
+            if event.event_class != StateEventClass::Read
+                || !potentially_uninitialized_reads.contains(&event.event)
+            {
+                return None;
+            }
+            let FlowSubject::Binding { value } = event.subject else {
+                return None;
+            };
+            if data_bindings.binary_search(&value).is_err() {
+                return None;
+            }
+            let event_index = key.event_index as usize;
+            semantics
+                .point(key.point)
+                .is_some_and(|point| event_index < point.events.len())
+                .then_some((event.event, key.point, event_index, value))
+        })
+        .collect::<Vec<_>>();
+    if read_events.is_empty() {
+        return Ok(HashMap::default());
+    }
+    let correlation_events = semantics
+        .points()
+        .iter()
+        .map(|point| (0..point.events.len()).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let bool_bindings = crate::type_flow::guard_condition_bindings(procedure);
+    let binding_origins = BindingOriginIndex::new(procedure);
+    let mut open_bindings: crate::hash::HashSet<_> = binding_origins
+        .address_taken_bindings()
+        .into_iter()
+        .collect();
+    for location in semantics.memory_locations() {
+        if let MemoryLocationKind::LexicalCell { binding }
+        | MemoryLocationKind::Capture {
+            binding: Some(binding),
+            ..
+        } = &location.kind
+        {
+            open_bindings.insert(*binding);
+        }
+    }
+    for capture in semantics.captures() {
+        if capture.mode != crate::analyzer::semantic::CaptureMode::Value
+            && let crate::analyzer::semantic::CaptureSource::Value(binding) = &capture.captured
+        {
+            open_bindings.insert(*binding);
+        }
+    }
+    let mut omitted_edges = control_edge_mask
+        .omitted
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    omitted_edges.sort_unstable();
+    let mut uncertain_return_edges = Vec::new();
+    for gap in semantics.gaps() {
+        if gap.capability != SemanticCapability::DynamicDispatch {
+            continue;
+        }
+        let SemanticGapSubject::CallSite(call_id) = gap.subject else {
+            continue;
+        };
+        let Some(call) = semantics.call_site(call_id) else {
+            continue;
+        };
+        if call.invocation_mode != CallInvocationMode::Ordinary {
+            continue;
+        }
+        if gap.kind != SemanticGapKind::Ambiguous
+            && matches!(&call.declared_targets, CallableTargetResolution::Proven(_))
+        {
+            continue;
+        }
+        let Some(target) = call.normal_continuation.target() else {
+            continue;
+        };
+        let edges = normal_control_edges_to_target(semantics, call.point, target);
+        assert_eq!(
+            edges.len(),
+            1,
+            "a represented call continuation maps to one normal CFG edge"
+        );
+        uncertain_return_edges.push(edges[0]);
+    }
+    uncertain_return_edges.sort_unstable();
+    uncertain_return_edges.dedup();
+    let analysis = crate::type_flow::analyze_correlations_with_observations(
+        procedure,
+        &bool_bindings,
+        &data_bindings,
+        &open_bindings,
+        &uninitialized_entry_bindings,
+        &correlation_events,
+        &read_events,
+        &uncertain_return_edges,
+        &omitted_edges,
+        budget,
+        Some(cancellation),
+    )?;
+    let mut answers = HashMap::default();
+    for row in analysis.data_reaching_at_event {
+        let answer = if row.definitions.is_empty() {
+            BindingInitializationAnswer::Unreachable
+        } else if row.unknown {
+            BindingInitializationAnswer::Open {
+                reasons: vec![FlowStateIncompleteReason::BindingStateNotClosed {
+                    binding: row.binding,
+                }],
+            }
+        } else if row.may_be_uninitialized {
+            BindingInitializationAnswer::MayBeUninitialized
+        } else {
+            BindingInitializationAnswer::Proven
+        };
+        assert!(answers.insert(row.event, answer).is_none());
+    }
+    Ok(answers)
 }
 
 fn collect_capability_reasons(
@@ -7510,14 +7877,7 @@ where
                     StateEventClass::Kill => unreachable!("kills are not projected here"),
                 }
             }
-            if matches!(
-                semantic_event.effect,
-                SemanticEffect::ValueFlow {
-                    source,
-                    kind: ValueFlowKind::Transfer(transfer),
-                    ..
-                } if source == binding && matches!(transfer.kind, TransferKind::Move { .. })
-            ) {
+            if binding_is_invalidated_by(&semantic_event.effect, binding) {
                 return Ok(OverwrittenUnreadAnswer::Open {
                     reasons: vec![FlowStateIncompleteReason::BindingStateNotClosed { binding }],
                 });
@@ -7858,6 +8218,25 @@ where
 
 /// The dense definition identities the reaching fixed point is solved over:
 /// one per establishment event.
+fn invalidated_binding(effect: &SemanticEffect) -> Option<ValueId> {
+    match effect {
+        SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::Transfer(transfer),
+            source,
+            ..
+        } if matches!(transfer.kind, TransferKind::Move { .. }) => Some(*source),
+        SemanticEffect::ValueUse {
+            kind: ValueUseKind::Unbind,
+            value,
+        } => Some(*value),
+        _ => None,
+    }
+}
+
+fn binding_is_invalidated_by(effect: &SemanticEffect, binding: ValueId) -> bool {
+    invalidated_binding(effect) == Some(binding)
+}
+
 struct Definitions {
     /// Definition id -> event id.
     events: Vec<usize>,
@@ -7945,17 +8324,12 @@ impl Definitions {
                         .last_uninitialized_by_point
                         .insert((point.id.index(), *binding), false);
                 }
-                if let SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Transfer(transfer),
-                    source,
-                    ..
-                } = &event.effect
-                    && matches!(transfer.kind, TransferKind::Move { .. })
-                    && definitions.uninitialized_by_binding.contains_key(source)
+                if let Some(binding) = invalidated_binding(&event.effect)
+                    && definitions.uninitialized_by_binding.contains_key(&binding)
                 {
                     definitions
                         .last_uninitialized_by_point
-                        .insert((point.id.index(), *source), true);
+                        .insert((point.id.index(), binding), true);
                 }
             }
         }
@@ -8048,15 +8422,10 @@ impl Definitions {
                         state_at_point.insert(binding, false);
                     }
                 }
-                if let SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Transfer(transfer),
-                    source,
-                    ..
-                } = &semantic_event.effect
-                    && matches!(transfer.kind, TransferKind::Move { .. })
-                    && self.uninitialized_by_binding.contains_key(source)
+                if let Some(binding) = invalidated_binding(&semantic_event.effect)
+                    && self.uninitialized_by_binding.contains_key(&binding)
                 {
-                    state_at_point.insert(*source, true);
+                    state_at_point.insert(binding, true);
                 }
             }
         }
@@ -10212,7 +10581,7 @@ class Sample {
     }
 
     #[test]
-    fn unmodeled_deletion_keeps_overwrite_proof_open() {
+    fn deleting_local_reads_its_value_before_unbinding_it() {
         const SOURCE: &str = r#"
 def deleted():
     x = 1
@@ -10240,21 +10609,15 @@ def deleted():
             .expect("first establishment exists");
         let procedure = fixture.procedure(0, derivation.procedure);
         let cancellation = CancellationToken::default();
-        assert!(matches!(
-            derivation.overwritten_unread_local(
-                &procedure,
-                first.event,
-                &mut FlowStateRequest::new(&cancellation)
-            ),
-            OverwrittenUnreadAnswer::Open { reasons }
-                if reasons.iter().any(|reason| matches!(
-                    reason,
-                    FlowStateIncompleteReason::LoweringGap {
-                        capability: SemanticCapability::ExceptionalControlFlow,
-                        ..
-                    }
-                ))
-        ));
+        let answer = derivation.overwritten_unread_local(
+            &procedure,
+            first.event,
+            &mut FlowStateRequest::new(&cancellation),
+        );
+        assert!(
+            matches!(answer, OverwrittenUnreadAnswer::ReadBeforeOverwrite { .. }),
+            "deleting a local reads its current value: {answer:?}"
+        );
     }
 
     #[test]
@@ -10368,7 +10731,7 @@ function beforeVar() { c = 1; var c; c = 2; }
     }
 
     #[test]
-    fn unmodeled_python_deletion_keeps_binding_initialization_open() {
+    fn python_delete_marks_the_local_uninitialized_until_assignment() {
         const SOURCE: &str = r#"
 def deleted():
     x = 1
@@ -10393,15 +10756,54 @@ def deleted():
         let procedure = fixture.procedure(0, derivation.procedure);
         assert!(matches!(
             derivation.binding_initialization_at_read(&procedure, read),
-            BindingInitializationAnswer::Open { reasons }
-                if reasons.iter().any(|reason| matches!(
-                    reason,
-                    FlowStateIncompleteReason::LoweringGap {
-                        capability: SemanticCapability::ExceptionalControlFlow,
-                        ..
-                    }
-                ))
+            BindingInitializationAnswer::MayBeUninitialized
         ));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4720: a local helper with no normal exit left a caller read spuriously uninitialized"
+    )]
+    fn python_workspace_nonreturning_constructor_proves_the_following_local_read() {
+        const SOURCE: &str = r#"class Terminates:
+    def __init__(self):
+        self.ready = True
+        raise
+
+def caller(flag):
+    if flag:
+        value = 1
+    else:
+        Terminates()
+    return value
+"#;
+        let fixture = Fixture::new(Language::Python, &[("src/main.py", SOURCE)]);
+        let state = fixture.state(0);
+        let read_at = SOURCE.rfind("value").expect("return read exists");
+        let (derivation, read) = state
+            .procedures
+            .iter()
+            .find_map(|derivation| {
+                derivation.events.iter().find_map(|event| {
+                    (event.event_class == StateEventClass::Read
+                        && event.site.range.start_byte == read_at)
+                        .then_some((derivation, event.event))
+                })
+            })
+            .expect("return expression projects a local binding read");
+        let procedure = fixture.procedure(0, derivation.procedure);
+        assert_eq!(
+            derivation.binding_initialization_at_read(&procedure, read),
+            BindingInitializationAnswer::Proven,
+            "the constructor's exceptional-only body removes the caller's else continuation: {:?}",
+            derivation.completeness
+        );
+        let call = call_handle_spelled(&procedure, SOURCE, "Terminates()");
+        let normal_edge = normal_edge_for_call(&procedure, &call);
+        assert!(
+            derivation.control_edge_mask.omitted.contains(&normal_edge),
+            "the shared workspace effect projection omits the proven non-returning call edge"
+        );
     }
 
     #[test]

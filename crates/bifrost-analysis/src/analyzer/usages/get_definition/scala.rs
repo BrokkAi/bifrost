@@ -5,10 +5,10 @@ use crate::analyzer::scala::{
     ScalaExportSelector, ScalaSupertypeLookupPath, ScalaWildcardImportEnvironment,
     ScalaWildcardOwnerFacts, resolve_scala_wildcard_import_environment,
     scala_enclosing_package_root_candidates, scala_enclosing_template_owner_fq_names,
-    scala_import_path, scala_import_path_candidates, scala_import_visible_at,
-    scala_lexical_scope_path_at, scala_lexical_scope_path_checked, scala_nested_type_candidates,
-    scala_package_prefixes_at, scala_package_prefixes_at_checked, scala_simple_type_name,
-    scala_type_lookup_segments,
+    scala_generated_companion_owner, scala_import_path, scala_import_path_candidates,
+    scala_import_visible_at, scala_lexical_scope_path_at, scala_lexical_scope_path_checked,
+    scala_nested_type_candidates, scala_package_prefixes_at, scala_package_prefixes_at_checked,
+    scala_simple_type_name, scala_type_lookup_segments,
 };
 use crate::analyzer::structural::{
     HierarchyRelation, MemberDispatchTier, PrecedenceTier, RejectionReason,
@@ -57,6 +57,7 @@ use brokk_bifrost_jvm::scala::graph::syntax::{
     scala_definition_binder_names, scala_method_value_site, scala_pattern_binder_names,
     template_self_types,
 };
+use brokk_bifrost_jvm::scala::scala_normalize_fq_name;
 use brokk_bifrost_jvm::scala::supertypes::scala_type_lookup_segments_with;
 use brokk_bifrost_jvm::scala::wildcard_imports::ScalaWildcardImportOwner;
 use std::cell::{Cell, RefCell};
@@ -599,9 +600,13 @@ impl<'a> ForwardScalaNameResolver<'a> {
     /// Without this, `object Status { import Registry._; def f = X.y }`
     /// left the qualified-path root `X` unresolved even though `Registry` is
     /// indexed as a sibling of `Status`.
-    fn enclosing_owner_qualified_wildcard_candidates(&self, segments: &[String]) -> Vec<String> {
+    fn enclosing_owner_qualified_wildcard_candidates<'imports>(
+        &self,
+        segments: &[String],
+        imports: impl Iterator<Item = &'imports ImportInfo>,
+    ) -> Vec<String> {
         let mut candidates = Vec::new();
-        for import in self.visible_imports().filter(|import| import.is_wildcard) {
+        for import in imports.filter(|import| import.is_wildcard) {
             let Some(structured_path) = import.path.as_ref() else {
                 continue;
             };
@@ -781,98 +786,107 @@ impl<'a> ForwardScalaNameResolver<'a> {
             return ScalaNameResolution::Ambiguous(Vec::new());
         }
         let mut candidates = scala_wildcard_owner_segment_candidates(environment.owners, segments);
-        candidates.extend(self.enclosing_owner_qualified_wildcard_candidates(segments));
+        candidates.extend(
+            self.enclosing_owner_qualified_wildcard_candidates(segments, self.visible_imports()),
+        );
         self.resolve_candidate_tier(candidates, kind)
     }
 
-    /// The owner a term-position reference (an `apply` or extractor name)
-    /// denotes when a scope nested inside the compilation unit binds it.
-    ///
-    /// SLS 2 nests scopes before it ranks precedences. An import written
-    /// inside a template body or block is a more deeply nested binding than
-    /// the compilation unit's package clause, so it shadows a same-named
-    /// package member; a compilation-unit wildcard import sits at the same
-    /// nesting as the package clause and is ranked against it by precedence
-    /// instead, which is what `resolve_owner_segments` walks (#2224).
-    ///
-    /// Term position accepts either namespace: the owner may be an object, or
-    /// a case class whose companion is synthetic and therefore unindexed. The
-    /// walk is scope-major for that reason -- one scope answers from the
-    /// singleton-object namespace and then from the class namespace before
-    /// the walk widens -- because a name bound in a nested scope shadows every
-    /// binding of the name outside it, in either namespace.
-    ///
-    /// `Unresolved` means no nested scope binds the name; the caller then
-    /// continues with the compilation-unit-and-outward walk
-    /// (`resolve_owner_segments`), which keeps its existing tier order.
-    fn resolve_nested_scope_term_owner(&self, segments: &[String]) -> ScalaNameResolution {
-        // An explicit import binds one name in both namespaces, so both
-        // lookups belong to this tier. An indexed target in the other
-        // namespace makes the first lookup `Unresolved`, so the class lookup
-        // must run for both `MissingExplicitImport` and `Unresolved`.
-        match self.resolve_explicit_owner_segments(segments, ScalaOwnerKind::SingletonObject) {
-            ScalaNameResolution::MissingExplicitImport => {
-                return match self.resolve_explicit_owner_segments(segments, ScalaOwnerKind::Class) {
-                    ScalaNameResolution::Unresolved => ScalaNameResolution::MissingExplicitImport,
-                    outcome => outcome,
-                };
-            }
-            ScalaNameResolution::Unresolved => {
-                match self.resolve_explicit_owner_segments(segments, ScalaOwnerKind::Class) {
-                    ScalaNameResolution::Resolved(owner) => {
-                        return ScalaNameResolution::Resolved(owner);
-                    }
-                    ScalaNameResolution::Ambiguous(owners) => {
-                        return ScalaNameResolution::Ambiguous(owners);
-                    }
-                    ScalaNameResolution::MissingExplicitImport
-                    | ScalaNameResolution::Unresolved => {}
-                }
-            }
-            outcome => return outcome,
-        }
-
-        // The wildcard tier `resolve_owner_segments` walks, narrowed to the
-        // imports a template body or block encloses.
-        // `enclosing_owner_qualified_wildcard_candidates` contributes only
-        // owner-qualified spellings of imports that have an enclosing
-        // template, so every candidate it yields belongs to this tier too.
+    /// Search each nested import scope in turn, innermost first. Within one
+    /// scope explicit imports precede wildcards, and each tier answers in both
+    /// term-owner namespaces before the lookup widens (#2224). Compilation-unit
+    /// imports belong after the same-file package tier, not in this probe.
+    fn resolve_nested_scope_term_owner(
+        &self,
+        segments: &[String],
+        root: Node<'_>,
+    ) -> ScalaNameResolution {
         let imports = self.visible_import_list();
-        let environment = self.wildcard_import_environment(&imports);
-        if environment.ambiguous {
-            return ScalaNameResolution::Ambiguous(Vec::new());
-        }
-        let owners = environment.owners.into_iter().filter(|owner| {
-            let import = imports
-                .get(owner.import_index)
-                .expect("wildcard owner indexes the import list it was resolved from");
-            self.import_is_template_nested(import)
-        });
-        let mut candidates = scala_wildcard_owner_segment_candidates(owners, segments);
-        candidates.extend(self.enclosing_owner_qualified_wildcard_candidates(segments));
-        for kind in [ScalaOwnerKind::SingletonObject, ScalaOwnerKind::Class] {
-            match self.resolve_candidate_tier(candidates.clone(), kind) {
+        let mut scopes = imports
+            .iter()
+            .filter_map(|import| {
+                let scope = import.path.as_ref()?.lexical_scopes.last().copied()?;
+                let node = root
+                    .descendant_for_byte_range(scope.start_byte, scope.end_byte)
+                    .expect("an import scope belongs to the source tree");
+                // A package clause and its body share the package tier. The
+                // grammar also uses template_body for that body, so its parent
+                // determines whether it introduces a nested template scope.
+                let package_scope = node.kind() == "package_clause"
+                    || node.parent().is_some_and(|parent| {
+                        parent.kind() == "package_clause"
+                            && parent.child_by_field_name("body") == Some(node)
+                    });
+                (!package_scope).then_some(scope)
+            })
+            .collect::<Vec<_>>();
+        scopes.sort_unstable_by_key(|scope| (scope.end_byte - scope.start_byte, scope.start_byte));
+        scopes.dedup();
+        let mut environment = None;
+        for scope in scopes {
+            let in_scope = |import: &ImportInfo| {
+                import
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| path.lexical_scopes.last() == Some(&scope))
+            };
+            let explicit = imports
+                .iter()
+                .filter(|import| in_scope(import))
+                .collect::<Vec<_>>();
+            match self.resolve_explicit_term_owner_segments(segments, &explicit) {
                 ScalaNameResolution::Unresolved => {}
                 outcome => return outcome,
+            }
+            let environment =
+                environment.get_or_insert_with(|| self.wildcard_import_environment(&imports));
+            if environment.ambiguous {
+                return ScalaNameResolution::Ambiguous(Vec::new());
+            }
+            let owners = environment
+                .owners
+                .iter()
+                .filter(|owner| in_scope(&imports[owner.import_index]))
+                .cloned();
+            let mut candidates = scala_wildcard_owner_segment_candidates(owners, segments);
+            candidates.extend(self.enclosing_owner_qualified_wildcard_candidates(
+                segments,
+                imports.iter().filter(|import| in_scope(import)),
+            ));
+            for kind in [ScalaOwnerKind::SingletonObject, ScalaOwnerKind::Class] {
+                match self.resolve_candidate_tier(candidates.clone(), kind) {
+                    ScalaNameResolution::Unresolved => {}
+                    outcome => return outcome,
+                }
             }
         }
         ScalaNameResolution::Unresolved
     }
 
-    /// Whether an import is written inside a template body or block rather
-    /// than at compilation-unit level. The parser records where the import
-    /// declaration starts; the class-range index answers which templates
-    /// enclose that byte.
-    fn import_is_template_nested(&self, import: &ImportInfo) -> bool {
-        import.path.as_ref().is_some_and(|path| {
-            !scala_enclosing_template_owner_fq_names(
-                self.scala,
-                self.scala,
-                &self.file,
-                path.declaration_start_byte,
-            )
-            .is_empty()
-        })
+    /// An explicit import binds both namespaces. Only an import absent from
+    /// both can claim an unindexed boundary.
+    fn resolve_explicit_term_owner_segments(
+        &self,
+        segments: &[String],
+        imports: &[&ImportInfo],
+    ) -> ScalaNameResolution {
+        let mut missing = false;
+        for kind in [ScalaOwnerKind::SingletonObject, ScalaOwnerKind::Class] {
+            match self.resolve_explicit_owner_segments_in_imports(
+                segments,
+                kind,
+                imports.iter().copied(),
+            ) {
+                ScalaNameResolution::Unresolved => {}
+                ScalaNameResolution::MissingExplicitImport => missing = true,
+                outcome => return outcome,
+            }
+        }
+        if missing {
+            ScalaNameResolution::MissingExplicitImport
+        } else {
+            ScalaNameResolution::Unresolved
+        }
     }
 
     fn resolve_absolute_owner_segments(
@@ -913,6 +927,25 @@ impl<'a> ForwardScalaNameResolver<'a> {
         kind: ScalaOwnerKind,
         declaration_range: Option<(usize, usize)>,
     ) -> ScalaNameResolution {
+        self.resolve_explicit_owner_segments_in_imports(
+            segments,
+            kind,
+            self.visible_imports().filter(|import| {
+                declaration_range.is_none_or(|(start, end)| {
+                    import.path.as_ref().is_some_and(|path| {
+                        path.declaration_start_byte >= start && path.declaration_start_byte < end
+                    })
+                })
+            }),
+        )
+    }
+
+    fn resolve_explicit_owner_segments_in_imports<'imports>(
+        &self,
+        segments: &[String],
+        kind: ScalaOwnerKind,
+        imports: impl Iterator<Item = &'imports ImportInfo>,
+    ) -> ScalaNameResolution {
         let Some(simple) = segments.last().map(String::as_str) else {
             return ScalaNameResolution::Unresolved;
         };
@@ -928,14 +961,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         // boundary; let the remaining name-resolution tiers answer it.
         let mut indexed_import_target = false;
         let mut resolved = Vec::new();
-        for import in self.visible_imports() {
-            if declaration_range.is_some_and(|(start, end)| {
-                import.path.as_ref().is_none_or(|path| {
-                    path.declaration_start_byte < start || path.declaration_start_byte >= end
-                })
-            }) {
-                continue;
-            }
+        for import in imports {
             let Some(path) = scala_import_path(import) else {
                 continue;
             };
@@ -1412,7 +1438,7 @@ fn bounded_scala_definition_context(
 pub(super) fn resolve_scala(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
-    context: &mut DefinitionBatchContext<'_>,
+    context: &mut DefinitionBatchContext<'_, '_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -5715,6 +5741,7 @@ fn scala_terminal_candidates_outcome(
     }
     sort_units(&mut candidates);
     candidates.dedup();
+    scala_drop_generated_companion_duplicates(&mut candidates);
     let distinct_fqns = candidates
         .iter()
         .map(CodeUnit::fq_name)
@@ -5728,6 +5755,34 @@ fn scala_terminal_candidates_outcome(
         ));
     }
     Some(candidates_outcome(candidates))
+}
+
+/// Drop a generated companion that a candidate the source wrote already
+/// answers.
+///
+/// Scala declaration extraction publishes a companion code unit beside every
+/// case class that has no authored companion (#5101). It carries its class's
+/// declared name under the same owner and differs only by the `$` the display
+/// rule appends to a [`SegmentKind::Companion`] segment, so a lookup that
+/// reaches both holds one authored declaration and a compiler-derived
+/// duplicate, not the cross-namespace tie the caller reports as
+/// `ambiguous_scala_type`. An authored companion is a real second declaration
+/// and still reports that ambiguity (#2167).
+///
+/// [`SegmentKind::Companion`]: brokk_bifrost_core::analyzer::fq_name::SegmentKind::Companion
+fn scala_drop_generated_companion_duplicates(candidates: &mut Vec<CodeUnit>) {
+    if !candidates.iter().any(CodeUnit::is_synthetic) {
+        return;
+    }
+    let authored = candidates
+        .iter()
+        .filter(|unit| !unit.is_synthetic())
+        .map(|unit| scala_normalize_fq_name(unit.fq()))
+        .collect::<HashSet<_>>();
+    candidates.retain(|unit| {
+        !scala_generated_companion_owner(unit)
+            || !authored.contains(&scala_normalize_fq_name(unit.fq()))
+    });
 }
 
 fn scala_exact_enclosing_singleton_path(
@@ -5967,9 +6022,20 @@ fn resolve_scala_parser_proven_term_role(
         // Scope-major: a scope nested inside the compilation unit answers from
         // both namespaces before the compilation-unit-and-outward walk runs
         // (#2224).
-        let resolution = match resolver.resolve_nested_scope_term_owner(&reference.segments) {
-            ScalaNameResolution::Unresolved => resolver
-                .resolve_owner_segments(&reference.segments, ScalaOwnerKind::SingletonObject),
+        let resolution = match resolver.resolve_nested_scope_term_owner(&reference.segments, root) {
+            ScalaNameResolution::Unresolved => {
+                // Compilation-unit imports also bind both term-owner
+                // namespaces. A class-only imported owner must retain its
+                // callable miss instead of falling through to extensions.
+                let imports = resolver.visible_imports().collect::<Vec<_>>();
+                match resolver.resolve_explicit_term_owner_segments(&reference.segments, &imports) {
+                    ScalaNameResolution::Unresolved => resolver.resolve_owner_segments(
+                        &reference.segments,
+                        ScalaOwnerKind::SingletonObject,
+                    ),
+                    outcome => outcome,
+                }
+            }
             outcome => outcome,
         };
         // Scala applies `Owner.Name(args)` in the term namespace: the target
@@ -6091,15 +6157,7 @@ fn resolve_scala_parser_proven_term_role(
     // Scope-major: a scope nested inside the compilation unit answers from
     // both namespaces before the compilation-unit-and-outward walk runs
     // (#2224).
-    let resolution = match resolver.resolve_nested_scope_term_owner(&[name.to_string()]) {
-        ScalaNameResolution::Unresolved => match resolver.resolve_wildcard_singleton(name) {
-            ScalaNameResolution::Unresolved => {
-                resolver.resolve_owner(name, ScalaOwnerKind::SingletonObject)
-            }
-            outcome => outcome,
-        },
-        outcome => outcome,
-    };
+    let resolution = scala_extractor_owner(ctx, resolver, root, name);
     Some(match resolution {
         // A nested scope can bind the name in the class namespace alone: a
         // case class whose companion is synthetic has no indexed object, and
@@ -6174,6 +6232,43 @@ fn resolve_scala_parser_proven_term_role(
             }
         }
     })
+}
+
+/// SLS 2 orders scopes before binding tiers. Once nested imports miss, a
+/// package member in this compilation unit precedes explicit imports, then
+/// wildcards, then package members from other compilation units. Each tier
+/// answers for an object or class before the next tier runs.
+fn scala_extractor_owner(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    root: Node<'_>,
+    name: &str,
+) -> ScalaNameResolution {
+    let segments = [name.to_string()];
+    match resolver.resolve_nested_scope_term_owner(&segments, root) {
+        ScalaNameResolution::Unresolved => {}
+        outcome => return outcome,
+    }
+    for kind in [ScalaOwnerKind::SingletonObject, ScalaOwnerKind::Class] {
+        match scala_same_file_type_owner(ctx, &segments, kind) {
+            ScalaNameResolution::Unresolved => {}
+            outcome => return outcome,
+        }
+    }
+    let imports = resolver.visible_imports().collect::<Vec<_>>();
+    match resolver.resolve_explicit_term_owner_segments(&segments, &imports) {
+        ScalaNameResolution::Unresolved => {}
+        outcome => return outcome,
+    }
+    match resolver.resolve_wildcard_singleton(name) {
+        ScalaNameResolution::Unresolved => {}
+        outcome => return outcome,
+    }
+    match resolver.resolve_wildcard_owner_segments(&segments, ScalaOwnerKind::Class) {
+        ScalaNameResolution::Unresolved => {}
+        outcome => return outcome,
+    }
+    resolver.resolve_owner(name, ScalaOwnerKind::SingletonObject)
 }
 
 /// Whether a declaration can be the target of a term-position reference: a
@@ -6472,7 +6567,6 @@ fn resolve_scala_bare_apply_fast_path(
             name,
             call_shape.as_ref(),
         )
-        || resolver.resolve_wildcard_singleton(name) != ScalaNameResolution::Unresolved
     {
         return None;
     }
@@ -6537,6 +6631,12 @@ fn resolve_scala_bare_apply_fast_path(
                 call_shape.as_ref(),
             ));
         }
+    }
+    // Same-file and enclosing declarations bind before wildcard imports. The
+    // imported singleton may be a generated case-class companion, so indexing
+    // that companion must not skip the lexical lookup above.
+    if resolver.resolve_wildcard_singleton(name) != ScalaNameResolution::Unresolved {
+        return None;
     }
     let owner_fqn = resolver
         .resolve_singleton(name)
@@ -6648,6 +6748,21 @@ fn scala_exact_owner_apply_candidates(
     owner: &CodeUnit,
     call_shape: Option<&ScalaCallSiteShape>,
 ) -> Vec<CodeUnit> {
+    if owner.is_synthetic() {
+        // Generated companions publish apply at the case-class constructor's
+        // identity, not at an authored Owner$.apply declaration. Select that
+        // source class before applying the existing constructor shape rules.
+        let companion_fqn = owner.fq_name();
+        let class =
+            scala_unique_exact_class_owner(ctx, companion_fqn.trim_end_matches('$'), |candidate| {
+                candidate.source() == owner.source()
+                    && candidate.fq().parent() == owner.fq().parent()
+                    && ctx.scala.is_case_class_declaration(candidate)
+            });
+        return class.map_or_else(Vec::new, |class| {
+            scala_exact_primary_constructor_candidates(ctx, &class, call_shape)
+        });
+    }
     let apply_fqn = format!("{}.apply", owner.fq_name());
     let mut units = ctx
         .support
@@ -6767,6 +6882,27 @@ fn scala_callable_has_applicable_fixed_shape(
     })
 }
 
+fn scala_exact_primary_constructor_candidates(
+    ctx: ScalaLookupCtx<'_>,
+    owner: &CodeUnit,
+    call_shape: Option<&ScalaCallSiteShape>,
+) -> Vec<CodeUnit> {
+    let class_fqn = owner.fq_name();
+    let constructor_name = scala_constructor_member_name(&class_fqn);
+    let constructor_fqn = format!("{class_fqn}.{constructor_name}");
+    scala_filter_callable_units(
+        ctx.scala,
+        ctx.support
+            .fqn(&constructor_fqn)
+            .into_iter()
+            .filter(|unit| unit.is_function() && unit.fq_name() == constructor_fqn)
+            .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
+            .collect(),
+        call_shape,
+        ScalaCallableSiteRole::PrimaryConstruction,
+    )
+}
+
 fn scala_exact_type_apply_or_constructor_outcome(
     ctx: ScalaLookupCtx<'_>,
     token: QueryToken<'_>,
@@ -6804,19 +6940,7 @@ fn scala_exact_type_apply_or_constructor_outcome(
         }
     }
 
-    let constructor_name = scala_constructor_member_name(&class_fqn);
-    let constructor_fqn = format!("{class_fqn}.{constructor_name}");
-    let constructors = scala_filter_callable_units(
-        ctx.scala,
-        ctx.support
-            .fqn(&constructor_fqn)
-            .into_iter()
-            .filter(|unit| unit.is_function() && unit.fq_name() == constructor_fqn)
-            .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
-            .collect(),
-        call_shape,
-        ScalaCallableSiteRole::PrimaryConstruction,
-    );
+    let constructors = scala_exact_primary_constructor_candidates(ctx, owner, call_shape);
     if !constructors.is_empty() {
         return candidates_outcome(constructors);
     }
@@ -12568,30 +12692,12 @@ fn scala_resolve_visible_type_declaration(
     let segments = scala_type_lookup_segments(node, ctx.source);
     let kind = scala_type_node_owner_kind(node);
     if !segments.is_empty() {
-        let package = scala_package_name_of(ctx.scala, ctx.file).unwrap_or_default();
-        let mut same_file = scala_nested_type_candidates(package, &segments, false)
-            .into_iter()
-            .flat_map(|candidate| {
-                let fqn = match kind {
-                    ScalaOwnerKind::Class => candidate.trim_end_matches('$').to_string(),
-                    ScalaOwnerKind::SingletonObject if candidate.ends_with('$') => candidate,
-                    ScalaOwnerKind::SingletonObject => format!("{candidate}$"),
-                    ScalaOwnerKind::TypeNamespace => candidate,
-                };
-                ctx.support.fqn(&fqn).into_iter().filter(move |unit| {
-                    unit.fq_name() == fqn
-                        && unit.source() == ctx.file
-                        && scala_unit_matches_owner_kind(ctx.scala, unit, kind)
-                })
-            })
-            .collect::<Vec<_>>();
-        sort_units(&mut same_file);
-        same_file.dedup();
-        if let [declaration] = same_file.as_slice() {
-            return Some(declaration.clone());
-        }
-        if same_file.len() > 1 {
-            return None;
+        match scala_same_file_type_owner(ctx, &segments, kind) {
+            ScalaNameResolution::Resolved(owner) => return Some(owner._declaration),
+            ScalaNameResolution::Ambiguous(_) | ScalaNameResolution::MissingExplicitImport => {
+                return None;
+            }
+            ScalaNameResolution::Unresolved => {}
         }
     }
 
@@ -13155,6 +13261,17 @@ fn scala_same_file_type_fqn(
     segments: &[String],
     kind: ScalaOwnerKind,
 ) -> Option<String> {
+    scala_resolved_owner_fqn(scala_same_file_type_owner(ctx, segments, kind))
+}
+
+/// The compilation unit's own package declarations bind before its imports.
+/// Keep the exact declaration and ambiguity so term and type lookups share
+/// this tier without promoting a package declaration from another file.
+fn scala_same_file_type_owner(
+    ctx: ScalaLookupCtx<'_>,
+    segments: &[String],
+    kind: ScalaOwnerKind,
+) -> ScalaNameResolution {
     let package = scala_package_name_of(ctx.scala, ctx.file).unwrap_or_default();
     let candidates = scala_nested_type_candidates(package, segments, false);
     let mut matches = Vec::new();
@@ -13165,21 +13282,27 @@ fn scala_same_file_type_fqn(
             ScalaOwnerKind::SingletonObject => format!("{candidate}$"),
             ScalaOwnerKind::TypeNamespace => candidate,
         };
-        matches.extend(
-            ctx.support
-                .fqn(&fqn)
-                .into_iter()
-                .filter(|unit| {
-                    unit.fq_name() == fqn
-                        && unit.source() == ctx.file
-                        && scala_unit_matches_owner_kind(ctx.scala, unit, kind)
-                })
-                .map(|unit| unit.fq_name()),
-        );
+        matches.extend(ctx.support.fqn(&fqn).into_iter().filter(|unit| {
+            unit.fq_name() == fqn
+                && unit.source() == ctx.file
+                && scala_unit_matches_owner_kind(ctx.scala, unit, kind)
+        }));
     }
-    matches.sort();
+    sort_units(&mut matches);
     matches.dedup();
-    (matches.len() == 1).then(|| matches.remove(0))
+    let owners = matches
+        .into_iter()
+        .map(|unit| ScalaOwnerIdentity {
+            fqn: unit.fq_name(),
+            kind,
+            _declaration: unit,
+        })
+        .collect::<Vec<_>>();
+    match owners.as_slice() {
+        [] => ScalaNameResolution::Unresolved,
+        [owner] => ScalaNameResolution::Resolved(owner.clone()),
+        _ => ScalaNameResolution::Ambiguous(owners),
+    }
 }
 
 fn scala_type_node_owner_kind(node: Node<'_>) -> ScalaOwnerKind {

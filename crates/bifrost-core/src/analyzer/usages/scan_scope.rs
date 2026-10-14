@@ -9,6 +9,7 @@ use crate::hash::HashSet;
 /// target, importer, or convention-derived file behind the planner's back.
 pub struct UsageScanScope<'a> {
     candidate_files: &'a HashSet<ProjectFile>,
+    explicit_candidate_files: Option<&'a HashSet<ProjectFile>>,
     cancellation: Option<&'a CancellationToken>,
     include_tests: bool,
 }
@@ -17,6 +18,7 @@ impl<'a> UsageScanScope<'a> {
     pub fn new(candidate_files: &'a HashSet<ProjectFile>) -> Self {
         Self {
             candidate_files,
+            explicit_candidate_files: None,
             cancellation: None,
             include_tests: true,
         }
@@ -28,9 +30,21 @@ impl<'a> UsageScanScope<'a> {
     ) -> Self {
         Self {
             candidate_files,
+            explicit_candidate_files: None,
             cancellation: Some(cancellation),
             include_tests: true,
         }
+    }
+
+    /// Carry the admitted files the caller named explicitly, separately from discovery.
+    pub fn with_explicit_candidates(mut self, files: Option<&'a HashSet<ProjectFile>>) -> Self {
+        debug_assert!(files.is_none_or(|files| files.is_subset(self.candidate_files)));
+        self.explicit_candidate_files = files;
+        self
+    }
+
+    pub fn explicit_candidate_files(&self) -> Option<&'a HashSet<ProjectFile>> {
+        self.explicit_candidate_files
     }
 
     /// Set whether test source participates in this usage query's inventory.

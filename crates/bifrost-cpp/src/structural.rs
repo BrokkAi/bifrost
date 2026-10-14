@@ -3,8 +3,9 @@
 use brokk_bifrost_core::analyzer::common::try_node_source_text as node_text;
 use brokk_bifrost_core::analyzer::statement_facts::StatementFactKind;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child, unquoted_string_content_span,
+    CalleeSpineStep, attach_positional_argument_roles, attach_role_with_derived_name,
+    attach_terminal_callee, field_name_in_parent, first_named_child, terminal_callee_leaf,
+    unquoted_string_content_span,
 };
 use brokk_bifrost_core::analyzer::structural::body_relations::{
     BodyOwner, BodyState, body_relation_for_block,
@@ -1012,6 +1013,31 @@ pub fn declarator_name_node<'tree>(declarator: Node<'tree>) -> Option<Node<'tree
     }
 }
 
+/// Grammar steps for the shared call-callee spine. A value expression has no step.
+pub fn callee_spine_step(kind: &str) -> Option<CalleeSpineStep> {
+    use CalleeSpineStep::{Field, FieldOrOnlyChild, Name};
+    match kind {
+        "identifier"
+        | "field_identifier"
+        | "type_identifier"
+        | "operator_name"
+        | "operator_cast"
+        | "destructor_name"
+        | "literal_operator_name"
+        | "primitive_type" => Some(Name),
+        "qualified_identifier"
+        | "scoped_identifier"
+        | "scoped_type_identifier"
+        | "dependent_name"
+        | "template_function"
+        | "template_method"
+        | "template_type" => Some(Field("name")),
+        "field_expression" => Some(Field("field")),
+        "pointer_expression" => Some(FieldOrOnlyChild("argument")),
+        _ => None,
+    }
+}
+
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = expression;
     loop {
@@ -1563,7 +1589,11 @@ impl StructuralSpec for CppStructuralSpec {
                     "function"
                 };
                 if let Some(function) = node.child_by_field_name(function_field) {
-                    attach_terminal_callee(sink, function, expression_name_node(function));
+                    attach_terminal_callee(
+                        sink,
+                        function,
+                        terminal_callee_leaf(function, callee_spine_step),
+                    );
                     // The callee token of a free-function call is a plain value
                     // read, and it is the only occurrence the call site leaves
                     // behind when the function is not indexed (#3466). Member

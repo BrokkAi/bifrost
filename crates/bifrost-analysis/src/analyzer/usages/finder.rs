@@ -363,8 +363,17 @@ impl<'a> ReferenceEngine<'a> {
         };
 
         drop(_cand_scope);
+        let explicit_candidates = explicit_provider
+            .and_then(CandidateFileProvider::explicit_candidate_files)
+            .map(|files| {
+                files
+                    .intersection(&admitted_query.candidate_files)
+                    .cloned()
+                    .collect::<HashSet<_>>()
+            });
         let scan_scope =
             UsageScanScope::with_cancellation(&admitted_query.candidate_files, &self.cancellation)
+                .with_explicit_candidates(explicit_candidates.as_ref())
                 .with_test_inclusion(self.excluded_test_files.is_none());
         let _graph_scope = crate::profiling::scope("usages::graph_find_usages");
         let outcome = graph_find_usages(

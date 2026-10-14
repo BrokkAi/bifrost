@@ -1863,7 +1863,10 @@ fn native_java_types_project_intrinsic_descriptors_from_selected_rows() {
         .build();
     let answer = native_type_projection(&java_fixture, JavaAdapter, "Use.java", java);
     {
-        let SelectedNativeTypes::Ready { nominal, intrinsic } = answer.types else {
+        let SelectedNativeTypes::Ready {
+            nominal, intrinsic, ..
+        } = answer.value_types
+        else {
             panic!("primitive type must project without a parser unit");
         };
         assert!(nominal.is_empty());
@@ -1905,7 +1908,10 @@ fn native_go_type_projects_bound_parameter_and_predeclared_type() {
         &ResolutionCompletion::Complete
     );
     assert_eq!(answer.answer.completion(), &ResolutionCompletion::Complete);
-    let SelectedNativeTypes::Ready { nominal, intrinsic } = answer.types else {
+    let SelectedNativeTypes::Ready {
+        nominal, intrinsic, ..
+    } = answer.value_types
+    else {
         panic!("the predeclared int type must project from selected Go facts");
     };
     assert!(nominal.is_empty());
@@ -1938,7 +1944,10 @@ fn native_java_and_go_types_project_nominal_source_identities() {
             go_fixture.file("source.go"),
         ),
     ] {
-        let SelectedNativeTypes::Ready { nominal, intrinsic } = answer.types else {
+        let SelectedNativeTypes::Ready {
+            nominal, intrinsic, ..
+        } = answer.value_types
+        else {
             panic!("nominal type must project to its selected declaration");
         };
         assert!(intrinsic.is_empty());

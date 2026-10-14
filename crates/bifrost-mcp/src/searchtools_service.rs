@@ -1,4 +1,7 @@
 use crate::analyzer::Language;
+use crate::analyzer::semantic_model::{
+    ActivationReceipt, ActivationReceiptStage, ActivationReceiptStageStatus,
+};
 #[cfg(test)]
 use crate::policy::{
     PolicyExecutionStage, PolicyExecutionTermination, PolicyReportDiagnosticCode,
@@ -264,11 +267,34 @@ fn activate_configured_semantic_models(
     workspace: &WorkspaceAnalyzer,
     configured: Option<ConfiguredSemanticModels>,
 ) -> Result<WorkspacePackActivationState, String> {
+    activate_configured_semantic_models_observed(workspace_root, workspace, configured, None)
+}
+
+fn activate_configured_semantic_models_observed(
+    workspace_root: &Path,
+    workspace: &WorkspaceAnalyzer,
+    configured: Option<ConfiguredSemanticModels>,
+    receipt: Option<&ActivationReceipt>,
+) -> Result<WorkspacePackActivationState, String> {
     let _scope = profiling::scope("semantic_pack.activate_configured");
     let packs_config = load_workspace_packs_config_at(workspace_root)
-        .map_err(|error| format!("failed to load workspace packs document: {error}"))?
+        .map_err(|error| {
+            if let Some(receipt) = receipt {
+                receipt.record_stage_failure(
+                    ActivationReceiptStage::Configuration,
+                    ActivationReceiptStageStatus::Unavailable,
+                );
+            }
+            format!("failed to load workspace packs document: {error}")
+        })?
         .map(Arc::new);
     if configured_explicit_legacy(&configured) {
+        if let Some(receipt) = receipt {
+            receipt.record_stage_failure(
+                ActivationReceiptStage::RuntimeAcquisition,
+                ActivationReceiptStageStatus::Unavailable,
+            );
+        }
         return activate_legacy_configured_semantic_models(
             workspace_root,
             workspace,
@@ -286,7 +312,15 @@ fn activate_configured_semantic_models(
         additional_evidence,
     } = match open_session_pack_catalog(workspace_root, workspace, &configured, &packs_config) {
         Ok(prelude) => prelude,
-        Err(failure_state) => return Ok(failure_state),
+        Err(failure_state) => {
+            if let Some(receipt) = receipt {
+                receipt.record_stage_failure(
+                    ActivationReceiptStage::CatalogBootstrap,
+                    ActivationReceiptStageStatus::Unavailable,
+                );
+            }
+            return Ok(failure_state);
+        }
     };
     // The activation publishes its models onto the session analyzer, which is
     // what the session's tools read. Policy evaluation activates its own
@@ -296,6 +330,7 @@ fn activate_configured_semantic_models(
         &AnalyzerConfig::default(),
         &catalog,
         WorkspaceActivationSources {
+            activation_receipt: receipt,
             catalog_root: workspace_root,
             workspace_model_root: workspace_models.then_some(workspace_root),
             config: packs_config.as_deref(),
@@ -305,7 +340,21 @@ fn activate_configured_semantic_models(
         &CancellationToken::default(),
     )
     .err()
-    .map(|error| format!("workspace semantic-pack activation failed: {error}"));
+    .map(|error| {
+        if let Some(receipt) = receipt {
+            let stage = match &error {
+                crate::analyzer::packs_document::WorkspaceActivationError::WorkspaceModels(_) => {
+                    ActivationReceiptStage::WorkspaceModelRegistration
+                }
+                crate::analyzer::packs_document::WorkspaceActivationError::Catalog(_)
+                | crate::analyzer::packs_document::WorkspaceActivationError::ShippedModels(_) => {
+                    ActivationReceiptStage::CatalogBootstrap
+                }
+            };
+            receipt.record_stage_failure(stage, ActivationReceiptStageStatus::Unavailable);
+        }
+        format!("workspace semantic-pack activation failed: {error}")
+    });
     Ok(WorkspacePackActivationState {
         config: packs_config,
         ecosystems,
@@ -355,6 +404,7 @@ fn activate_configured_semantic_models_installed_stage(
         &AnalyzerConfig::default(),
         &catalog,
         WorkspaceActivationSources {
+            activation_receipt: None,
             catalog_root: workspace_root,
             workspace_model_root: workspace_models.then_some(workspace_root),
             config: packs_config.as_deref(),
@@ -976,7 +1026,7 @@ struct RunPolicyParams {
     #[serde(default)]
     fail_on: RunPolicyFailOn,
     diff_base: Option<String>,
-    /// Scope the taint composition to the files `diff_base` changed. Requires
+    /// Scope taint sink procedures to changed hunks from `diff_base`. Requires
     /// `diff_base` and incremental reuse.
     #[serde(default)]
     diff_scoped: bool,
@@ -1284,6 +1334,8 @@ pub struct SearchToolsService {
     /// for a trusted whole-workspace caller, never a tool argument: a query
     /// document must not be able to raise its own limits.
     workspace_scaled_query_limits: bool,
+    /// Diagnostic state retained only by the opt-in one-shot query host.
+    activation_receipt: Option<Arc<ActivationReceipt>>,
 }
 
 /// Calls `get_symbol_sources` and decodes its JSON response for tests that
@@ -4609,6 +4661,16 @@ impl SearchToolsService {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
         let input_decode_ns = duration_ns(input_decode_started.elapsed());
         let query_execution_started = Instant::now();
+        if let Some(receipt) = &self.activation_receipt {
+            let active_snapshot = snapshot.analyzer().active_semantic_model_snapshot();
+            receipt
+                .bind_snapshot(active_snapshot.as_deref())
+                .map_err(|error| {
+                    SearchToolsServiceError::internal(format!(
+                        "failed to bind activation receipt: {error}"
+                    ))
+                })?;
+        }
         let mut response = CodeIntelligenceRuntime::new(snapshot, &self.flow_state, cancellation)
             .execute_query_with_all_analysis_registrations(
                 workspace_generation,
@@ -4865,6 +4927,71 @@ impl SearchToolsService {
         Self::new_one_shot_with_watcher_starter(root, production_watcher_starter())
     }
 
+    /// Construct one whole-workspace CLI query with its observer installed
+    /// before eager semantic activation. The ordinary constructor remains untraced.
+    pub fn new_one_shot_with_activation_receipt(
+        root: PathBuf,
+        receipt: Arc<ActivationReceipt>,
+    ) -> Result<Self, String> {
+        let (canonical, file_listing) = canonical_one_shot_root_and_listing_cache(root)
+            .inspect_err(|_error| {
+                receipt.record_stage_failure(
+                    ActivationReceiptStage::WorkspaceBuild,
+                    ActivationReceiptStageStatus::Unavailable,
+                );
+            })?;
+        let watcher_starter = production_watcher_starter();
+        let (project, workspace) =
+            build_persisted_workspace(canonical, file_listing.clone(), UpdateStrategy::Manual)
+                .inspect_err(|_error| {
+                    receipt.record_stage_failure(
+                        ActivationReceiptStage::WorkspaceBuild,
+                        ActivationReceiptStageStatus::Unavailable,
+                    );
+                })?;
+        let root = project.root().to_path_buf();
+        let activation = configured_semantic_models()
+            .inspect_err(|_error| {
+                receipt.record_stage_failure(
+                    ActivationReceiptStage::Configuration,
+                    ActivationReceiptStageStatus::Unavailable,
+                );
+            })
+            .and_then(|configured| {
+                activate_configured_semantic_models_observed(
+                    project.root(),
+                    &workspace,
+                    configured,
+                    Some(&receipt),
+                )
+            });
+        let activation = match activation {
+            Ok(state) => Some(Arc::new(state)),
+            Err(error) => {
+                eprintln!("bifrost: workspace semantic-pack activation unavailable: {error}");
+                None
+            }
+        };
+        let semantic_packs = Arc::new(SemanticPackWarm::settled(activation));
+        let session = assemble_session_with_warm(
+            project,
+            workspace,
+            UpdateStrategy::Manual,
+            StartupIndexWarm::OnDemand,
+            &watcher_starter,
+            semantic_packs,
+        )?;
+        let mut service = Self::with_session_state(
+            root,
+            Some(session),
+            file_listing,
+            UpdateStrategy::Manual,
+            watcher_starter,
+        );
+        service.activation_receipt = Some(receipt);
+        Ok(service)
+    }
+
     fn new_one_shot_with_watcher_starter(
         root: PathBuf,
         watcher_starter: WatcherStarter,
@@ -5024,6 +5151,7 @@ impl SearchToolsService {
             diff_snapshot_object_dir: None,
             diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
+            activation_receipt: None,
         }
     }
 
@@ -5089,6 +5217,7 @@ impl SearchToolsService {
             diff_snapshot_object_dir: None,
             diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
+            activation_receipt: None,
         }
     }
 
@@ -5317,6 +5446,7 @@ impl SearchToolsService {
             diff_snapshot_object_dir: None,
             diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
+            activation_receipt: None,
         })
     }
 
@@ -7201,6 +7331,7 @@ fn unbound_test_service(
         diff_snapshot_object_dir: None,
         diff_scoring: DiffScoringSession::default(),
         workspace_scaled_query_limits: false,
+        activation_receipt: None,
     }
 }
 
@@ -9479,6 +9610,7 @@ public partial class MudDialogContainer
             diff_snapshot_object_dir: None,
             diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
+            activation_receipt: None,
         }
     }
 

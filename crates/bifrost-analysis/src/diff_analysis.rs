@@ -1471,6 +1471,50 @@ fn add_odb_alternate(repo: &Repository, path: &Path, description: &str) -> Resul
         .map_err(|err| format!("unable to attach {description} {}: {err}", path.display()))
 }
 
+/// Changed hunks in the head buffer, as half-open byte ranges. Context lines
+/// are excluded; a deletion is a zero-width position in the head. This uses
+/// the same libgit2 diff machinery as repository diff analysis, without
+/// interpreting rendered patches or reading the live working tree.
+pub fn changed_buffer_ranges(
+    base: &str,
+    head: &str,
+) -> Result<Vec<std::ops::Range<usize>>, String> {
+    let mut options = DiffOptions::new();
+    options.context_lines(0).interhunk_lines(0);
+    let patch = git2::Patch::from_buffers(
+        base.as_bytes(),
+        None,
+        head.as_bytes(),
+        None,
+        Some(&mut options),
+    )
+    .map_err(|error| format!("unable to compare source buffers: {error}"))?;
+    // libgit2 counts LF-delimited lines. A lone CR is content, whereas the
+    // display-coordinate helper also treats it as a line break.
+    let starts = std::iter::once(0)
+        .chain(
+            head.bytes()
+                .enumerate()
+                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
+        )
+        .collect::<Vec<_>>();
+    let offset = |line: usize| starts.get(line).copied().unwrap_or(head.len());
+    (0..patch.num_hunks())
+        .map(|index| {
+            let (hunk, _) = patch
+                .hunk(index)
+                .map_err(|error| format!("unable to read source hunk: {error}"))?;
+            let count = hunk.new_lines() as usize;
+            let start = if count == 0 {
+                hunk.new_start() as usize
+            } else {
+                hunk.new_start() as usize - 1
+            };
+            Ok(offset(start)..offset(start + count))
+        })
+        .collect()
+}
+
 fn diff_metadata(
     repo: &Repository,
     base: Snapshot,

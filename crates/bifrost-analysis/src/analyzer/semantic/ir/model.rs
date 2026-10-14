@@ -2105,8 +2105,8 @@ impl ValueFlowKind {
     }
 }
 
-/// A structured operation that consumes a value without claiming that the
-/// consumed value flows into the operation's result.
+/// A structured operation on a value or binding without claiming that it
+/// flows into the operation's result.
 ///
 /// This is deliberately separate from [`ValueFlowKind`]. For example, an
 /// address value is required to dereference memory, but the address itself is
@@ -2114,12 +2114,15 @@ impl ValueFlowKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueUseKind {
     Dereference,
+    /// Remove the lexical binding that names this local or parameter.
+    Unbind,
 }
 
 impl ValueUseKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Dereference => "dereference",
+            Self::Unbind => "unbind",
         }
     }
 }

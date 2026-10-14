@@ -88,23 +88,9 @@ pub struct GoPackage {
     #[serde(default)]
     pub for_test: String,
     #[serde(default)]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Canonical descriptive test inventory is retained for diagnostics; only selected GoFiles and Imports authorize membership"
-        )
-    )]
     pub test_go_files: Vec<PathBuf>,
     #[serde(default)]
     #[serde(rename = "XTestGoFiles")]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Canonical descriptive test inventory is retained for diagnostics; only selected GoFiles and Imports authorize membership"
-        )
-    )]
     pub x_test_go_files: Vec<PathBuf>,
     #[serde(default)]
     #[cfg_attr(
@@ -374,7 +360,56 @@ fn discover_with_runner(
         cancellation,
     ) {
         Ok(bytes) => bytes,
-        Err(error) => return failed_outcome("go.list_failed", error, cancellation, limits).into(),
+        Err(error) => {
+            let semantic_packs =
+                failed_outcome("go.list_failed", error.clone(), cancellation, limits);
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return semantic_packs.into();
+            }
+            // An unsuccessful root invocation has no per-file selection
+            // authority. Retain its structured failure alongside inventory
+            // placements instead of erasing them with an empty tool profile.
+            let packages = discovery
+                .workspace_patterns
+                .iter()
+                .map(|pattern| GoPackage {
+                    import_path: pattern.clone(),
+                    name: String::new(),
+                    dir: project.root().to_path_buf(),
+                    standard: false,
+                    incomplete: true,
+                    error: Some(GoPackageError {
+                        err: error.clone(),
+                        import_stack: Vec::new(),
+                        pos: String::new(),
+                    }),
+                    module: None,
+                    go_files: Vec::new(),
+                    cgo_files: Vec::new(),
+                    ignored_go_files: Vec::new(),
+                    imports: Vec::new(),
+                    import_map: BTreeMap::new(),
+                    for_test: String::new(),
+                    test_go_files: Vec::new(),
+                    x_test_go_files: Vec::new(),
+                    test_imports: Vec::new(),
+                    x_test_imports: Vec::new(),
+                    deps_errors: Vec::new(),
+                })
+                .collect();
+            return GoDiscoveryOutcome {
+                canonical: Some(GoPackageDiscovery {
+                    packages,
+                    environment: environment.clone(),
+                    goos: goos.to_owned(),
+                    goarch: goarch.to_owned(),
+                    build_tags: discovery.build_tags.clone(),
+                    workspace_patterns: discovery.workspace_patterns.clone(),
+                    vendor,
+                }),
+                semantic_packs,
+            };
+        }
     };
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return cancelled_outcome().into();

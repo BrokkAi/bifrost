@@ -2941,8 +2941,17 @@ fn validate_events(
                         }
                     }
                 }
-                SemanticEffect::ValueUse { value, .. } => {
+                SemanticEffect::ValueUse { kind, value } => {
                     ensure_value(id, *value, procedure.values.len(), "used value")?;
+                    if *kind == ValueUseKind::Unbind
+                        && !procedure.values[value.index()].kind.is_binding()
+                    {
+                        return Err(SemanticIrError::procedure(
+                            id,
+                            SemanticIrErrorKind::ValueFlowContract,
+                            format!("unbind use names non-binding value {value}"),
+                        ));
+                    }
                 }
                 SemanticEffect::Allocation { allocation } => {
                     ensure_allocation(

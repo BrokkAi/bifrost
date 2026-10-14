@@ -38,6 +38,7 @@ macro_rules! generation_and_root_params {
             &$key.generation.semantics_digest,
             $key.generation.representation_version,
             &$key.root_public_digest,
+            $key.owner_storage_language_key.as_str(),
         ]
     };
 }
@@ -59,6 +60,7 @@ pub struct ClassSetRootResultGenerationKey {
 pub struct FindingFreeClassSetRootKey {
     pub generation: ClassSetRootResultGenerationKey,
     pub root_public_digest: ClassSetRootResultDigest,
+    pub owner_storage_language_key: crate::analyzer::semantic::StorageLanguageKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -306,17 +308,19 @@ pub(crate) static CLASS_SET_ROOT_RESULT_HEADER_SQL: LazyLock<String> = LazyLock:
                 CASE WHEN length(results.content_digest)=32 THEN results.content_digest END,
                 length(CAST(results.owner_rel_path AS BLOB)),
                 length(CAST(blobs.blob_oid AS BLOB)),
-                results.owner_rel_path,blobs.blob_oid
+                length(CAST(blobs.lang AS BLOB)),
+                results.owner_rel_path,blobs.blob_oid,blobs.lang
          FROM class_set_root_result_generations AS generations
          JOIN class_set_finding_free_root_results AS results
            ON results.generation_id=generations.generation_id
-         JOIN blobs ON blobs.id=results.owner_blob_id AND blobs.lang=results.lang
+         JOIN blobs ON blobs.id=results.owner_blob_id
          JOIN blob_meta AS meta ON meta.blob_id=blobs.id
          WHERE generations.lang=?1 AND generations.workspace_content_digest=?2
            AND generations.provider_behavior_digest=?3 AND generations.active_pack_digest=?4
            AND generations.field_slots_digest=?5
            AND generations.root_result_semantics_digest=?6
            AND generations.representation_version=?7 AND results.root_public_digest=?8
+           AND blobs.lang=?9
            AND {PARSED_BLOB_COMPLETE_CONDITION}"
     )
 });
@@ -446,10 +450,11 @@ impl AnalyzerStore {
                         generations.field_slots_digest,
                         generations.root_result_semantics_digest,
                         generations.representation_version,results.root_public_digest,
-                        results.published_at
+                        results.published_at,blobs.lang
                  FROM class_set_root_result_generations AS generations
                  JOIN class_set_finding_free_root_results AS results
                    ON results.generation_id=generations.generation_id
+                 JOIN blobs ON blobs.id=results.owner_blob_id
                  ORDER BY generations.lang,generations.workspace_content_digest,
                           generations.provider_behavior_digest,generations.active_pack_digest,
                           generations.field_slots_digest,
@@ -467,6 +472,7 @@ impl AnalyzerStore {
                     row.get::<_, i64>(6)?,
                     row.get::<_, Vec<u8>>(7)?,
                     row.get::<_, i64>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             })?;
             rows.map(|row| {
@@ -480,6 +486,7 @@ impl AnalyzerStore {
                     version,
                     root,
                     published_at,
+                    storage_lang,
                 ) = row?;
                 Ok((
                     FindingFreeClassSetRootKey {
@@ -487,6 +494,8 @@ impl AnalyzerStore {
                             lang, workspace, provider, pack, fields, semantics, version,
                         )?,
                         root_public_digest: digest(root, "snapshot root")?,
+                        owner_storage_language_key:
+                            crate::analyzer::semantic::StorageLanguageKey::from_store(storage_lang),
                     },
                     snapshot_published_at(published_at)?,
                 ))
@@ -733,8 +742,14 @@ fn load_result(
         MAX_CLASS_SET_ROOT_TEXT_BYTES,
         "owner blob text byte",
     )?;
+    let owner_storage_language_key_bytes = bounded_count(
+        header.get::<_, i64>(8)?,
+        MAX_CLASS_SET_ROOT_TEXT_BYTES,
+        "owner storage-language text byte",
+    )?;
     let attachment_text_bytes = owner_path_bytes
         .checked_add(owner_blob_oid_bytes)
+        .and_then(|bytes| bytes.checked_add(owner_storage_language_key_bytes))
         .ok_or_else(|| {
             StoreError::resource_bound("class-set root-result attachment size overflows usize")
         })?;
@@ -746,8 +761,15 @@ fn load_result(
     // The length columns above are decoded and admitted before either owned
     // string. This keeps a corrupt header from allocating outside the caller's
     // already-validated retained-byte envelope.
-    let owner_rel_path = header.get::<_, String>(8)?;
-    let owner_blob_oid = header.get::<_, String>(9)?;
+    let owner_rel_path = header.get::<_, String>(9)?;
+    let owner_blob_oid = header.get::<_, String>(10)?;
+    let owner_storage_language_key =
+        crate::analyzer::semantic::StorageLanguageKey::from_store(header.get::<_, String>(11)?);
+    if owner_storage_language_key != key.owner_storage_language_key {
+        return Err(StoreError::corrupt(
+            "class-set root-result owner storage-language identity is corrupt",
+        ));
+    }
     let row_text_bytes = text_bytes - attachment_text_bytes;
     let rows = load_rows(conn, result_id, row_count, row_text_bytes, cancellation)?;
     let result = FindingFreeClassSetRootResult::try_from_canonical_rows(
@@ -755,6 +777,7 @@ fn load_result(
         ClassSetSummaryAttachment {
             rel_path: owner_rel_path,
             blob_oid: owner_blob_oid,
+            storage_language_key: owner_storage_language_key,
             language: key.generation.language,
         },
         rows,
@@ -997,7 +1020,9 @@ fn delete_exact_result(
 ) -> Result<()> {
     conn.execute(
         "DELETE FROM class_set_finding_free_root_results
-         WHERE root_public_digest=?8 AND generation_id IN (
+         WHERE root_public_digest=?8 AND owner_blob_id IN (
+           SELECT id FROM blobs WHERE lang=?9
+         ) AND generation_id IN (
            SELECT generation_id FROM class_set_root_result_generations
            WHERE lang=?1 AND workspace_content_digest=?2 AND provider_behavior_digest=?3
              AND active_pack_digest=?4 AND field_slots_digest=?5
@@ -1012,15 +1037,15 @@ fn live_owner_blob_id(
     conn: &rusqlite::Connection,
     result: &FindingFreeClassSetRootResult,
 ) -> Result<i64> {
-    let language = result.key.generation.language.config_label();
-    super::live_class_set_owner_blob_id(conn, &result.attachment.blob_oid, language)?.ok_or_else(
-        || {
+    let storage_language_key = &result.key.owner_storage_language_key;
+    super::live_class_set_owner_blob_id(conn, &result.attachment.blob_oid, storage_language_key)?
+        .ok_or_else(|| {
             StoreError::new(format!(
                 "class-set root-result owner blob {}/{} is absent",
-                result.attachment.blob_oid, language
+                result.attachment.blob_oid,
+                storage_language_key.as_str()
             ))
-        },
-    )
+        })
 }
 
 fn validate_key_and_attachment(
@@ -1029,6 +1054,7 @@ fn validate_key_and_attachment(
 ) -> Result<()> {
     validate_generation_key(&key.generation)?;
     if attachment.language != key.generation.language
+        || attachment.storage_language_key != key.owner_storage_language_key
         || attachment.rel_path.is_empty()
         || !super::valid_workspace_relative_path(Path::new(&attachment.rel_path))
         || git2::Oid::from_str(&attachment.blob_oid).is_err()
@@ -1114,6 +1140,7 @@ fn payload_text_bytes(
         .rel_path
         .len()
         .checked_add(attachment.blob_oid.len())
+        .and_then(|bytes| bytes.checked_add(attachment.storage_language_key.as_str().len()))
         .ok_or_else(|| {
             StoreError::resource_bound("class-set root-result text size overflows usize")
         })?;
@@ -1327,10 +1354,15 @@ mod tests {
             FindingFreeClassSetRootKey {
                 generation: generation(seed),
                 root_public_digest: [6; 32],
+                owner_storage_language_key:
+                    crate::analyzer::semantic::StorageLanguageKey::from_adapter("python"),
             },
             ClassSetSummaryAttachment {
                 rel_path: "src/app.py".to_string(),
                 blob_oid: BLOB.to_string(),
+                storage_language_key: crate::analyzer::semantic::StorageLanguageKey::from_adapter(
+                    "python",
+                ),
                 language: Language::Python,
             },
             vec![
@@ -1382,10 +1414,15 @@ mod tests {
             FindingFreeClassSetRootKey {
                 generation: generation(1),
                 root_public_digest: [7; 32],
+                owner_storage_language_key:
+                    crate::analyzer::semantic::StorageLanguageKey::from_adapter("python"),
             },
             ClassSetSummaryAttachment {
                 rel_path: "src/app.py".to_string(),
                 blob_oid: BLOB.to_string(),
+                storage_language_key: crate::analyzer::semantic::StorageLanguageKey::from_adapter(
+                    "python",
+                ),
                 language: Language::Python,
             },
             rows,
@@ -1395,6 +1432,64 @@ mod tests {
 
     fn store_with_blob() -> AnalyzerStore {
         ephemeral_store_with_complete_python_blob(BLOB, 0)
+    }
+
+    fn insert_complete_storage_blob(store: &AnalyzerStore, oid: &str, storage_key: &str) {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid,lang,generation) VALUES(?1,?2,0)",
+            rusqlite::params![oid, storage_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blob_meta(
+               blob_id,lang,contains_tests,content_package,stored_unit_count,
+               range_count,signature_count,signature_metadata_count,supertype_count,
+               child_count,import_statement_count,type_identifier_count,is_complete
+             )
+             SELECT id,lang,0,'',0,0,0,0,0,0,0,0,1
+             FROM blobs WHERE blob_oid=?1 AND lang=?2",
+            rusqlite::params![oid, storage_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blob_payload_costs(blob_id,payload_bytes)
+             SELECT id,0 FROM blobs WHERE blob_oid=?1 AND lang=?2",
+            rusqlite::params![oid, storage_key],
+        )
+        .unwrap();
+    }
+
+    fn result_for_storage_key(
+        seed: u8,
+        path: &str,
+        storage_key: &'static str,
+        language: Language,
+    ) -> FindingFreeClassSetRootResult {
+        let mut generation = generation(seed);
+        generation.language = language;
+        let mut rows = result(seed).rows;
+        for row in &mut rows {
+            row.relative_path = PathBuf::from(path);
+        }
+        FindingFreeClassSetRootResult::try_new(
+            FindingFreeClassSetRootKey {
+                generation,
+                root_public_digest: [seed.wrapping_add(10); 32],
+                owner_storage_language_key:
+                    crate::analyzer::semantic::StorageLanguageKey::from_adapter(storage_key),
+            },
+            ClassSetSummaryAttachment {
+                rel_path: path.to_owned(),
+                blob_oid: BLOB.to_owned(),
+                storage_language_key: crate::analyzer::semantic::StorageLanguageKey::from_adapter(
+                    storage_key,
+                ),
+                language,
+            },
+            rows,
+        )
+        .unwrap()
     }
 
     fn load(
@@ -1407,6 +1502,47 @@ mod tests {
             MAX_CLASS_SET_ROOT_RETAINED_BYTES,
             &CancellationToken::new(),
         )
+    }
+
+    #[test]
+    fn root_results_bind_same_blob_oid_to_exact_typescript_storage_dialect() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        insert_complete_storage_blob(&store, BLOB, "typescript:ts");
+        insert_complete_storage_blob(&store, BLOB, "typescript:tsx");
+        let ts = result_for_storage_key(21, "src/entry.ts", "typescript:ts", Language::TypeScript);
+        let tsx =
+            result_for_storage_key(22, "src/entry.tsx", "typescript:tsx", Language::TypeScript);
+        for expected in [&ts, &tsx] {
+            assert!(
+                store
+                    .publish_finding_free_class_set_root_result(
+                        expected.clone(),
+                        &CancellationToken::new(),
+                    )
+                    .unwrap()
+            );
+            assert_eq!(
+                load(&store, &expected.key).unwrap(),
+                ClassSetRootResultLookup::Hit(Box::new(expected.clone()))
+            );
+        }
+
+        let mut wrong_ts_owner = ts.key.clone();
+        wrong_ts_owner.owner_storage_language_key =
+            crate::analyzer::semantic::StorageLanguageKey::from_adapter("typescript:tsx");
+        assert_eq!(
+            load(&store, &wrong_ts_owner).unwrap(),
+            ClassSetRootResultLookup::Miss,
+            "the shared Git OID does not make the TSX blob a valid TS owner"
+        );
+        let mut wrong_tsx_owner = tsx.key.clone();
+        wrong_tsx_owner.owner_storage_language_key =
+            crate::analyzer::semantic::StorageLanguageKey::from_adapter("typescript:ts");
+        assert_eq!(
+            load(&store, &wrong_tsx_owner).unwrap(),
+            ClassSetRootResultLookup::Miss,
+            "the shared Git OID does not make the TS blob a valid TSX owner"
+        );
     }
 
     #[test]

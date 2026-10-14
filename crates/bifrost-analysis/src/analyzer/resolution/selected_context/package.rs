@@ -19,11 +19,17 @@ pub(crate) struct SelectedPackageBridgeDescriptor {
     target_definition: Option<BindingNodeId>,
     route_identity: [u8; 32],
     precedence: Option<PrecedenceStep>,
+    candidate_origin_rank: Option<u32>,
     jvm_evidence: Option<SelectedJvmBridgeEvidence>,
     completion: ResolutionCompletion,
 }
 
 impl SelectedPackageBridgeDescriptor {
+    pub(crate) fn with_candidate_origin_rank(mut self, rank: Option<u32>) -> Self {
+        self.candidate_origin_rank = rank;
+        self
+    }
+
     pub(super) fn matches_qualified_reference(
         &self,
         source_fragment: BindingFragmentId,
@@ -128,6 +134,7 @@ impl SelectedPackageBridgeDescriptor {
             target_definition: None,
             route_identity: [0; 32],
             precedence: None,
+            candidate_origin_rank: None,
             jvm_evidence: None,
             completion,
         }
@@ -196,6 +203,7 @@ impl SelectedPackageBridgeDescriptor {
             target_definition: None,
             route_identity: [0; 32],
             precedence: None,
+            candidate_origin_rank: None,
             jvm_evidence: Some(evidence),
             completion,
         }
@@ -300,6 +308,7 @@ impl SelectedPackageBridgeDescriptor {
             target_definition: Some(target_definition),
             route_identity,
             precedence,
+            candidate_origin_rank: None,
             jvm_evidence: evidence,
             completion,
         }
@@ -384,78 +393,152 @@ impl SelectedPackageBridgeDescriptor {
             target_definition: Some(target_definition),
             route_identity,
             precedence: None,
+            candidate_origin_rank: None,
             jvm_evidence: evidence,
             completion,
         }
     }
 
-    fn digest(&self, domain: &[u8]) -> [u8; 32] {
-        let mut hash = CanonicalHasher::new(domain);
-        hash.field("source", &self.source_fragment.as_bytes());
-        hash.field("target", &self.target_fragment.as_bytes());
+    fn digest(
+        &self,
+        domain: &[u8],
+        identities: &SelectedContextIdentities,
+        source: &dyn BatchResolutionFragmentSource,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<[u8; 32]> {
+        let mut hash = CanonicalIdentityDescriptor::new(domain, |key| {
+            super::super::canonical_identity::selected_identity_content_digest(
+                identities,
+                source,
+                key,
+                cancellation,
+            )
+        });
+        hash.field(
+            "source",
+            CanonicalIdentityPart::identity(self.source_fragment),
+        )?;
+        hash.field(
+            "target",
+            CanonicalIdentityPart::identity(self.target_fragment),
+        )?;
         hash.field(
             "source_language",
-            self.source_language.config_label().as_bytes(),
-        );
+            CanonicalIdentityPart::Label(self.source_language.config_label()),
+        )?;
         hash.field(
             "target_language",
-            self.target_language.config_label().as_bytes(),
-        );
-        hash.field("source_token", &self.source_token.as_bytes());
-        hash.field("target_token", &self.target_token.as_bytes());
-        hash.field("source_domain", &self.source_domain.as_bytes());
-        hash.field("source_lookup", &self.source_lookup.as_bytes());
-        hash.field("target_domain", &self.target_domain.as_bytes());
-        hash.field("target_lookup", &self.target_lookup.as_bytes());
-        hash.field("route_identity", &self.route_identity);
+            CanonicalIdentityPart::Label(self.target_language.config_label()),
+        )?;
+        hash.field(
+            "source_token",
+            CanonicalIdentityPart::identity(self.source_token),
+        )?;
+        hash.field(
+            "target_token",
+            CanonicalIdentityPart::identity(self.target_token),
+        )?;
+        hash.field(
+            "source_domain",
+            CanonicalIdentityPart::identity(self.source_domain),
+        )?;
+        hash.field(
+            "source_lookup",
+            CanonicalIdentityPart::identity(self.source_lookup),
+        )?;
+        hash.field(
+            "target_domain",
+            CanonicalIdentityPart::identity(self.target_domain),
+        )?;
+        hash.field(
+            "target_lookup",
+            CanonicalIdentityPart::identity(self.target_lookup),
+        )?;
+        hash.field(
+            "route_identity",
+            CanonicalIdentityPart::Content(&self.route_identity),
+        )?;
         if let Some(step) = self.precedence {
-            hash.field("precedence_tier", step.tier.label().as_bytes());
-            hash.field("precedence_ordinal", &step.ordinal.to_le_bytes());
-            hash.field("precedence_choice", &step.semantic.as_bytes());
+            hash.field(
+                "precedence_tier",
+                CanonicalIdentityPart::Label(step.tier.label()),
+            )?;
+            hash.field(
+                "precedence_ordinal",
+                CanonicalIdentityPart::Content(&step.ordinal.to_le_bytes()),
+            )?;
+            hash.field(
+                "precedence_choice",
+                CanonicalIdentityPart::identity(step.semantic),
+            )?;
+        }
+        if let Some(rank) = self.candidate_origin_rank {
+            hash.field(
+                "candidate_origin_rank",
+                CanonicalIdentityPart::Content(&rank.to_le_bytes()),
+            )?;
         }
         if let Some(definition) = self.target_definition {
-            hash.field("target_definition", &definition.as_bytes());
+            hash.field(
+                "target_definition",
+                CanonicalIdentityPart::identity(definition),
+            )?;
         }
         if let Some(evidence) = self.jvm_evidence {
-            hash.field("dependency_identity", &evidence.dependency_identity);
+            hash.field(
+                "dependency_identity",
+                CanonicalIdentityPart::Content(&evidence.dependency_identity),
+            )?;
             hash.field(
                 "target_declaration",
-                &evidence.target_declaration.as_bytes(),
-            );
-            hash.field("target_definition", &evidence.target_definition.as_bytes());
+                CanonicalIdentityPart::identity(evidence.target_declaration),
+            )?;
+            hash.field(
+                "target_definition",
+                CanonicalIdentityPart::identity(evidence.target_definition),
+            )?;
             hash.field(
                 "source_namespace",
-                evidence.source_namespace.identity_label().as_bytes(),
-            );
+                CanonicalIdentityPart::Label(evidence.source_namespace.identity_label()),
+            )?;
             hash.field(
                 "target_namespace",
-                evidence.target_namespace.identity_label().as_bytes(),
-            );
+                CanonicalIdentityPart::Label(evidence.target_namespace.identity_label()),
+            )?;
             hash.field(
                 "visibility",
-                match evidence.visibility {
+                CanonicalIdentityPart::Content(match evidence.visibility {
                     SelectedJvmBridgeVisibility::Public => b"public".as_slice(),
                     SelectedJvmBridgeVisibility::Protected => b"protected".as_slice(),
                     SelectedJvmBridgeVisibility::Package => b"package".as_slice(),
                     SelectedJvmBridgeVisibility::Open => b"open".as_slice(),
-                },
-            );
+                }),
+            )?;
             match evidence.provenance {
                 SelectedJvmBridgeProvenance::StructuredPackageType {
                     source_package,
                     target_package,
                 } => {
-                    hash.field("provenance", b"structured_package_type");
-                    hash.field("source_package", &source_package.as_bytes());
-                    hash.field("target_package", &target_package.as_bytes());
+                    hash.field(
+                        "provenance",
+                        CanonicalIdentityPart::Content(b"structured_package_type"),
+                    )?;
+                    hash.field(
+                        "source_package",
+                        CanonicalIdentityPart::identity(source_package),
+                    )?;
+                    hash.field(
+                        "target_package",
+                        CanonicalIdentityPart::identity(target_package),
+                    )?;
                 }
                 SelectedJvmBridgeProvenance::AliasFact { alias } => {
-                    hash.field("provenance", b"alias_fact");
-                    hash.field("alias", &alias.as_bytes());
+                    hash.field("provenance", CanonicalIdentityPart::Content(b"alias_fact"))?;
+                    hash.field("alias", CanonicalIdentityPart::identity(alias))?;
                 }
             }
         }
-        hash.finish()
+        Ok(hash.finish())
     }
 
     pub(crate) const fn source_language(&self) -> Language {
@@ -485,14 +568,25 @@ impl SelectedPackageBridgeDescriptor {
     pub(crate) fn compile(
         &self,
         identities: &SelectedContextIdentities,
+        source: &dyn BatchResolutionFragmentSource,
         cancellation: &CancellationToken,
         session: &ResolutionSession,
-    ) -> Option<(CandidatePathIdentity, PartialPath)> {
+    ) -> StoreResult<Option<(CandidatePathIdentity, PartialPath)>> {
         if cancellation.is_cancelled() || !session.scope_step() {
-            return None;
+            return Ok(None);
         }
-        let path = identities.path(self.digest(b"bifrost-selected-package-path:v1"));
-        let tail = identities.stack_variable(self.digest(b"bifrost-selected-package-tail:v1"));
+        let path = identities.path(self.digest(
+            b"bifrost-selected-package-path:v1",
+            identities,
+            source,
+            cancellation,
+        )?);
+        let tail = identities.stack_variable(self.digest(
+            b"bifrost-selected-package-tail:v1",
+            identities,
+            source,
+            cancellation,
+        )?);
         let root = BindingNodeId::universal_root();
         let (end_node, export, witness) = if let Some(definition) = self.target_definition {
             (definition, Vec::new(), vec![WitnessStep::Node(definition)])
@@ -503,7 +597,17 @@ impl SelectedPackageBridgeDescriptor {
                 Vec::new(),
             )
         };
-        Some((
+        let mut precedence = self.precedence.into_iter().collect::<Vec<_>>();
+        if let Some(rank) = self.candidate_origin_rank {
+            precedence.push(PrecedenceStep {
+                tier: PrecedenceTier::CandidateOriginRank,
+                ordinal: rank,
+                semantic: self
+                    .precedence
+                    .map_or(self.source_token, |step| step.semantic),
+            });
+        }
+        Ok(Some((
             CandidatePathIdentity::new(self.source_fragment, path),
             PartialPath::new(
                 EndpointSignature::new(
@@ -519,16 +623,18 @@ impl SelectedPackageBridgeDescriptor {
                     StackPattern::open(export, tail),
                     StackPattern::closed([]),
                 ),
-                self.precedence.into_iter().collect::<Vec<_>>(),
+                precedence,
                 witness,
                 self.completion.clone(),
             ),
-        ))
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::engine::PreloadedFragmentSource;
+
     use super::*;
 
     #[test]
@@ -552,15 +658,18 @@ mod tests {
             target_definition: Some(BindingNodeId::universal_root()),
             route_identity: [0; 32],
             precedence: Some(step),
+            candidate_origin_rank: None,
             jvm_evidence: None,
             completion: ResolutionCompletion::Complete,
         };
         let compiled = bridge
             .compile(
                 &SelectedContextIdentities::new(),
+                &PreloadedFragmentSource::new([], []),
                 &CancellationToken::default(),
                 &ResolutionSession::unbounded(),
             )
+            .unwrap()
             .expect("a live selected package bridge compiles");
         assert_eq!(compiled.1.precedence(), &[step]);
     }

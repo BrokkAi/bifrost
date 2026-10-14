@@ -639,6 +639,10 @@ impl ExplicitCandidateProvider {
 }
 
 impl CandidateFileProvider for ExplicitCandidateProvider {
+    fn explicit_candidate_files(&self) -> Option<&HashSet<ProjectFile>> {
+        Some(self.files.as_ref())
+    }
+
     fn find_candidates(
         &self,
         target: &CodeUnit,

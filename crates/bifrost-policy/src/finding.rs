@@ -4319,16 +4319,16 @@ fn bound_obligation_group_key(value: &str) -> String {
 /// How a run's endpoints were scoped against a requested changed range (spec
 /// M4.0).
 ///
-/// A `changed-range` run bound sinks only in the files it examined, so an empty
+/// A `changed-range` run bound sinks only in the procedures it examined, so an empty
 /// result says nothing about sinks outside them. A `workspace` run considered
 /// every endpoint; `widened` then names why the request did not narrow it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyRunScope {
     kind: PolicyRunScopeKind,
-    /// Workspace-relative changed files whose sinks this run bound, in path
-    /// order. Changed-range runs only.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    examined_files: Vec<String>,
+    /// Procedure source ranges overlapping a changed hunk, in path/range order.
+    /// An empty array explicitly states that no procedure was in scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    examined_procedures: Option<Vec<PolicySourceLocation>>,
     /// Each selector or engine that kept this run from the requested range,
     /// with the reason.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -4348,16 +4348,19 @@ impl PolicyRunScope {
     pub(crate) const fn workspace(widened: Vec<String>) -> Self {
         Self {
             kind: PolicyRunScopeKind::Workspace,
-            examined_files: Vec::new(),
+            examined_procedures: None,
             widened,
         }
     }
 
-    /// A run that bound sinks only in `examined_files`.
-    pub(crate) const fn changed_range(examined_files: Vec<String>, widened: Vec<String>) -> Self {
+    /// A run that bound sinks only in `examined_procedures`.
+    pub(crate) const fn changed_range(
+        examined_procedures: Vec<PolicySourceLocation>,
+        widened: Vec<String>,
+    ) -> Self {
         Self {
             kind: PolicyRunScopeKind::ChangedRange,
-            examined_files,
+            examined_procedures: Some(examined_procedures),
             widened,
         }
     }
@@ -4366,8 +4369,8 @@ impl PolicyRunScope {
         self.kind
     }
 
-    pub fn examined_files(&self) -> &[String] {
-        &self.examined_files
+    pub fn examined_procedures(&self) -> &[PolicySourceLocation] {
+        self.examined_procedures.as_deref().unwrap_or_default()
     }
 
     pub fn widened(&self) -> &[String] {
@@ -4378,7 +4381,7 @@ impl PolicyRunScope {
 impl RetainedSize for PolicyRunScope {
     fn retained_size(&self) -> usize {
         size_of::<Self>()
-            .saturating_add(retained_extra(&self.examined_files))
+            .saturating_add(retained_extra(&self.examined_procedures))
             .saturating_add(retained_extra(&self.widened))
     }
 }

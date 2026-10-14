@@ -637,6 +637,7 @@ fn go_native_point_binds_standard_package_and_external_member_identity() {
         &config,
         &[DependencyPackEcosystem::Go],
         DependencyPackWorkspaceContext {
+            activation_receipt: None,
             catalog: &catalog,
             persistence: None,
             activation: &activation,
@@ -1068,6 +1069,7 @@ func useUnknown[T interface{ Release() error }](receiver T) {
         &config,
         &[DependencyPackEcosystem::Go],
         DependencyPackWorkspaceContext {
+            activation_receipt: None,
             catalog: &catalog,
             persistence: None,
             activation: &activation,
@@ -2129,6 +2131,77 @@ fn go_native_point_resolves_direct_method_selection() {
 }
 
 #[test]
+#[hardwon(
+    "1476df13bd6d: cli/cli pkg/cmd/discussion/comment/comment.go:148:17: function-valued field calls panic on positioned Go prefix metadata"
+)]
+fn go_native_point_function_valued_field_call_does_not_panic() {
+    if !go_toolchain_available() {
+        return;
+    }
+    let source = r#"package consumer
+import "fmt"
+type Options struct { Client func() (fmt.Stringer, error) }
+func run(opts *Options) { c, err := opts.Client(); _, _ = c, err }
+"#;
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+        .file(CALLER, source)
+        .build();
+    let config = AnalyzerConfig {
+        go: GoAnalyzerConfig {
+            dependency_discovery: GoDependencyDiscoveryConfig {
+                mode: GoDependencyDiscoveryMode::FullProduction,
+                ..GoDependencyDiscoveryConfig::default()
+            },
+        },
+        ..AnalyzerConfig::default()
+    };
+    let workspace = fixture.workspace_analyzer(config.clone());
+    let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+    let activation = SemanticModelActivationRequest {
+        bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        evidence: Vec::new(),
+        controls: Vec::new(),
+        limits: SemanticModelRuntimeLimits::default(),
+    };
+    let cancellation = CancellationToken::default();
+    let discovery = workspace.activate_dependency_packs(
+        &config,
+        &[DependencyPackEcosystem::Go],
+        DependencyPackWorkspaceContext {
+            activation_receipt: None,
+            catalog: &catalog,
+            persistence: None,
+            activation: &activation,
+            limits: DependencyPackLimits::default(),
+            cancellation: &cancellation,
+        },
+    );
+    assert_go_discovery_completed(&discovery);
+    let analyzer = workspace.analyzer();
+    let file = fixture.file(CALLER);
+    let point = site_for(source, "Client");
+    let outcome = complete(resolve_go_definition_bounded(
+        BoundedReceiverQuery {
+            analyzer,
+            file: &file,
+            source,
+            tree: None,
+            site: &point,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: Some(&cancellation),
+        },
+        || {},
+    ));
+    assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
+    assert_eq!(
+        outcome.definitions[0].fq_name().to_string(),
+        "example.test/native/consumer.Options.Client",
+        "{outcome:?}"
+    );
+}
+
+#[test]
 fn go_native_point_resolves_method_expressions_with_exact_method_sets() {
     let caller_source = r#"package consumer
 
@@ -3089,17 +3162,15 @@ func (cache *Cache[K, V]) get(key K, values ...Option[K, V]) *Item[K, V] {
         .expect("generic Loader.Load method value")
         + "_ = getOpts.loader.".len();
     let default_method_value = resolve_at(method_value_start, ReceiverAnalysisBudget::default());
-    let default_work = match default_method_value {
-        BoundedResolution::Exceeded { limit, work } => {
-            assert_eq!(
-                limit,
-                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::SummaryExpansions
-            );
-            work
-        }
-        other => panic!("default-budget method-value query unexpectedly finished: {other:?}"),
+    let BoundedResolution::Complete {
+        value: default_value,
+        work: default_work,
+    } = default_method_value
+    else {
+        panic!("default owner budget must complete the method-value query");
     };
-    assert_eq!(default_work.summary_expansions, 64);
+    assert_eq!(default_value.status, DefinitionLookupStatus::Resolved);
+    assert_eq!(default_work.resolution_rounds, 65);
     let wide_method_value = resolve_at(
         method_value_start,
         ReceiverAnalysisBudget {
@@ -3112,7 +3183,7 @@ func (cache *Cache[K, V]) get(key K, values ...Option[K, V]) *Item[K, V] {
         BoundedResolution::Complete { value, work } => (value, work),
         other => panic!("wide-budget method-value query did not finish: {other:?}"),
     };
-    assert_eq!(method_value_work.summary_expansions, 65);
+    assert_eq!(method_value_work.resolution_rounds, 65);
     assert_eq!(
         method_value.status,
         DefinitionLookupStatus::Resolved,

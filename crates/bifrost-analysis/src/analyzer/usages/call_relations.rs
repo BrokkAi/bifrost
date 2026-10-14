@@ -2,6 +2,17 @@
 
 use std::sync::{Arc, Mutex};
 
+/// One caller file's speculative native answers, keyed by the exact callee
+/// byte range of each retained reverse site. The owning language's
+/// `LanguageSupport::prefetch_reverse_call_targets` fills these before the
+/// demanding walk asks, so this stays language-neutral.
+pub(crate) struct PrefetchedCallFile {
+    pub(crate) source_identity: ContentIdentity,
+    pub(crate) outcomes: Vec<((usize, usize), CallTargetLookupOutcome)>,
+    pub(crate) work: CallRelationWork,
+    pub(crate) native_execution_delta: usize,
+}
+
 use super::{
     FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageProof, UsageProofAuthority,
     UsageQueryCompletion, proof_rank,
@@ -291,6 +302,9 @@ pub(crate) struct CallDispatchSession {
     /// is owned by the file session, so it is bounded by the calls one query
     /// announced in one file.
     callee_outcomes: HashMap<(usize, usize), CallTargetLookupOutcome>,
+    /// Speculative native answers only. They can be removed without losing
+    /// any answer the sequential session itself resolved.
+    prefetched_callees: HashSet<(usize, usize)>,
 }
 
 const MAX_CPP_DISPATCH_PREFETCH_SITES: usize = 1024;
@@ -313,7 +327,10 @@ fn unbounded_call_relation_limits(max_files: usize, max_candidates: usize) -> Ca
     }
 }
 
-fn request_for_callee_range(file: &ProjectFile, range: Range) -> DefinitionLookupRequest {
+pub(crate) fn request_for_callee_range(
+    file: &ProjectFile,
+    range: Range,
+) -> DefinitionLookupRequest {
     DefinitionLookupRequest {
         file: file.clone(),
         line: None,
@@ -323,7 +340,7 @@ fn request_for_callee_range(file: &ProjectFile, range: Range) -> DefinitionLooku
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CallRelationWork {
     pub scanned_files: usize,
     pub scanned_source_bytes: usize,
@@ -1087,6 +1104,31 @@ fn append_incoming_projection_omission(
 }
 
 impl CallDispatchSession {
+    pub(crate) fn install_prefetched(&mut self, prefetched: PrefetchedCallFile) {
+        if prefetched.source_identity != ContentIdentity::hash_bytes(self.exact_source.as_bytes()) {
+            return;
+        }
+        debug_assert_eq!(
+            prefetched.work.scanned_source_bytes,
+            self.exact_source.len()
+        );
+        debug_assert_eq!(prefetched.native_execution_delta, 0);
+        for (key, outcome) in prefetched.outcomes {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.callee_outcomes.entry(key)
+            {
+                entry.insert(outcome);
+                self.prefetched_callees.insert(key);
+            }
+        }
+    }
+
+    pub(crate) fn discard_prefetched(&mut self) {
+        for key in self.prefetched_callees.drain() {
+            self.callee_outcomes.remove(&key);
+        }
+    }
+
     /// Conservative live source, tree, and project-path footprint while this
     /// session owns its exact snapshot. The shared syntax estimator also
     /// budgets entries retained by the analyzer's prepared-syntax store.
@@ -1211,6 +1253,7 @@ impl CallDispatchSession {
             };
         }
 
+        let parse_was_uninitialized = matches!(self.parse, CallDispatchParse::Uninitialized);
         let mut work = CallRelationWork {
             examined_candidates: 1,
             ..CallRelationWork::default()
@@ -1278,6 +1321,13 @@ impl CallDispatchSession {
                     work,
                 );
             }
+            Some(ExactCallReference::Unsupported(ExactCallReferenceGap::CallOfValue)) => {
+                return unresolved_dispatch_lookup(
+                    DefinitionLookupStatus::NoDefinition,
+                    "unsupported_call_of_value: callee expression does not name a declaration; dispatch requires callable-value information".to_string(),
+                    work,
+                );
+            }
             None => {
                 return unresolved_dispatch_lookup(
                     DefinitionLookupStatus::InvalidLocation,
@@ -1297,6 +1347,23 @@ impl CallDispatchSession {
         // and only the post-resolution steps below run per call.
         let callee_key = (callee_range.start_byte, callee_range.end_byte);
         let (outcome, cancelled) = if let Some(outcome) = self.callee_outcomes.get(&callee_key) {
+            if self.prefetched_callees.contains(&callee_key) {
+                // Speculation does not pay source/call work. This lookup runs
+                // the same parse and scalar charge as a sequential demand.
+                let sequential_work = CallRelationWork {
+                    scanned_files: usize::from(parse_was_uninitialized),
+                    scanned_source_bytes: if parse_was_uninitialized {
+                        self.exact_source.len()
+                    } else {
+                        0
+                    },
+                    examined_candidates: 1,
+                };
+                debug_assert_eq!(
+                    work, sequential_work,
+                    "prefetch preserves staged scalar dispatch work"
+                );
+            }
             (
                 Some(outcome.clone()),
                 cancellation.is_some_and(CancellationToken::is_cancelled),
@@ -1591,6 +1658,7 @@ impl CallRelationService {
             cpp_dispatch_prefetched: false,
             expected_calls: Vec::new(),
             callee_outcomes: HashMap::default(),
+            prefetched_callees: HashSet::default(),
         }
     }
 
@@ -1692,6 +1760,13 @@ impl CallRelationService {
                         DefinitionLookupStatus::NoDefinition,
                         "unsupported_ruby_callable_object_dispatch: resolving `receiver.(...)` requires value/heap callable-target information"
                             .to_string(),
+                        work,
+                    ));
+                }
+                Some(ExactCallReference::Unsupported(ExactCallReferenceGap::CallOfValue)) => {
+                    lookups[index] = Some(unresolved_dispatch_lookup(
+                        DefinitionLookupStatus::NoDefinition,
+                        "unsupported_call_of_value: callee expression does not name a declaration; dispatch requires callable-value information".to_string(),
                         work,
                     ));
                 }
@@ -5146,6 +5221,7 @@ void caller() {
             &AnalyzerConfig::default(),
             &[DependencyPackEcosystem::Cpp],
             DependencyPackWorkspaceContext {
+                activation_receipt: None,
                 catalog: &catalog,
                 persistence: None,
                 activation: &activation,

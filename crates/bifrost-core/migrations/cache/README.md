@@ -172,7 +172,26 @@ stores the source position at which it takes effect, and the selected import
 context consumes one blob's imports in that order. Other producers store NULL.
 
 Migration `0173-rust-unit-summary-rows.sql` is create-only. It adds the Rust-owned
-`rust_resolution_unit_summary_*` tables that hold placement, route, macro and typed facts
-keyed to the shared per-unit summary rows. It moves no data and changes no shared table.
+`rust_resolution_unit_summary_*` tables that hold placement, route, macro and typed
+facts keyed to the shared per-unit summary rows. It also adds an index for
+resolving effective bindings by summary, module, name, and namespace. It moves
+no data and changes no shared table.
 
-Migration `0174-jvm-external-owner-inventory.sql` adds durable external declaration inventories for JVM resolution, recording member and supertype rows plus completeness for each member namespace.
+Migration `0174-jvm-external-owner-inventory.sql` adds durable external
+declaration inventories for JVM resolution, recording member and supertype rows
+plus completeness for each member namespace.
+
+Migration `0175-contextual-callable-parameter-lists.sql` adds a normalized
+contextual flag to callable parameter-list rows. Scala marks implicit and
+using lists; the shared applicability mapper skips omitted contextual lists
+while aligning explicit argument lists.
+
+Migration `0177-resolution-member-owner-name.sql` stores the logical spelling of
+each member-owner row so shared JVM member selection can match synthesized
+members without relying on a source CodeUnit's display name.
+
+Migration `0178-class-set-owner-storage-identity.sql` retains class-set semantic
+languages while referencing each physical owner through its exact blob ID.
+Adapter-specific blob languages such as `typescript:ts` no longer have to equal
+the semantic language `typescript`. It preserves row IDs, dependent rows,
+root-generation language constraints, indexes and structural-surface triggers.

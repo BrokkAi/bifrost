@@ -443,14 +443,10 @@ WHERE mounted.mount_ordinal=?1 AND mounted.storage_language='go'
 "#;
 
 const GO_POINT_CALLABLE_RESULT_SLOT: &str = r#"
-SELECT projection.output_slot
+SELECT obligation.result_slot
 FROM temp.selected_resolution_mounts mounted
-JOIN main.resolution_semantic_sites semantic
-  ON semantic.blob_id=mounted.blob_id
- AND semantic.semantic_key=?2 AND semantic.semantic_role='reference'
-JOIN main.resolution_binding_projections projection
-  ON projection.blob_id=semantic.blob_id
- AND projection.reference=semantic.semantic_key AND projection.kind=2
+JOIN main.resolution_call_obligations obligation
+  ON obligation.blob_id=mounted.blob_id AND obligation.callee_reference=?2
 WHERE mounted.mount_ordinal=?1 AND mounted.storage_language='go'
 "#;
 

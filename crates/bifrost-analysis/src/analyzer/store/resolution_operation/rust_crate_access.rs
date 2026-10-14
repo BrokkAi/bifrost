@@ -348,61 +348,35 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
     }
 }
 
-pub(super) const PLACEMENTS: &str = "WITH RECURSIVE graph(
- workspace_id, generation, unit_key, summary_id, topology_id
-) AS (
- SELECT workspace_id, generation, unit_key, summary_id, topology_id
- FROM selected_rust_unit_summaries WHERE unit_key=?1
- UNION
- SELECT child.workspace_id, child.generation, child.unit_key,
-        child.summary_id, child.topology_id
- FROM graph
- JOIN main.resolution_unit_summary_dependencies AS dependency
-   ON dependency.summary_id=graph.summary_id AND dependency.boundary='workspace'
- JOIN selected_rust_unit_summaries AS child
-   ON child.workspace_id=graph.workspace_id AND child.generation=graph.generation
-  AND child.unit_key=dependency.dependency_unit_key
-)
-SELECT placement.topology_id, placement.container_path, json(context.cfg_atoms)
-FROM graph
+// Seek the blob's materialized placements before scanning its dependency
+// closure. Driving from graph used to repeat all module alignment per crate.
+pub(crate) const PLACEMENTS: &str =
+    "SELECT placement.topology_id, placement.container_path, json(context.cfg_atoms)
+FROM selected_rust_module_placements AS placement
+CROSS JOIN selected_rust_unit_closure AS graph
+  ON graph.root_unit_key=?1 AND graph.topology_id=placement.topology_id
 CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
   ON context.summary_id=graph.summary_id
-CROSS JOIN selected_rust_module_placements AS placement
-  ON placement.topology_id=graph.topology_id
 WHERE placement.placement_blob=?2 AND placement.module_declaration IS ?3";
 
 /// The module placements of a blob in the crate being resolved only, with the
 /// same columns as [`PLACEMENTS`]. See `reference_placements`.
 pub(super) const REFERENCE_PLACEMENTS: &str = "SELECT placement.topology_id,
  placement.container_path, json(context.cfg_atoms)
-FROM selected_rust_unit_summaries AS unit
-JOIN main.rust_resolution_unit_summary_contexts AS context
+FROM selected_rust_module_placements AS placement
+CROSS JOIN selected_rust_unit_summaries AS unit
+  ON unit.topology_id=placement.topology_id
+CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
   ON context.summary_id=unit.summary_id
-JOIN selected_rust_module_placements AS placement
-  ON placement.topology_id=unit.topology_id
 WHERE unit.unit_key=?1 AND placement.placement_blob=?2
   AND placement.module_declaration IS ?3";
 
-pub(super) const MEMBERSHIPS: &str = "WITH RECURSIVE graph(
- workspace_id, generation, unit_key, summary_id, topology_id
-) AS (
- SELECT workspace_id, generation, unit_key, summary_id, topology_id
- FROM selected_rust_unit_summaries WHERE unit_key=?1
- UNION
- SELECT child.workspace_id, child.generation, child.unit_key,
-        child.summary_id, child.topology_id
- FROM graph
- JOIN main.resolution_unit_summary_dependencies AS dependency
-   ON dependency.summary_id=graph.summary_id AND dependency.boundary='workspace'
- JOIN selected_rust_unit_summaries AS child
-   ON child.workspace_id=graph.workspace_id AND child.generation=graph.generation
-  AND child.unit_key=dependency.dependency_unit_key
-)
-SELECT graph.topology_id, json(context.cfg_atoms), context.target_kind
-FROM graph
+pub(super) const MEMBERSHIPS: &str =
+    "SELECT graph.topology_id, json(context.cfg_atoms), context.target_kind
+FROM selected_rust_unit_closure AS graph
 CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
   ON context.summary_id=graph.summary_id
-WHERE EXISTS (
+WHERE graph.root_unit_key=?1 AND EXISTS (
  SELECT 1 FROM main.resolution_unit_summary_members AS member
   INDEXED BY resolution_unit_summary_members_blob
  WHERE member.summary_id=graph.summary_id AND member.blob_id=?2

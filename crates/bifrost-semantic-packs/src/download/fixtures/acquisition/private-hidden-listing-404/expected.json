@@ -1,0 +1,29 @@
+{
+  "created_at": "<TIMESTAMP>",
+  "engine": {
+    "build_identity": "fixture-build",
+    "executable_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version": "9.9.0"
+  },
+  "failure": {
+    "class": "access-denied",
+    "message": "pack repository listing is inaccessible",
+    "retryable": false
+  },
+  "inventory": null,
+  "outcome_schema_version": 1,
+  "rejections": [],
+  "request": {
+    "dependencies": [],
+    "pack_id": "bifrost.premium",
+    "repository": "https://github.com/example/private-packs",
+    "request_schema_version": 1,
+    "selection": {
+      "allowed_versions": "*",
+      "channel": "stable",
+      "mode": "preferred"
+    }
+  },
+  "selection": null,
+  "status": "failed"
+}

@@ -2781,7 +2781,7 @@ fn lookup_declared_effects(
 /// The language label is the semantic-pack spelling the taint side already
 /// binds authored summaries with, so TSX and TypeScript select the same pack
 /// while an effect declaration and a data-flow summary use the same rule.
-fn external_modeled_key(target: &UnmaterializedExternalTarget) -> ModeledProcedureKey {
+pub(super) fn external_modeled_key(target: &UnmaterializedExternalTarget) -> ModeledProcedureKey {
     ModeledProcedureKey {
         language: target.language().semantic_pack_label().to_owned(),
         owner: target.owner_fqn().to_owned(),
@@ -5369,7 +5369,11 @@ fn javascript_typescript_call_result_obligation_expansions(
                     break;
                 }
             };
-            if !reviewed_js_ts_evidence_selected(language, &summary.shard.matched_evidence) {
+            if !reviewed_js_ts_evidence_selected(
+                language,
+                &summary.record.target.path,
+                &summary.shard.matched_evidence,
+            ) {
                 row.reason = Some("artifact_unselected");
                 break;
             }
@@ -5512,6 +5516,7 @@ fn ruby_core_evidence_selected(evidence: &SemanticModelActivationEvidence) -> bo
 
 fn reviewed_js_ts_evidence_selected(
     language: crate::analyzer::Language,
+    declaration_path: &str,
     evidence: &crate::analyzer::semantic_model::SemanticModelActivationEvidence,
 ) -> bool {
     let package_matches = |name: &str, version: Option<&str>| {
@@ -5530,7 +5535,13 @@ fn reviewed_js_ts_evidence_selected(
             evidence.language == "typescript"
                 && evidence.ecosystem == "npm"
                 && package_matches("typescript", Some("7.0.2"))
-                && evidence.configuration.as_deref() == Some("typescript-lib:es5")
+                && matches!(
+                    (declaration_path, evidence.configuration.as_deref()),
+                    (
+                        "lib/lib.es5.d.ts",
+                        Some("typescript-lib:es5" | "typescript-lib:es2019")
+                    ) | ("lib/lib.es2019.string.d.ts", Some("typescript-lib:es2019"))
+                )
                 && evidence.artifact_sha256.is_none()
         }
         crate::analyzer::Language::JavaScript => {
@@ -13817,8 +13828,14 @@ fn discover_effect_graph(
                         caller: node,
                         callee,
                         site_id: shape.outcome.site_id.clone(),
+                        site_ast_id: shape.outcome.site_ast_id.clone(),
+                        target_id: arm.effect.target_id.clone(),
+                        proof: arm.effect.proof,
+                        dispatch_complete: arm.effect.complete,
+                        site_coverage,
                         certainty,
                         execution_timing: arm.effect.execution_timing,
+                        external_callee_key: None,
                     });
                     // A callee already queued is already going to be walked at
                     // a depth no greater than this one. The fixpoint below,
@@ -13843,8 +13860,14 @@ fn discover_effect_graph(
                         caller: node,
                         callee,
                         site_id: shape.outcome.site_id.clone(),
+                        site_ast_id: shape.outcome.site_ast_id.clone(),
+                        target_id: arm.effect.target_id.clone(),
+                        proof: arm.effect.proof,
+                        dispatch_complete: arm.effect.complete,
+                        site_coverage,
                         certainty,
                         execution_timing: arm.effect.execution_timing,
+                        external_callee_key: Some(external.key.clone()),
                     });
                 }
             }
@@ -13859,12 +13882,26 @@ fn discover_effect_graph(
             left.callee,
             &left.site_id,
             left.execution_timing,
+            &left.target_id,
+            &left.site_ast_id,
+            left.proof,
+            left.dispatch_complete,
+            left.site_coverage,
+            left.certainty,
+            &left.external_callee_key,
         )
             .cmp(&(
                 right.caller,
                 right.callee,
                 &right.site_id,
                 right.execution_timing,
+                &right.target_id,
+                &right.site_ast_id,
+                right.proof,
+                right.dispatch_complete,
+                right.site_coverage,
+                right.certainty,
+                &right.external_callee_key,
             ))
     });
     graph.edges.dedup();

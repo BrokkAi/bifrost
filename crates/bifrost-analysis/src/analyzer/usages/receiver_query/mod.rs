@@ -1,7 +1,6 @@
 //! Analyzer-owned bounded receiver queries for structural traversal.
 
 use crate::analyzer::common::language_for_file;
-#[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::go::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
 use crate::analyzer::languages::{
     BoundedReceiverQuery, LanguageSupport, ReceiverFactContext, StructuralReceiverResolver,
@@ -50,7 +49,6 @@ use crate::analyzer::{
     AnalyzerDefinitionLookup, CodeUnit, DispatchExtensibility, IAnalyzer, Language, ProjectFile,
     Range, WorkspaceAnalyzer,
 };
-#[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::{GoAnalyzer, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -253,7 +251,6 @@ pub struct ReceiverQueryService<'a> {
     prepared_structural_files: RefCell<HashMap<ProjectFile, PreparedStructuralReceiverFile>>,
     /// Selected Go point state belongs to this service's one RQL/policy
     /// request and grows only for source files that request touches.
-    #[cfg(any(test, feature = "test-support"))]
     native_go_points: RefCell<Option<Box<GoNativePointRequest<'a>>>>,
 }
 
@@ -455,6 +452,10 @@ impl ReceiverWorkLedger {
                 .budget
                 .max_summary_expansions
                 .saturating_sub(self.work.summary_expansions),
+            max_resolution_rounds: self
+                .budget
+                .max_resolution_rounds
+                .saturating_sub(self.work.resolution_rounds),
             ..self.budget
         }
     }
@@ -474,6 +475,7 @@ impl ReceiverWorkLedger {
         let remaining = self.remaining_budget();
         let scope_exceeded = work.scope_nodes > remaining.max_scope_nodes;
         let summaries_exceeded = work.summary_expansions > remaining.max_summary_expansions;
+        let rounds_exceeded = work.resolution_rounds > remaining.max_resolution_rounds;
         self.work.scope_nodes = self
             .work
             .scope_nodes
@@ -482,10 +484,16 @@ impl ReceiverWorkLedger {
             work.summary_expansions
                 .min(remaining.max_summary_expansions),
         );
+        self.work.resolution_rounds = self
+            .work
+            .resolution_rounds
+            .saturating_add(work.resolution_rounds.min(remaining.max_resolution_rounds));
         if scope_exceeded {
             Err(ReceiverBudgetLimit::ScopeNodes)
         } else if summaries_exceeded {
             Err(ReceiverBudgetLimit::SummaryExpansions)
+        } else if rounds_exceeded {
+            Err(ReceiverBudgetLimit::ResolutionRounds)
         } else {
             Ok(())
         }
@@ -505,6 +513,9 @@ fn combined_receiver_work(
         summary_expansions: left
             .summary_expansions
             .saturating_add(right.summary_expansions),
+        resolution_rounds: left
+            .resolution_rounds
+            .saturating_add(right.resolution_rounds),
         scope_nodes: left.scope_nodes.saturating_add(right.scope_nodes),
     }
 }
@@ -586,7 +597,6 @@ impl<'a> ReceiverQueryService<'a> {
             prepared_files: RefCell::new(HashMap::default()),
             prepared_java_files: RefCell::new(HashMap::default()),
             prepared_structural_files: RefCell::new(HashMap::default()),
-            #[cfg(any(test, feature = "test-support"))]
             native_go_points: RefCell::new(None),
         }
     }
@@ -600,7 +610,6 @@ impl<'a> ReceiverQueryService<'a> {
         if language != Language::Go || !resolver.reuses_request_scoped_native_points() {
             return resolver.resolve_type_bounded(query);
         }
-        #[cfg(any(test, feature = "test-support"))]
         {
             let mut request = self.native_go_points.borrow_mut();
             if request.is_none()
@@ -616,6 +625,7 @@ impl<'a> ReceiverQueryService<'a> {
                 }
             }
             if let Some(request) = request.as_mut() {
+                request.begin_receiver_query(query.file);
                 return request.resolve_type(query);
             }
         }
@@ -631,7 +641,6 @@ impl<'a> ReceiverQueryService<'a> {
         if language != Language::Go || !resolver.reuses_request_scoped_native_points() {
             return resolver.resolve_definition_bounded(query);
         }
-        #[cfg(any(test, feature = "test-support"))]
         {
             let mut request = self.native_go_points.borrow_mut();
             if request.is_none()
@@ -3137,6 +3146,7 @@ impl ReceiverSemanticBridge {
     fn receiver_work(work: SemanticWork) -> ReceiverAnalysisWork {
         ReceiverAnalysisWork {
             setup_nodes: 0,
+            resolution_rounds: 0,
             summary_expansions: work
                 .call_sites
                 .saturating_add(work.memory_locations)

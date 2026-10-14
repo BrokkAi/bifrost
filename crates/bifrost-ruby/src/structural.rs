@@ -6,8 +6,9 @@ use crate::local_bindings::{
 use crate::syntax::{call_method_node, ruby_call_arguments, ruby_static_string_content_node};
 use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child, nearest_ancestor,
+    CalleeSpineStep, attach_argument_role_with_derived_name, attach_role_with_derived_name,
+    attach_terminal_callee, field_name_in_parent, first_named_child, nearest_ancestor,
+    terminal_callee_leaf,
 };
 use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::edges::{
@@ -262,6 +263,17 @@ fn expression_target_node(mut node: Node<'_>) -> Node<'_> {
         node = child;
     }
     node
+}
+
+/// Grammar steps for the shared call-callee spine. A value expression has no step.
+pub fn callee_spine_step(kind: &str) -> Option<CalleeSpineStep> {
+    use CalleeSpineStep::{Field, Name, OnlyChild};
+    match kind {
+        "identifier" | "constant" | "operator" => Some(Name),
+        "scope_resolution" => Some(Field("name")),
+        "parenthesized_statements" => Some(OnlyChild),
+        _ => None,
+    }
 }
 
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
@@ -1004,7 +1016,11 @@ impl StructuralSpec for RubyStructuralSpec {
                 if node.kind() == "identifier" {
                     attach_terminal_callee(sink, node, Some(node));
                 } else if let Some(method) = call_method_node(node) {
-                    attach_terminal_callee(sink, method, expression_name_node(method));
+                    attach_terminal_callee(
+                        sink,
+                        method,
+                        terminal_callee_leaf(method, callee_spine_step),
+                    );
                 }
                 if let Some(receiver) = node.child_by_field_name("receiver") {
                     attach_role_with_derived_name(

@@ -408,6 +408,10 @@ impl<'a> JavaResolutionSession<'a> {
                 &mut state.work.summary_expansions,
                 budget.max_summary_expansions,
             ),
+            ReceiverBudgetLimit::ResolutionRounds => (
+                &mut state.work.resolution_rounds,
+                budget.max_resolution_rounds,
+            ),
         };
         if *used == maximum {
             state.stop = Some(JavaResolutionStop::Exceeded(limit));

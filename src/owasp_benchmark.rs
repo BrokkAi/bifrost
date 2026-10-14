@@ -932,6 +932,7 @@ pub fn activate_jdk_dependency_pack(
         &jdk_config,
         &[DependencyPackEcosystem::Jvm],
         DependencyPackWorkspaceContext {
+            activation_receipt: None,
             catalog,
             persistence: None,
             activation: &request,

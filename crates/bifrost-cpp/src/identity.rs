@@ -512,6 +512,7 @@ pub fn cpp_source_path_is_header(source: &ProjectFile) -> bool {
 
 pub(crate) fn cpp_occurrence_role_for_node(
     node: Node<'_>,
+    source: &str,
     candidate: &CodeUnit,
 ) -> CppOccurrenceRole {
     if !candidate.is_callable() && !candidate.is_class() {
@@ -526,6 +527,12 @@ pub(crate) fn cpp_occurrence_role_for_node(
         } else {
             CppOccurrenceRole::DeclarationOnly
         };
+    }
+    // A typedef or `using` declaration both declares and defines the alias it
+    // names, even when it mentions a bodiless elaborated type such as
+    // `typedef struct node_t *node;` (#2430).
+    if cpp_node_declares_alias(node, source, candidate) {
+        return CppOccurrenceRole::Both;
     }
     if node.kind() == "function_definition" && node.child_by_field_name("body").is_some() {
         return CppOccurrenceRole::Definition;
@@ -618,7 +625,28 @@ pub fn cpp_occurrence_role_for_range(
             CppOccurrenceRole::DeclarationOnly
         };
     }
-    cpp_occurrence_role_for_node(node, candidate)
+    cpp_occurrence_role_for_node(node, source, candidate)
+}
+
+/// Whether `node` is the typedef or `using` alias declaration of `candidate`.
+fn cpp_node_declares_alias(node: Node<'_>, source: &str, candidate: &CodeUnit) -> bool {
+    match node.kind() {
+        "alias_declaration" => {
+            node.child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+                == Some(candidate.identifier())
+        }
+        "type_definition" => {
+            let mut cursor = node.walk();
+            node.children_by_field_name("declarator", &mut cursor)
+                .any(|declarator| {
+                    crate::declarations::extract_typedef_declarator_name(declarator, source)
+                        .as_deref()
+                        == Some(candidate.identifier())
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Whether the occurrence at `range` is a pure-virtual member declaration

@@ -264,11 +264,14 @@ fn typed_descriptor_digest_tracks_nested_identity_and_cancelled_work() {
     let second = seed_fragment(SemanticId::operation_local(1), SemanticId::context_local(3));
     let cancellation = CancellationToken::new();
     assert_ne!(
-        typed_fragment_digest(&first, &cancellation).unwrap(),
-        typed_fragment_digest(&second, &cancellation).unwrap()
+        typed_fragment_digest(&first, [7; 32], &cancellation).unwrap(),
+        typed_fragment_digest(&second, [7; 32], &cancellation).unwrap()
     );
     cancellation.cancel();
-    assert_eq!(typed_fragment_digest(&first, &cancellation).unwrap(), None);
+    assert_eq!(
+        typed_fragment_digest(&first, [7; 32], &cancellation).unwrap(),
+        None
+    );
 }
 
 #[test]

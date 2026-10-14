@@ -32,9 +32,9 @@ pub(crate) use jvm_context::{
 };
 pub(super) mod native_units;
 pub(crate) use native_units::{
-    ProjectedNativeMemberContext, SelectedNativeDefinition, SelectedNativeDefinitions,
-    SelectedNativeNamedArgument, SelectedNativeReferenceTypes, SelectedNativeReferenceUnits,
-    SelectedNativeTypes,
+    NativeExternalMemberTarget, ProjectedNativeMemberContext, SelectedNativeDefinition,
+    SelectedNativeDefinitions, SelectedNativeNamedArgument, SelectedNativeReferenceTypes,
+    SelectedNativeReferenceUnits, SelectedNativeTypes,
 };
 
 pub(super) struct NativeReferenceQuery<'a> {
@@ -47,6 +47,7 @@ pub(super) struct NativeReferenceQuery<'a> {
     go_demand: Option<go_named::GoDemandContext>,
     selected_import_gap: Option<(SemanticId, SemanticId)>,
     go_receiver_overlay: Option<crate::analyzer::resolution::GoReceiverSlotTypeOverlay>,
+    query_result_slot: Option<SemanticId>,
     point_metrics: Option<&'a mut ResolutionBatchMetrics>,
 }
 pub(super) mod package_context;
@@ -90,7 +91,7 @@ pub(crate) use rust_privacy::{
     read_selected_rust_declaration_authority_with_cancellation,
 };
 pub(crate) use rust_reverse::{
-    ReferenceOmission, ReferenceResolution, SelectedRustReverseBatchOutcome,
+    ReferenceOmission, ReferenceResolution, RustReverseRequest, SelectedRustReverseBatchOutcome,
     SelectedRustReverseQueries, SelectedRustTargetReferences,
 };
 
@@ -606,6 +607,47 @@ pub(crate) struct SelectedResolutionOperationInput<'project, 'selection> {
     content_mounts: Vec<SelectedResolutionContentMountRequest>,
 }
 
+/// A worker recreates exactly the enclosing query's authority inputs.
+/// Owned selection descriptors die with that query; project/analyzer remain borrowed.
+pub(crate) struct CapturedSelectedResolutionInput<'project> {
+    project: &'project dyn Project,
+    analyzer: Option<&'project dyn IAnalyzer>,
+    analysis_generation: u64,
+    workspace_id: WorkspaceId,
+    snapshots: WorkspaceSnapshots,
+    languages: Vec<SelectedResolutionLanguage>,
+    overlay_masks: Vec<SelectedResolutionOverlayMask>,
+    content_mounts: Vec<SelectedResolutionContentMountRequest>,
+}
+
+impl<'project> CapturedSelectedResolutionInput<'project> {
+    fn capture(input: &SelectedResolutionOperationInput<'project, '_>) -> Self {
+        Self {
+            project: input.project,
+            analyzer: input.analyzer,
+            analysis_generation: input.analysis_generation,
+            workspace_id: input.workspace_id.clone(),
+            snapshots: input.snapshots.clone(),
+            languages: input.languages.to_vec(),
+            overlay_masks: input.overlay_masks.to_vec(),
+            content_mounts: input.content_mounts.clone(),
+        }
+    }
+
+    pub(crate) fn input(&self) -> SelectedResolutionOperationInput<'project, '_> {
+        SelectedResolutionOperationInput {
+            project: self.project,
+            analyzer: self.analyzer,
+            analysis_generation: self.analysis_generation,
+            workspace_id: &self.workspace_id,
+            snapshots: &self.snapshots,
+            languages: &self.languages,
+            overlay_masks: &self.overlay_masks,
+            content_mounts: self.content_mounts.clone(),
+        }
+    }
+}
+
 impl<'project, 'selection> SelectedResolutionOperationInput<'project, 'selection> {
     pub(crate) fn new(
         project: &'project dyn Project,
@@ -988,6 +1030,9 @@ struct ReadySelectedResolution<'store, 'input> {
     /// request is what makes them agree across the contexts a request builds,
     /// and it is dropped with the request.
     context_identities: crate::analyzer::resolution::SelectedContextIdentities,
+    /// Demand answers and minting authority touched by this operation only.
+    /// Blueprints lend the identity registry to otherwise fresh fact arenas.
+    operation_demand_state: Arc<crate::analyzer::resolution::SelectedDemandState>,
     // One scalar publication identity for this request, never a package index.
     go_publication: RefCell<Option<super::GoContextIdentity>>,
     /// Whether this request encountered any complete selected Go package.
@@ -1080,6 +1125,40 @@ impl std::ops::DerefMut for ReadySelectedResolution<'_, '_> {
 }
 
 impl<'store> ReadySelectedResolution<'store, '_> {
+    fn identity_content_digest(
+        &self,
+        key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<[u8; 32]> {
+        if let Some(digest) = self
+            .inventory
+            .authority_request_memo()
+            .borrow()
+            .canonical_digests
+            .get(&key)
+            .copied()
+        {
+            return Ok(digest);
+        }
+        if let Some(number) = key.context_number() {
+            return Ok(self
+                .context_identities
+                .content_digest(number)
+                .expect("a selected context alias has a canonical digest"));
+        }
+        if let Some(number) = key.operation_number() {
+            return Ok(self
+                .operation_demand_state
+                .identity_digest(number)
+                .expect("a selected demand alias has a canonical digest"));
+        }
+        self.lexical_source()
+            .identity_content_digest(key, cancellation)?
+            .ok_or_else(|| {
+                StoreError::new(format!("selected identity has no content digest: {key:?}"))
+            })
+    }
+
     /// Where this request's lowerings and its own demands get a shared name's
     /// id. The table lives on the inventory, which is built for one request
     /// and dropped with it.
@@ -1588,6 +1667,7 @@ impl<'store, 'input> SelectedResolutionOperationOpenOutcome<'store, 'input> {
 /// Non-clone selected owner retained for one query lifetime. A Rust definition
 /// batch may use it for several bounded point requests.
 pub(crate) struct SelectedResolutionOperation<'store, 'input> {
+    captured_input: CapturedSelectedResolutionInput<'input>,
     ready: ReadySelectedResolution<'store, 'input>,
     enumerated_mounts: OnceCell<Vec<SelectedResolutionOperationMount>>,
     /// Same-package peer mounts and grouped member rows, retained only for
@@ -1602,6 +1682,47 @@ pub(crate) struct SelectedResolutionOperation<'store, 'input> {
     /// Prepared Go file contexts admitted by point, graph, or forward-fallback
     /// demand. Values die with this selected operation.
     go_prepared_contexts: RefCell<HashMap<GoPreparedContextKey, go_named::GoPreparedImportContext>>,
+}
+
+impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
+    pub(crate) fn worker_input(&self) -> &CapturedSelectedResolutionInput<'input> {
+        &self.captured_input
+    }
+
+    pub(crate) fn worker_store(&self) -> &'store AnalyzerStore {
+        self.ready.store
+    }
+
+    pub(crate) fn identity_content_digest(
+        &self,
+        key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<[u8; 32]> {
+        self.ready.identity_content_digest(key, cancellation)
+    }
+
+    pub(crate) fn worker_shared_names(&self) -> super::resolution::StoreSharedNames<'_> {
+        self.ready.shared_names()
+    }
+
+    pub(crate) fn worker_context_identities(
+        &self,
+    ) -> &crate::analyzer::resolution::SelectedContextIdentities {
+        &self.ready.context_identities
+    }
+
+    pub(crate) fn worker_demand_state(&self) -> &crate::analyzer::resolution::SelectedDemandState {
+        &self.ready.operation_demand_state
+    }
+
+    pub(crate) fn finish_worker_answer<T>(
+        mut self,
+        answer: T,
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedResolutionOperationOutcome<T>> {
+        self.ready
+            .finish(answer, &ResolutionCompletion::Complete, cancellation)
+    }
 }
 
 /// Context kind, context id, caller mount, caller path, and source role.
@@ -3335,6 +3456,10 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                         &definition.host,
                         definition.semantic,
                         definition.node,
+                        self.ready
+                            .identity_content_digest(site.semantic().into(), cancellation)?,
+                        self.ready
+                            .identity_content_digest(definition.semantic.into(), cancellation)?,
                         cancellation,
                     )?
                     .is_none()
@@ -3482,6 +3607,10 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                             &definition_host,
                             definition,
                             definition_node,
+                            self.ready
+                                .identity_content_digest(head.into(), cancellation)?,
+                            self.ready
+                                .identity_content_digest(definition.into(), cancellation)?,
                             cancellation,
                         )?
                         .is_none()
@@ -3507,6 +3636,10 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                             &definition_host,
                             definition,
                             definition_node,
+                            self.ready
+                                .identity_content_digest(head.into(), cancellation)?,
+                            self.ready
+                                .identity_content_digest(definition.into(), cancellation)?,
                             cancellation,
                         )?
                         .is_none()
@@ -3774,6 +3907,10 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                         &definition_host,
                         definition,
                         definition_node,
+                        self.ready
+                            .identity_content_digest(head.into(), cancellation)?,
+                        self.ready
+                            .identity_content_digest(definition.into(), cancellation)?,
                         cancellation,
                     )?
                     .is_none()
@@ -4182,6 +4319,13 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                             origin_host: origin_mount,
                             original_identity: path.identity,
                             original: &path.path,
+                            path_content: self.ready.identity_content_digest(
+                                path.identity.path().into(),
+                                cancellation,
+                            )?,
+                            destination_content: self
+                                .ready
+                                .identity_content_digest(destination.into(), cancellation)?,
                             end_kind: path.end_kind,
                         });
                     }
@@ -5998,6 +6142,22 @@ fn assemble_rust_reference_answer<T>(
             enumeration.combine(&cancelled_completion()),
         ));
     };
+    for (key, digest) in crate::analyzer::resolution::worker_transport::forward_identity_digests(
+        operation,
+        &resolution,
+        &enumeration,
+    )? {
+        let previous = ready
+            .inventory
+            .authority_request_memo()
+            .borrow_mut()
+            .canonical_digests
+            .insert(key, digest);
+        assert!(
+            previous.is_none_or(|previous| previous == digest),
+            "one selected operation never reassigns an identity alias: {key:?}"
+        );
+    }
     Ok(SelectedResolutionOperationOutcome::Native(
         SelectedRustReferenceAnswer {
             macro_expansion_gaps,
@@ -6361,7 +6521,14 @@ fn rust_path_root_boundary(
         return Ok(Some(ResolutionCompletion::incomplete([
             ResolutionIncompleteReason::UnsupportedSemantic({
                 let mut digest = CanonicalHasher::new(b"bifrost-rust-macro-module-path-root:v1");
-                digest.field("mount", &mount.get().to_be_bytes());
+                digest.field(
+                    "mount",
+                    &ready
+                        .inventory
+                        .mount_record_by_ordinal(mount)?
+                        .fragment_digest()
+                        .as_bytes(),
+                );
                 digest.field("reference", name.as_bytes());
                 identities.semantic(digest.finish())
             }),
@@ -7057,6 +7224,7 @@ impl AnalyzerStore {
         input: SelectedResolutionOperationInput<'project, 'selection>,
         cancellation: &CancellationToken,
     ) -> Result<SelectedResolutionOperationOpenOutcome<'store, 'project>> {
+        let captured_input = CapturedSelectedResolutionInput::capture(&input);
         Ok(
             match self.prepare_selected_resolution(input, cancellation)? {
                 PreparedSelectedResolution::Ready(ready) => {
@@ -7065,6 +7233,7 @@ impl AnalyzerStore {
                     }
                     SelectedResolutionOperationOpenOutcome::Ready(Box::new(
                         SelectedResolutionOperation {
+                            captured_input,
                             ready: *ready,
                             enumerated_mounts: OnceCell::new(),
                             go_package_member_indexes: RefCell::default(),
@@ -7212,6 +7381,7 @@ impl AnalyzerStore {
                 macro_walk: RefCell::default(),
                 crate_rows: RefCell::default(),
                 context_identities: SelectedContextIdentities::new(),
+                operation_demand_state: Arc::default(),
                 go_publication: RefCell::new(None),
                 go_package_inventory_complete: RefCell::new(None),
                 go_package_inventory_fragments: RefCell::default(),
@@ -7451,6 +7621,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 go_demand: None,
                 selected_import_gap: None,
                 go_receiver_overlay: None,
+                query_result_slot: None,
                 point_metrics: None,
             },
             |_, _, _, answer| Ok(answer),
@@ -7477,6 +7648,7 @@ impl SelectedResolutionOperation<'_, '_> {
             mut go_demand,
             selected_import_gap,
             go_receiver_overlay,
+            query_result_slot,
             point_metrics,
         } = query;
         if !session.scope_step() {
@@ -7531,6 +7703,9 @@ impl SelectedResolutionOperation<'_, '_> {
                         >| {
                             if let Some(overlay) = go_receiver_overlay {
                                 operation.set_go_receiver_slot_type_overlay(overlay);
+                            }
+                            if let Some(slot) = query_result_slot {
+                                operation.set_query_result_slot(reference, slot);
                             }
                             let answer = operation.resolve_reference_with_metrics(
                                 reference,
@@ -8818,6 +8993,10 @@ impl SelectedResolutionOperation<'_, '_> {
                             point_cancellation,
                             &point_session,
                             |operation| {
+                                operation.enable_completed_root_reuse(
+                                    &ready.operation_demand_state,
+                                    RustDeclarationAccessKind::Caller as u64,
+                                );
                                 let mut answers = Vec::with_capacity(references.len());
                                 for reference in references {
                                     if !point_session.scope_step()
@@ -9128,6 +9307,8 @@ impl SelectedResolutionOperation<'_, '_> {
                 cancellation,
                 session,
                 |operation| {
+                    operation
+                        .enable_completed_root_reuse(&ready.operation_demand_state, access as u64);
                     let mut attempts = Vec::with_capacity(located.len());
                     for (locator, references) in &located {
                         let Some(references) = references else {
@@ -9650,6 +9831,30 @@ impl ReadySelectedResolution<'_, '_> {
                 "selected root inventory completion contains operation cancellation",
             ));
         }
+        // Tokens are freshly allocated for every publication. Hash the full
+        // structured path cells instead, including completion, so two equal
+        // overlays share demand answers without conflating distinct overlays.
+        // This buffer is the result of this one publication and dies here.
+        struct ContextSignature(Vec<u8>);
+        impl std::hash::Hasher for ContextSignature {
+            fn finish(&self) -> u64 {
+                let digest = brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(&self.0);
+                u64::from_le_bytes(
+                    digest[..8]
+                        .try_into()
+                        .expect("a SHA-256 digest has eight bytes"),
+                )
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                self.0
+                    .extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                self.0.extend_from_slice(bytes);
+            }
+        }
+        use std::hash::Hash as _;
+        let mut signature = ContextSignature(Vec::new());
+        completion.hash(&mut signature);
+        context_owned_gap_identities.hash(&mut signature);
         let mut shared = BTreeSet::new();
         let mut local = BTreeSet::new();
         // Only descriptor references live until this one publication ends.
@@ -9660,7 +9865,7 @@ impl ReadySelectedResolution<'_, '_> {
             .publish_context_paths(cancellation, |writer| {
                 for bridge in bridges.iter() {
                     let Some(projected) = compile_selected_root_bridge(
-                        &identities, bridge, &names, cancellation, session,
+                        &self.lexical_source(), &identities, bridge, &names, cancellation, session,
                     )? else {
                         return Ok(false);
                     };
@@ -9678,13 +9883,14 @@ impl ReadySelectedResolution<'_, '_> {
                     for (_, recipe) in &projected.recipes {
                         shared.insert(recipe.identity(&names));
                     }
+                    (candidate, path).hash(&mut signature);
                     if !writer.insert(candidate, path)? {
                         return Ok(false);
                     }
                 }
                 let mut package_derivations = HashMap::default();
                 for bridge in &package_bridges {
-                    let Some((candidate, path)) = bridge.compile(&identities, cancellation, session) else {
+                    let Some((candidate, path)) = bridge.compile(&identities, &self.lexical_source(), cancellation, session)? else {
                         return Ok(false);
                     };
                     if let Some(previous) = package_derivations.insert(candidate, bridge)
@@ -9694,13 +9900,14 @@ impl ReadySelectedResolution<'_, '_> {
                             )));
                         }
                     shared.extend(bridge.shared_identities());
+                    (candidate, &path).hash(&mut signature);
                     if !writer.insert(candidate, &path)? {
                         return Ok(false);
                     }
                 }
                 let mut go_import_derivations = HashMap::default();
                 for bridge in &go_import_bindings {
-                    let Some((candidate, path)) = bridge.compile(&identities, cancellation, session) else {
+                    let Some((candidate, path)) = bridge.compile(&identities, &self.lexical_source(), cancellation, session)? else {
                         return Ok(false);
                     };
                     if let Some(previous) = go_import_derivations.insert(candidate, bridge)
@@ -9710,6 +9917,7 @@ impl ReadySelectedResolution<'_, '_> {
                             )));
                         }
                     shared.extend(bridge.shared_identities());
+                    (candidate, &path).hash(&mut signature);
                     if !writer.insert(candidate, &path)? {
                         return Ok(false);
                     }
@@ -9740,6 +9948,9 @@ impl ReadySelectedResolution<'_, '_> {
         Ok(SelectedContextPathPublicationOutcome::Ready(
             SelectedContextPathPublication {
                 token,
+                context_digest: brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(
+                    &signature.0,
+                ),
                 contextual_reverse_inventory_completion: completion,
                 go_package_inventory_complete,
                 go_package_inventory_fragments,
@@ -9771,7 +9982,8 @@ impl ReadySelectedResolution<'_, '_> {
             match self.publish_context_paths(context, cancellation, session)? {
                 SelectedContextPathPublicationOutcome::Ready(publication) => {
                     SelectedFactOperationBlueprintConstruction::Ready(
-                        SelectedFactOperationBlueprint::from_publication(publication),
+                        SelectedFactOperationBlueprint::from_publication(publication)
+                            .with_selected_demand_state(&self.operation_demand_state),
                     )
                 }
                 SelectedContextPathPublicationOutcome::Cancelled {
@@ -9923,7 +10135,11 @@ impl ReadySelectedResolution<'_, '_> {
             if cancellation.is_cancelled() {
                 return Ok(ContextRegistrationOutcome::Cancelled);
             }
-            staged.register_context_owned_semantic(reason, &self.inventory.shared_names());
+            staged.register_context_owned_semantic(
+                reason,
+                blueprint.context_owned_semantic_digest(reason)?,
+                &self.inventory.shared_names(),
+            );
         }
         for &node in blueprint.boundary_nodes() {
             if cancellation.is_cancelled() {
@@ -10011,7 +10227,11 @@ impl ReadySelectedResolution<'_, '_> {
         }
         let names = self.inventory.shared_names();
         for &reason in blueprint.context_owned_gap_identities() {
-            rebaser.register_context_owned_semantic(reason, &names);
+            rebaser.register_context_owned_semantic(
+                reason,
+                blueprint.context_owned_semantic_digest(reason)?,
+                &names,
+            );
         }
         for &node in blueprint.boundary_nodes() {
             rebaser.register_context_boundary(node);

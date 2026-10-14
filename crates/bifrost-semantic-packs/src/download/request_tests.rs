@@ -198,8 +198,13 @@ fn normalize_outcome(mut outcome: Value, cache: &Path) -> Value {
                     normalize(value, cache_root);
                 }
             }
-            Value::String(value) => {
-                *value = value.replace(cache_root, "<CACHE>");
+            Value::String(value) if value.contains(cache_root) => {
+                // Paths below the temporary cache root are the only strings
+                // that carry the host's separators, and the goldens pin POSIX
+                // forward slashes. Replace the whole cache root and then
+                // canonicalize the remaining separator so a Windows checkout
+                // renders `<CACHE>/selections/...`, not `<CACHE>\selections\...`.
+                *value = value.replace(cache_root, "<CACHE>").replace('\\', "/");
             }
             _ => {}
         }
@@ -211,7 +216,7 @@ fn normalize_outcome(mut outcome: Value, cache: &Path) -> Value {
 
 fn assert_golden(name: &str, outcome: Value, cache: &Path) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/acquisition")
+        .join("src/download/fixtures/acquisition")
         .join(name)
         .join("expected.json");
     let actual = render_canonical_outcome(&normalize_outcome(outcome, cache));
@@ -2155,7 +2160,7 @@ fn every_acquisition_golden_and_embedded_contract_object_matches_its_schema() {
     if std::env::var("BIFROST_BLESS").as_deref() == Ok("1") {
         return;
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/acquisition");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/download/fixtures/acquisition");
     let (request_validator, receipt_validator, outcome_validator) = request_schema_validators();
     let mut files = Vec::new();
     let mut pending = vec![root.clone()];

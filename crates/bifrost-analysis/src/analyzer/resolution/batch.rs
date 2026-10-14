@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use brokk_bifrost_core::analyzer::Language;
+#[cfg(test)]
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionCallableReceiverOrigin, ResolutionNamespace, ResolutionSiteId, ResolutionSiteKind,
@@ -193,6 +194,11 @@ impl FactReferenceSiteMetadata {
 
     pub const fn site_kind(self) -> ResolutionSiteKind {
         self.site_kind
+    }
+
+    pub(crate) const fn is_callable_reference(self) -> bool {
+        matches!(self.namespace, ResolutionNamespace::Callable)
+            || matches!(self.site_kind, ResolutionSiteKind::CallableReference)
     }
 
     pub const fn start_byte(self) -> usize {
@@ -534,23 +540,45 @@ impl ReferenceSeed {
     }
 }
 
+/// The identity of a transient starting alternative. Neither variant enters
+/// a result or a fragment catalog; equality only orders this request's seeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SeededPathKey {
+    Derivation(DerivationKey),
+    Identity {
+        fragment: BindingFragmentId,
+        reference: SemanticId,
+        node: BindingNodeId,
+    },
+}
+
+impl From<DerivationKey> for SeededPathKey {
+    fn from(key: DerivationKey) -> Self {
+        Self::Derivation(key)
+    }
+}
+
+impl std::fmt::Display for SeededPathKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
 /// One operation-local starting path for qualified or member lookup.
 ///
-/// The key is a stable semantic derivation key supplied by the caller. It is
-/// never looked up in, hydrated from, or persisted to the fragment source,
-/// which is why it is a [`DerivationKey`] and not one of the five identities:
-/// it names no mount, no row and no catalog entry. Distinct alternatives need
-/// distinct keys; reusing one is accepted only when it names the same
-/// canonical path.
+/// The typed key deduplicates alternatives only within this request. It is
+/// never looked up in, hydrated from, or persisted to the fragment source.
+/// Distinct alternatives need distinct keys; reusing one is accepted only
+/// when it names the same path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeededPartialPath {
-    key: DerivationKey,
+    key: SeededPathKey,
     path: PartialPath,
 }
 
 impl SeededPartialPath {
     pub(crate) fn new_with_poll<P>(
-        key: DerivationKey,
+        key: impl Into<SeededPathKey>,
         path: PartialPath,
         cancelled: &mut P,
     ) -> Option<Self>
@@ -558,12 +586,12 @@ impl SeededPartialPath {
         P: FnMut() -> bool,
     {
         Some(Self {
-            key,
+            key: key.into(),
             path: path.canonicalized_observations_with_poll(cancelled)?,
         })
     }
 
-    pub const fn key(&self) -> DerivationKey {
+    pub const fn key(&self) -> SeededPathKey {
         self.key
     }
 
@@ -594,7 +622,7 @@ impl SeededReferenceRequest {
     where
         P: FnMut() -> bool,
     {
-        let mut canonical = BTreeMap::<DerivationKey, SeededPartialPath>::new();
+        let mut canonical = BTreeMap::<SeededPathKey, SeededPartialPath>::new();
         let mut alternative_count = 0_usize;
         for mut alternative in alternatives {
             if cancelled() {
@@ -1023,11 +1051,26 @@ pub(crate) struct ForwardCandidateArtifactCache {
     /// typed reads of the graph route were going. Only complete, live answers
     /// are published here: see `retain_demanded_reference_answer`.
     demanded_reference_answers: HashMap<DemandedReferenceKey, super::fact_resolution::SharedAnswer>,
+    /// Budget accounting shared by the type and member stages of one receiver
+    /// query. The selected authority keeps unrelated frontiers distinct.
+    expanded_owner_frontiers: HashSet<DemandedReferenceKey>,
     #[cfg(test)]
     cache_hits: std::cell::Cell<usize>,
 }
 
 impl ForwardCandidateArtifactCache {
+    pub(crate) fn reset_owner_expansions(&mut self) {
+        self.expanded_owner_frontiers.clear();
+    }
+
+    pub(super) fn owner_frontier_expanded(&self, key: &DemandedReferenceKey) -> bool {
+        self.expanded_owner_frontiers.contains(key)
+    }
+
+    pub(super) fn retain_owner_expansion(&mut self, key: DemandedReferenceKey) {
+        self.expanded_owner_frontiers.insert(key);
+    }
+
     #[cfg(test)]
     pub(crate) fn record_cache_hit(&self) {
         self.cache_hits.set(self.cache_hits.get() + 1);
@@ -1285,7 +1328,7 @@ impl ReverseCandidateGapExclusionPlan {
         let Some(prepared) = &self.prepared else {
             return Ok(true);
         };
-        if prepared.raw_fingerprint != ReverseCandidateGapCoverageFingerprint(authority) {
+        if prepared.raw_fingerprint != ReverseCandidateGapCoverageKey::Authority(authority) {
             return Err(StoreError::new(
                 "reverse candidate gap exclusion plan was prepared for different raw coverage",
             ));
@@ -1378,7 +1421,7 @@ impl ReverseCandidateGapExclusionPlan {
             "an empty reverse-gap plan delegates to the raw source"
         );
         if let Some(prepared) = &self.prepared {
-            if prepared.raw_fingerprint != coverage.fingerprint {
+            if &prepared.raw_fingerprint != coverage.fingerprint {
                 return Err(StoreError::new(
                     "reverse candidate gap exclusion plan was prepared for different raw coverage",
                 ));
@@ -1455,7 +1498,7 @@ impl ReverseCandidateGapExclusionPlan {
             return Ok(false);
         }
         let prepared = PreparedReverseCandidateGapExclusions {
-            raw_fingerprint: coverage.fingerprint,
+            raw_fingerprint: coverage.fingerprint.clone(),
             inventory: filtered_inventory,
             endpoints: filtered_endpoints,
         };
@@ -1471,7 +1514,7 @@ impl ReverseCandidateGapExclusionPlan {
             .prepared
             .as_ref()
             .expect("a reverse-gap plan is read only after successful preparation");
-        if prepared.raw_fingerprint != coverage.fingerprint {
+        if &prepared.raw_fingerprint != coverage.fingerprint {
             return Err(StoreError::new(
                 "reverse candidate gap exclusion plan was prepared for different raw coverage",
             ));
@@ -1486,7 +1529,7 @@ impl Default for ReverseCandidateGapExclusionPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ReverseCandidateGapLocation {
     Inventory,
     Endpoint {
@@ -1495,7 +1538,7 @@ pub(crate) enum ReverseCandidateGapLocation {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ReverseCandidateGapRow {
     identity: ReverseCandidateGapIdentity,
     location: ReverseCandidateGapLocation,
@@ -1520,8 +1563,26 @@ impl ReverseCandidateGapRow {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReverseCandidateGapCoverageFingerprint([u8; 32]);
+/// Equality authority for an operation's exclusion plan. Selected sources
+/// already carry canonical inventory content; preload rows need only their
+/// exact typed values. Sharing the immutable row key avoids copying it into
+/// every borrowed coverage view and prepared exclusion plan.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ReverseCandidateGapCoverageKey {
+    Authority([u8; 32]),
+    Rows(std::sync::Arc<[ReverseCandidateGapRow]>),
+}
+
+impl ReverseCandidateGapCoverageKey {
+    fn estimated_retained_bytes(&self) -> usize {
+        match self {
+            Self::Authority(_) => 0,
+            Self::Rows(rows) => rows
+                .len()
+                .saturating_mul(std::mem::size_of::<ReverseCandidateGapRow>()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ReverseCandidateGapContribution {
@@ -1531,7 +1592,7 @@ struct ReverseCandidateGapContribution {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReverseCandidateGapCoverage {
-    fingerprint: ReverseCandidateGapCoverageFingerprint,
+    fingerprint: ReverseCandidateGapCoverageKey,
     by_identity: HashMap<ReverseCandidateGapIdentity, ReverseCandidateGapContribution>,
     inventory: ReverseCandidateReasonBucket,
     endpoints: HashMap<BindingNodeId, ReverseCandidateEndpointReasonBuckets>,
@@ -1572,13 +1633,15 @@ impl ReverseCandidateGapCoverage {
     /// behind.
     pub(crate) fn estimated_retained_bytes(&self) -> usize {
         let Self {
-            fingerprint: _,
+            fingerprint,
             by_identity,
             inventory,
             endpoints,
         } = self;
         super::add_estimated_map_values(
-            brokk_bifrost_core::hash::map_slot_bytes(by_identity)
+            fingerprint
+                .estimated_retained_bytes()
+                .saturating_add(brokk_bifrost_core::hash::map_slot_bytes(by_identity))
                 .saturating_add(inventory.estimated_retained_bytes())
                 .saturating_add(brokk_bifrost_core::hash::map_slot_bytes(endpoints)),
             endpoints
@@ -1596,7 +1659,7 @@ impl ReverseCandidateGapCoverage {
 
     fn view(&self) -> ReverseCandidateGapCoverageView<'_> {
         ReverseCandidateGapCoverageView {
-            fingerprint: self.fingerprint,
+            fingerprint: &self.fingerprint,
             by_identity: &self.by_identity,
             inventory_by_identity: &self.by_identity,
             inventory: &self.inventory,
@@ -1642,7 +1705,7 @@ impl ReverseCandidateGapCoverage {
         }
         Ok((
             ReverseCandidateGapCoverageView {
-                fingerprint: self.fingerprint,
+                fingerprint: &self.fingerprint,
                 by_identity: &self.by_identity,
                 inventory_by_identity: &inventory.by_identity,
                 inventory: &inventory.inventory,
@@ -1697,7 +1760,7 @@ impl ReverseCandidateGapCoverage {
 /// authority, never a fingerprint derived from the local slice alone.
 #[derive(Clone, Copy)]
 pub(crate) struct ReverseCandidateGapCoverageView<'coverage> {
-    fingerprint: ReverseCandidateGapCoverageFingerprint,
+    fingerprint: &'coverage ReverseCandidateGapCoverageKey,
     by_identity: &'coverage HashMap<ReverseCandidateGapIdentity, ReverseCandidateGapContribution>,
     inventory_by_identity:
         &'coverage HashMap<ReverseCandidateGapIdentity, ReverseCandidateGapContribution>,
@@ -1783,9 +1846,12 @@ struct ReverseCandidateGapCoverageParts {
 }
 
 impl ReverseCandidateGapCoverageParts {
-    fn with_fingerprint(self, fingerprint: [u8; 32]) -> ReverseCandidateGapCoverage {
+    fn with_fingerprint(
+        self,
+        fingerprint: ReverseCandidateGapCoverageKey,
+    ) -> ReverseCandidateGapCoverage {
         ReverseCandidateGapCoverage {
-            fingerprint: ReverseCandidateGapCoverageFingerprint(fingerprint),
+            fingerprint,
             by_identity: self.by_identity,
             inventory: self.inventory,
             endpoints: self.endpoints,
@@ -1814,18 +1880,16 @@ impl ReverseCandidateGapCoverageBuilder {
         self,
         cancellation: &CancellationToken,
     ) -> StoreResult<(ReverseCandidateGapCoverage, bool)> {
-        let mut fingerprint =
-            CanonicalHasher::new(b"bifrost-resolution-reverse-candidate-gap-coverage:v1");
-        fingerprint.field(
-            "row-count",
-            &u64::try_from(self.rows.len())
-                .expect("reverse candidate gap count fits u64")
-                .to_be_bytes(),
-        );
+        let mut rows = Vec::with_capacity(self.rows.len());
         let (parts, cancelled) = self.aggregate(cancellation, |row| {
-            hash_reverse_candidate_gap_row(&mut fingerprint, row);
+            #[cfg(test)]
+            REVERSE_CANDIDATE_GAP_KEY_ROWS.with(|count| count.set(count.get() + 1));
+            rows.push(row);
         });
-        Ok((parts.with_fingerprint(fingerprint.finish()), cancelled))
+        Ok((
+            parts.with_fingerprint(ReverseCandidateGapCoverageKey::Rows(rows.into())),
+            cancelled,
+        ))
     }
 
     pub(crate) fn finish_with_authority(
@@ -1834,11 +1898,24 @@ impl ReverseCandidateGapCoverageBuilder {
         cancellation: &CancellationToken,
     ) -> StoreResult<(ReverseCandidateGapCoverage, bool)> {
         let (parts, cancelled) = self.aggregate(cancellation, |_| {});
-        Ok((parts.with_fingerprint(authority), cancelled))
+        Ok((
+            parts.with_fingerprint(ReverseCandidateGapCoverageKey::Authority(authority)),
+            cancelled,
+        ))
+    }
+
+    #[cfg(test)]
+    fn finish_with_key(
+        self,
+        key: ReverseCandidateGapCoverageKey,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<(ReverseCandidateGapCoverage, bool)> {
+        let (parts, cancelled) = self.aggregate(cancellation, |_| {});
+        Ok((parts.with_fingerprint(key), cancelled))
     }
 
     /// Aggregate every returned row even after cancellation so evidence is
-    /// retained. The observer is only for callers deriving a row fingerprint;
+    /// retained. The observer is only for callers constructing an exact row key;
     /// selected authorities already identify their immutable raw inventory.
     fn aggregate(
         self,
@@ -2175,7 +2252,7 @@ impl ReverseCandidateEndpointReasonDecrements {
 
 #[derive(Debug)]
 struct PreparedReverseCandidateGapExclusions {
-    raw_fingerprint: ReverseCandidateGapCoverageFingerprint,
+    raw_fingerprint: ReverseCandidateGapCoverageKey,
     inventory: Option<ResolutionCompletion>,
     endpoints: HashMap<BindingNodeId, PreparedReverseCandidateEndpointBuckets>,
 }
@@ -2193,63 +2270,7 @@ fn poll_reverse_candidate_gap_work(cancellation: &CancellationToken, work: &mut 
 
 #[cfg(test)]
 thread_local! {
-    static REVERSE_CANDIDATE_GAP_HASH_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-fn hash_reverse_candidate_gap_row(fingerprint: &mut CanonicalHasher, row: ReverseCandidateGapRow) {
-    #[cfg(test)]
-    REVERSE_CANDIDATE_GAP_HASH_ROWS.with(|rows| rows.set(rows.get() + 1));
-    let mut hasher = CanonicalHasher::new(b"bifrost-resolution-reverse-candidate-gap-row:v1");
-    hasher.field("fragment", &row.identity.fragment().as_bytes());
-    hasher.field("gap", &row.identity.gap_id().as_bytes());
-    match row.location {
-        ReverseCandidateGapLocation::Inventory => hasher.field("scope", b"inventory"),
-        ReverseCandidateGapLocation::Endpoint { endpoint, lookup } => {
-            hasher.field("scope", b"endpoint");
-            hasher.field("endpoint", &endpoint.as_bytes());
-            if let Some(lookup) = lookup {
-                hasher.field("lookup-kind", b"keyed");
-                hasher.field("lookup", &lookup.as_bytes());
-            } else {
-                hasher.field("lookup-kind", b"unkeyed");
-            }
-        }
-    }
-    match row.reason {
-        ResolutionIncompleteReason::Cancelled => {
-            panic!("persisted reverse candidate coverage cannot contain cancellation")
-        }
-        ResolutionIncompleteReason::CyclicPrefixDependency(_) => {
-            panic!("a cyclic prefix dependency publishes no candidate coverage")
-        }
-        ResolutionIncompleteReason::ReceiverBudgetExhausted(_) => {
-            panic!("a receiver budget stop publishes no candidate coverage")
-        }
-        ResolutionIncompleteReason::TimeBudgetExceeded(_) => {
-            panic!("a time budget stop publishes no candidate coverage")
-        }
-        ResolutionIncompleteReason::UnmountedFile { .. } => {
-            panic!("an unmounted-file route publishes no candidate coverage")
-        }
-        ResolutionIncompleteReason::CyclicExpansion(path) => {
-            hasher.field("reason-kind", b"cyclic-expansion");
-            hasher.field("reason-path", &path.as_bytes());
-        }
-        ResolutionIncompleteReason::InconsistentPrecedence(semantic) => {
-            hasher.field("reason-kind", b"inconsistent-precedence");
-            hasher.field("reason-semantic", &semantic.as_bytes());
-        }
-        ResolutionIncompleteReason::OpenBoundary { semantic, status } => {
-            hasher.field("reason-kind", b"open-boundary");
-            hasher.field("reason-semantic", &semantic.as_bytes());
-            hasher.field("reason-boundary", status.label().as_bytes());
-        }
-        ResolutionIncompleteReason::UnsupportedSemantic(semantic) => {
-            hasher.field("reason-kind", b"unsupported-semantic");
-            hasher.field("reason-semantic", &semantic.as_bytes());
-        }
-    }
-    fingerprint.field("row", &hasher.finish());
+    static REVERSE_CANDIDATE_GAP_KEY_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl BatchCandidateOutcome {
@@ -2460,6 +2481,24 @@ impl BatchCandidateMatch {
 /// direction flag: forward and reverse candidate indexes have different SQL
 /// shapes.
 pub trait BatchResolutionFragmentSource {
+    /// Content behind one demanded runtime alias. Runtime ordinals and minted
+    /// numbers must not enter a derived identity's hash preimage.
+    fn identity_content_digest(
+        &self,
+        key: super::ResolutionIdentityDigestKey,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            Ok(super::fact_lowering::fixture_names::identity_content_digest(key))
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let _ = key;
+            Ok(None)
+        }
+    }
+
     /// The selection this source is currently answering under.
     ///
     /// An answer read from this source is a function of the question and of
@@ -3032,6 +3071,14 @@ impl<'a> SelectedContextPathFragmentSource<'a> {
 }
 
 impl BatchResolutionFragmentSource for SelectedContextPathFragmentSource<'_> {
+    fn identity_content_digest(
+        &self,
+        key: super::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        self.base.identity_content_digest(key, cancellation)
+    }
+
     /// The overlay adds paths to what the base answers; it does not change
     /// which selection answers, so the base names the authority.
     fn selection_authority(&self) -> Option<SeedReadAuthority> {
@@ -4622,6 +4669,14 @@ fn materialize_reverse_candidate_pages(
 }
 
 impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> {
+    fn identity_content_digest(
+        &self,
+        key: super::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        self.base.identity_content_digest(key, cancellation)
+    }
+
     /// As for the path overlay: the overlay rows belong to the base's
     /// selection and are visible for the length of one operation, so the
     /// base's authority is this source's.
@@ -5862,7 +5917,7 @@ impl DemandForwardBatchFrame {
             *cancelled = true;
             return Ok(None);
         }
-        if !engine.charge_summary_step() {
+        if !engine.charge_round_step() {
             *cancelled = true;
             return Ok(None);
         }
@@ -6442,8 +6497,8 @@ pub(super) struct ExperimentalReverseBatchFrame {
     frontier_observations: usize,
     endpoint_classifications: HashMap<BindingNodeId, BatchEndpointClassification>,
     arena: HashMap<CandidatePathIdentity, PartialPath>,
-    frontier_ids_by_key: HashMap<(usize, DerivationKey), Vec<usize>>,
-    lexical_frontier_ids_by_key: HashMap<(usize, DerivationKey), Vec<usize>>,
+    frontier_ids_by_key: HashMap<ReverseFrontierKey, Vec<usize>>,
+    lexical_frontier_ids_by_key: HashMap<ReverseFrontierKey, Vec<usize>>,
     accounted_hydrated_completions: HashSet<(usize, CandidatePathIdentity)>,
     candidate_completion: OperationCandidateCompletionLedger,
     round: Option<ExperimentalReverseRound>,
@@ -7098,9 +7153,9 @@ struct ReverseFrontierContext<'a> {
     current: &'a [ReverseWorkPath],
     endpoint_classifications: &'a mut HashMap<BindingNodeId, BatchEndpointClassification>,
     frontiers: &'a mut Vec<ReverseCandidateFrontier>,
-    frontier_ids_by_key: &'a mut HashMap<(usize, DerivationKey), Vec<usize>>,
+    frontier_ids_by_key: &'a mut HashMap<ReverseFrontierKey, Vec<usize>>,
     lexical_frontiers: &'a mut Vec<ReverseCandidateLexicalFrontier>,
-    lexical_frontier_ids_by_key: &'a mut HashMap<(usize, DerivationKey), Vec<usize>>,
+    lexical_frontier_ids_by_key: &'a mut HashMap<ReverseFrontierKey, Vec<usize>>,
     cancellation: &'a CancellationToken,
     observations: &'a mut usize,
     cancelled: &'a mut bool,
@@ -8047,71 +8102,24 @@ impl ReverseCandidateLexicalFrontier {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReverseFrontierKey {
+    target: usize,
+    endpoint: super::model::AlphaEndpointKey,
+}
+
 fn reverse_frontier_key_with_poll<P>(
     target: usize,
     endpoint: &EndpointSignature,
     cancelled: &mut P,
-) -> Option<DerivationKey>
+) -> Option<ReverseFrontierKey>
 where
     P: FnMut() -> bool,
 {
-    let mut hasher = CanonicalHasher::new(b"bifrost-resolution-reverse-frontier-key:v1");
-    hasher.field("target", &(target as u64).to_le_bytes());
-    hasher.field("node", &endpoint.node().as_bytes());
-    hasher.field(
-        "symbol-count",
-        &(endpoint.symbols().fixed().len() as u64).to_le_bytes(),
-    );
-    for (index, symbol) in endpoint.symbols().fixed().iter().enumerate() {
-        if cancelled() {
-            return None;
-        }
-        hasher.field(&format!("symbol-{index}"), &symbol.symbol().as_bytes());
-        match symbol.scopes() {
-            Some(scopes) => {
-                hasher.field(&format!("symbol-{index}-scope-kind"), b"scoped");
-                hash_scope_stack_with_poll(
-                    &mut hasher,
-                    &format!("symbol-{index}-scope"),
-                    scopes,
-                    cancelled,
-                )?;
-            }
-            None => hasher.field(&format!("symbol-{index}-scope-kind"), b"unscoped"),
-        }
-    }
-    match endpoint.symbols().tail() {
-        Some(tail) => hasher.field("symbol-tail", &tail.as_bytes()),
-        None => hasher.field("symbol-tail", b"closed"),
-    }
-    hash_scope_stack_with_poll(&mut hasher, "scope", endpoint.scopes(), cancelled)?;
-    Some(DerivationKey::new(hasher.finish()))
-}
-
-fn hash_scope_stack_with_poll<P>(
-    hasher: &mut CanonicalHasher,
-    prefix: &str,
-    scopes: &StackPattern<BindingNodeId>,
-    cancelled: &mut P,
-) -> Option<()>
-where
-    P: FnMut() -> bool,
-{
-    hasher.field(
-        &format!("{prefix}-count"),
-        &(scopes.fixed().len() as u64).to_le_bytes(),
-    );
-    for (index, scope) in scopes.fixed().iter().enumerate() {
-        if cancelled() {
-            return None;
-        }
-        hasher.field(&format!("{prefix}-{index}"), &scope.as_bytes());
-    }
-    match scopes.tail() {
-        Some(tail) => hasher.field(&format!("{prefix}-tail"), &tail.as_bytes()),
-        None => hasher.field(&format!("{prefix}-tail"), b"closed"),
-    }
-    Some(())
+    Some(ReverseFrontierKey {
+        target,
+        endpoint: super::model::endpoint_alpha_key_with_poll(endpoint, cancelled)?,
+    })
 }
 
 fn include_matched_hydrated_completions_after_cancellation(
@@ -9528,8 +9536,8 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             .is_none_or(|session| session.scope_steps(count))
     }
 
-    fn charge_summary_step(&self) -> bool {
-        super::charge_summary_step(self.resolution_session)
+    fn charge_round_step(&self) -> bool {
+        super::charge_round_step(self.resolution_session)
     }
 
     /// Resolve one reference through the exact arity-one batch path.
@@ -10484,7 +10492,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                 cancelled = true;
                 break;
             }
-            if !self.charge_summary_step() {
+            if !self.charge_round_step() {
                 cancelled = true;
                 break;
             }
@@ -11411,7 +11419,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                     break;
                 };
                 let mut duplicate = false;
-                if let Some(frontier_ids) = frontier_ids_by_key.get(&(state.target, key)) {
+                if let Some(frontier_ids) = frontier_ids_by_key.get(&key) {
                     for &frontier_id in frontier_ids {
                         if clone_cancelled() {
                             *cancelled = true;
@@ -11450,7 +11458,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                         start,
                     });
                     frontier_ids_by_key
-                        .entry((state.target, key))
+                        .entry(key)
                         .or_default()
                         .push(frontier_id);
                 }
@@ -11477,7 +11485,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                     break;
                 };
                 let mut duplicate = false;
-                if let Some(frontier_ids) = lexical_frontier_ids_by_key.get(&(state.target, key)) {
+                if let Some(frontier_ids) = lexical_frontier_ids_by_key.get(&key) {
                     for &frontier_id in frontier_ids {
                         if clone_cancelled() {
                             *cancelled = true;
@@ -11511,7 +11519,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                         start,
                     });
                     lexical_frontier_ids_by_key
-                        .entry((state.target, key))
+                        .entry(key)
                         .or_default()
                         .push(frontier_id);
                 }
@@ -11690,7 +11698,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         let mut arena = map_with_capacity(definitions.len().saturating_mul(4));
         let mut candidates = Vec::new();
         let mut frontiers: Vec<ReverseCandidateFrontier> = Vec::new();
-        let mut frontier_ids_by_key: HashMap<(usize, DerivationKey), Vec<usize>> =
+        let mut frontier_ids_by_key: HashMap<ReverseFrontierKey, Vec<usize>> =
             map_with_capacity(definitions.len().saturating_mul(4));
         let mut lexical_frontiers = Vec::new();
         let mut lexical_frontier_ids_by_key =
@@ -12198,12 +12206,12 @@ pub(super) fn validate_reverse_reference_seeds(
     Ok(())
 }
 
-fn identity_seed_path_id(seed: &ReferenceSeed) -> DerivationKey {
-    let mut hasher = CanonicalHasher::new(b"bifrost-resolution-identity-seed-path:v1");
-    hasher.field("fragment", &seed.fragment().as_bytes());
-    hasher.field("reference", &seed.reference().as_bytes());
-    hasher.field("node", &seed.node().as_bytes());
-    DerivationKey::new(hasher.finish())
+fn identity_seed_path_id(seed: &ReferenceSeed) -> SeededPathKey {
+    SeededPathKey::Identity {
+        fragment: seed.fragment(),
+        reference: seed.reference(),
+        node: seed.node(),
+    }
 }
 
 fn prepare_reference_seed_completions(
@@ -12526,6 +12534,52 @@ mod tests {
             StackPattern::open(symbols, StackVariableId::for_test(tail)),
             StackPattern::closed(Vec::new()),
         )
+    }
+
+    #[test]
+    #[hardwon("#5076: alpha-renamed binder numbers entered reverse-frontier keys")]
+    fn reverse_frontier_keys_follow_alpha_normalized_binder_relationships() {
+        use super::super::model::PartialScopedSymbol;
+        let boundary = node("alpha-frontier-boundary");
+        let name = semantic("alpha-frontier-name");
+        let make = |first, second, shared| {
+            let start = EndpointSignature::new_scoped(
+                boundary,
+                StackPattern::closed([
+                    PartialScopedSymbol::scoped(name, StackPattern::open([], first)),
+                    PartialScopedSymbol::scoped(name, StackPattern::open([], second)),
+                ]),
+                StackPattern::open([], if shared { first } else { second }),
+            );
+            PartialPath::new(
+                start,
+                endpoint(boundary),
+                [],
+                [],
+                ResolutionCompletion::Complete,
+            )
+        };
+        // The second path allocates its binders in the opposite numeric order.
+        let left = make(
+            StackVariableId::operation_local(10),
+            StackVariableId::operation_local(11),
+            true,
+        );
+        let renamed = make(
+            StackVariableId::operation_local(91),
+            StackVariableId::operation_local(80),
+            true,
+        );
+        let different = make(
+            StackVariableId::operation_local(91),
+            StackVariableId::operation_local(80),
+            false,
+        );
+        let key = |path: &PartialPath| {
+            reverse_frontier_key_with_poll(0, path.start(), &mut || false).unwrap()
+        };
+        assert_eq!(key(&left), key(&renamed));
+        assert_ne!(key(&left), key(&different));
     }
 
     fn path(
@@ -14948,11 +15002,11 @@ mod tests {
         };
         let joint = build(&rows).finish(&live).unwrap().0;
         let inventory = build(&rows[..2])
-            .finish_with_authority(joint.fingerprint.0, &live)
+            .finish_with_key(joint.fingerprint.clone(), &live)
             .unwrap()
             .0;
         let endpoints = build(&rows[2..])
-            .finish_with_authority(joint.fingerprint.0, &live)
+            .finish_with_key(joint.fingerprint.clone(), &live)
             .unwrap()
             .0;
         let (split, cancelled) = endpoints.with_inventory(&inventory, &live).unwrap();
@@ -15015,7 +15069,7 @@ mod tests {
             reason,
         )];
         let duplicate = build(&duplicate)
-            .finish_with_authority(joint.fingerprint.0, &live)
+            .finish_with_key(joint.fingerprint.clone(), &live)
             .unwrap()
             .0;
         assert!(
@@ -15043,7 +15097,7 @@ mod tests {
 
     #[test]
     #[hardwon("843612333323: authority-backed gap finalization hashed every row unnecessarily")]
-    fn authority_gap_finalization_preserves_evidence_and_polls_without_hashing_rows() {
+    fn authority_gap_finalization_preserves_evidence_and_polls_without_copying_row_keys() {
         let owner = fragment("authority-gap-owner");
         let boundary = node("authority-gap-boundary");
         let lookup = semantic("authority-gap-lookup");
@@ -15086,19 +15140,19 @@ mod tests {
         };
         let live = CancellationToken::new();
         for checks in [1, 2, 4, 64] {
-            REVERSE_CANDIDATE_GAP_HASH_ROWS.with(|count| count.set(0));
+            REVERSE_CANDIDATE_GAP_KEY_ROWS.with(|count| count.set(0));
             let (hashed, hashed_cancelled) = build()
                 .finish(&CancellationToken::cancel_after_checks_for_test(checks))
                 .unwrap();
-            assert_eq!(REVERSE_CANDIDATE_GAP_HASH_ROWS.with(Cell::get), rows.len());
-            REVERSE_CANDIDATE_GAP_HASH_ROWS.with(|count| count.set(0));
+            assert_eq!(REVERSE_CANDIDATE_GAP_KEY_ROWS.with(Cell::get), rows.len());
+            REVERSE_CANDIDATE_GAP_KEY_ROWS.with(|count| count.set(0));
             let (authorized, authorized_cancelled) = build()
-                .finish_with_authority(
-                    hashed.fingerprint.0,
+                .finish_with_key(
+                    hashed.fingerprint.clone(),
                     &CancellationToken::cancel_after_checks_for_test(checks),
                 )
                 .unwrap();
-            assert_eq!(REVERSE_CANDIDATE_GAP_HASH_ROWS.with(Cell::get), 0);
+            assert_eq!(REVERSE_CANDIDATE_GAP_KEY_ROWS.with(Cell::get), 0);
             assert_eq!(hashed_cancelled, authorized_cancelled);
             assert_eq!(hashed.fingerprint, authorized.fingerprint);
             for coverage in [&hashed, &authorized] {
@@ -15850,11 +15904,12 @@ mod tests {
                 )
                 .unwrap();
         let work = baseline_session.finish(()).work();
-        assert!(work.scope_nodes > 0 && work.summary_expansions > 0);
+        assert!(work.scope_nodes > 0 && work.resolution_rounds > 0);
         for scope_limit in [work.scope_nodes, work.scope_nodes - 1, 0] {
             let budget = ReceiverAnalysisBudget {
                 max_scope_nodes: scope_limit,
                 max_summary_expansions: work.summary_expansions,
+                max_resolution_rounds: work.resolution_rounds,
                 ..ReceiverAnalysisBudget::default()
             };
             let eager_session = ResolutionSession::bounded(budget, Some(&cancellation));
@@ -16345,6 +16400,7 @@ mod tests {
             endpoint_classifications: HashMap::default(),
             unconditional_completion: Some(unconditional.clone()),
             demanded_reference_answers: HashMap::default(),
+            expanded_owner_frontiers: HashSet::default(),
             cache_hits: std::cell::Cell::new(0),
         };
 
@@ -16461,6 +16517,7 @@ mod tests {
                     setup_nodes: 0,
                     summary_expansions: 0,
                     scope_nodes: 0,
+                    resolution_rounds: 0,
                 },
             }
         ));
@@ -16494,6 +16551,7 @@ mod tests {
                     setup_nodes: 0,
                     summary_expansions: 0,
                     scope_nodes: 4,
+                    resolution_rounds: 0,
                 },
                 ..
             }
@@ -16527,6 +16585,7 @@ mod tests {
                     setup_nodes: 0,
                     summary_expansions: 0,
                     scope_nodes: 1,
+                    resolution_rounds: 0,
                 },
                 ..
             }
@@ -16550,6 +16609,7 @@ mod tests {
             endpoint_classifications: HashMap::default(),
             unconditional_completion: Some(completion.clone()),
             demanded_reference_answers: HashMap::default(),
+            expanded_owner_frontiers: HashSet::default(),
             cache_hits: std::cell::Cell::new(0),
         };
         let requests = [BatchCandidateRequest::new(0, endpoint)];
@@ -16588,6 +16648,7 @@ mod tests {
                     setup_nodes: 0,
                     summary_expansions: 0,
                     scope_nodes: 2,
+                    resolution_rounds: 0,
                 },
             }
         ));
@@ -16622,6 +16683,7 @@ mod tests {
                     setup_nodes: 0,
                     summary_expansions: 0,
                     scope_nodes: 3,
+                    resolution_rounds: 0,
                 },
                 ..
             }
@@ -16657,6 +16719,7 @@ mod tests {
             endpoint_classifications: HashMap::default(),
             unconditional_completion: Some(unconditional.clone()),
             demanded_reference_answers: HashMap::default(),
+            expanded_owner_frontiers: HashSet::default(),
             cache_hits: std::cell::Cell::new(0),
         };
         let requests = [

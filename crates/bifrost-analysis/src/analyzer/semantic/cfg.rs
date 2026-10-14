@@ -1402,6 +1402,16 @@ impl CompletionRoute {
     pub(crate) fn operations(&self) -> &[CleanupRouteOperation] {
         &self.operations
     }
+
+    /// Keep the cleanup path while selecting a more precise destination for a
+    /// proven exception type.
+    pub(crate) fn redirect(&self, target: ProgramPointId, edge_kind: ControlEdgeKind) -> Self {
+        Self::with_operations(
+            CompletionTarget::new(self.destination.kind, target, edge_kind),
+            self.cleanups.to_vec(),
+            self.operations.to_vec(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

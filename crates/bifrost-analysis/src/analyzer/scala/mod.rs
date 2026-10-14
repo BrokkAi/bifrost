@@ -136,13 +136,61 @@ pub(crate) use wildcard_imports::{
     scala_import_visible_at, scala_package_prefixes_at, scala_package_prefixes_at_checked,
 };
 
+/// Whether `unit` is the code unit Scala declaration extraction publishes for a
+/// compiler-synthesized companion object: the `X$` beside a `case class X` that
+/// has no authored companion. No source writes it.
+///
+/// The persisted synthetic flag plus the structured [`SegmentKind::Companion`]
+/// kind distinguish these from written anonymous templates and primary
+/// constructors, whose identities the graph must retain.
+pub(crate) fn scala_generated_companion_owner(unit: &CodeUnit) -> bool {
+    unit.is_class()
+        && unit.is_synthetic()
+        && unit
+            .fq()
+            .last()
+            .is_some_and(|segment| segment_interner().resolve(segment).1 == SegmentKind::Companion)
+}
+
+fn scala_usage_graph_declaration(unit: &CodeUnit) -> bool {
+    // Generated companion owners have no authored graph declaration. Generated
+    // members already alias their primary constructors rather than publishing
+    // separate CodeUnits.
+    !scala_generated_companion_owner(unit)
+}
+
 /// Decode one persisted [`FileState`] into the thirteen per-file facts the
 /// Scala graph reads.
 ///
 /// The state's own fields are moved out rather than cloned: this is the one
 /// caller, and it owns the map. Everything left behind is another language's
 /// column or store bookkeeping.
-fn scala_file_facts(state: FileState) -> ScalaFileFacts {
+fn scala_file_facts(mut state: FileState) -> ScalaFileFacts {
+    state.declarations.retain(scala_usage_graph_declaration);
+    state
+        .definition_lookup_units
+        .retain(scala_usage_graph_declaration);
+    state
+        .scala_exports
+        .retain(|owner, _| scala_usage_graph_declaration(owner));
+    state
+        .supertype_lookup_paths
+        .retain(|owner, _| scala_usage_graph_declaration(owner));
+    state
+        .signatures
+        .retain(|unit, _| scala_usage_graph_declaration(unit));
+    state
+        .signature_metadata
+        .retain(|unit, _| scala_usage_graph_declaration(unit));
+    state
+        .ranges
+        .retain(|unit, _| scala_usage_graph_declaration(unit));
+    state.children.retain(|owner, children| {
+        children.retain(scala_usage_graph_declaration);
+        scala_usage_graph_declaration(owner)
+    });
+    state.scala_traits.retain(scala_usage_graph_declaration);
+    state.type_aliases.retain(scala_usage_graph_declaration);
     ScalaFileFacts {
         source: state.source,
         package_name: state.package_name,
@@ -181,7 +229,7 @@ impl ScalaRelationalDefinitionIndex {
             name,
             query,
         };
-        match &self.backend {
+        let mut value = match &self.backend {
             ScalaRelationalBackend::Frontier(frontier) => frontier.ask(&question),
             ScalaRelationalBackend::Store(inner) => {
                 let request = question.request(0);
@@ -198,7 +246,11 @@ impl ScalaRelationalDefinitionIndex {
                     }
                 }
             }
+        };
+        if let RelationalDefinitionValue::Definitions(units) = &mut value {
+            units.retain(scala_usage_graph_declaration);
         }
+        value
     }
 
     fn package_query(

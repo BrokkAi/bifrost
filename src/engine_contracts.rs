@@ -562,6 +562,80 @@ pub const REVIEWED_ENGINE_CONTRACTS: &[EngineContract] = &[
         workspace_preconditions: PYTHON_SYNTAX_DIAGNOSTIC_WORKSPACE_PRECONDITIONS,
         per_run_uncertainty: ALL_PER_RUN_UNCERTAINTY,
     },
+    EngineContract {
+        id: "reviewed-python-builtin-result-obligation",
+        api: "CodeIntelligenceRuntime::execute_query",
+        operations: &["call_shape", "call_result_obligations"],
+        support: CapabilitySupport::Partial,
+        languages: PYTHON_FACT_LANGUAGES,
+        bounds: &[
+            "reviewed builtin str strip, lower, upper and two-argument replace results",
+            "source-proven discarded or consumed result use",
+            "annotated or inferred builtin str receivers use the builtin implementation",
+            "builtin methods are assumed not to be replaced",
+            "subclasses, unknown receivers and conflicting dispatch remain typed open",
+        ],
+        model_preconditions: &[
+            "active bifrost.python.str-result-use-obligations with matching cpython evidence",
+            "unique complete reviewed summary with matching obligation and override coverage",
+            "pure transformations require unchanged ordinary heap",
+        ],
+        workspace_preconditions: &[
+            "WorkspaceAnalyzer-backed Python call-shape query and exact source AST site",
+            "selected semantic-model snapshot and source-declared runtime compatibility",
+            "a runtime declaration does not establish an installed interpreter identity",
+        ],
+        per_run_uncertainty: ALL_PER_RUN_UNCERTAINTY,
+    },
+    EngineContract {
+        id: "reviewed-python-result-obligation",
+        api: "CodeIntelligenceRuntime::execute_query",
+        operations: &["call_shape", "call_result_obligations"],
+        support: CapabilitySupport::Partial,
+        languages: PYTHON_FACT_LANGUAGES,
+        bounds: &[
+            "reviewed subprocess.call and os.system fallible-status results",
+            "resolver-proven standard-library function identity and result-use site",
+            "consumed results remain distinct from discarded results",
+            "dynamic lookup, unresolved calls and conflicting dispatch remain typed open",
+        ],
+        model_preconditions: &[
+            "active bifrost.python.status-result-use-obligations with matching cpython evidence",
+            "unique complete reviewed summary with exact result ordinal and failure predicate",
+        ],
+        workspace_preconditions: &[
+            "WorkspaceAnalyzer-backed Python call-shape query and exact source AST site",
+            "selected semantic-model snapshot and source-declared runtime compatibility",
+            "a runtime declaration does not establish an installed interpreter identity",
+        ],
+        per_run_uncertainty: ALL_PER_RUN_UNCERTAINTY,
+    },
+    EngineContract {
+        id: "reviewed-ruby-core-result-obligation",
+        api: "CodeIntelligenceRuntime::execute_query",
+        operations: &["call_shape", "call_result_obligations"],
+        support: CapabilitySupport::Partial,
+        languages: &["ruby"],
+        bounds: &[
+            "reviewed String strip, lstrip, rstrip, downcase and upcase results",
+            "reviewed two-argument String sub and gsub results",
+            "reviewed Kernel.system fallible-status results with the exact false predicate",
+            "source-proven discarded or consumed result use",
+            "resolver output must prove one exact builtin String owner and receiver",
+            "builtin methods are assumed not to be replaced",
+            "subclasses, unresolved ancestors and unknown receivers remain typed open",
+        ],
+        model_preconditions: &[
+            "active bifrost.ruby.core-result-use-obligations in the selected model snapshot",
+            "unique complete reviewed summary with matching owner, member and obligation",
+            "pure transformations require unchanged ordinary heap and override coverage",
+            "the selected model has no runtime-version selector",
+        ],
+        workspace_preconditions: &[
+            "WorkspaceAnalyzer-backed Ruby call-shape query and exact source AST site",
+        ],
+        per_run_uncertainty: ALL_PER_RUN_UNCERTAINTY,
+    },
 ];
 
 const fn uncertainty_label(uncertainty: EngineContractUncertainty) -> &'static str {

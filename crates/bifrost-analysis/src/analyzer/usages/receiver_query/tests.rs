@@ -2066,6 +2066,7 @@ fn receiver_semantic_bridge_uses_every_receiver_limit() {
         max_targets: 3,
         max_summary_expansions: 9,
         max_scope_nodes: 17,
+        max_resolution_rounds: ReceiverAnalysisBudget::default().max_resolution_rounds,
     })
     .expect("aggregate semantic budget");
     let semantic = bridge.budget.limits();

@@ -57,14 +57,16 @@ const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-icfg-provider/def
 // written, escaped, or read as a value (#3787).
 // Factory callback provenance, matched-return capture transport and captured
 // formal cell initialization change the executable flow and heap semantics.
+// Structured callee spines reject calls of values instead of binding them to
+// names inside the callee expression (#5019).
 const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-behavior/v27";
+    b"bifrost-icfg-provider/workspace-behavior/v28";
 /// The domain of the same behavior without the workspace's content identity.
 ///
 /// Its own domain rather than a shorter message under the one above, so that
 /// no read half can ever equal a full identity by accident.
 const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-read-behavior/v26";
+    b"bifrost-icfg-provider/workspace-read-behavior/v27";
 
 /// Why one dispatch lookup could not be named by a replayable read key.
 ///

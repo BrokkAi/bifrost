@@ -14,6 +14,9 @@ use std::sync::Arc;
 pub const DEFAULT_RECEIVER_CONTEXT_DEPTH: usize = 1;
 pub const DEFAULT_RECEIVER_MAX_TARGETS: usize = 4;
 pub const DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS: usize = 64;
+// Native Go/JVM/Rust point and receiver calibration used at most 147 rounds.
+// Four times that maximum, rounded up to a power of two, is 1024.
+pub const DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS: usize = 1_024;
 pub const DEFAULT_RECEIVER_MAX_SCOPE_NODES: usize = 20_000;
 
 /// Budget for one interactive `get_type_by_location` request.
@@ -28,6 +31,7 @@ pub const INTERACTIVE_TYPE_LOOKUP_BUDGET: ReceiverAnalysisBudget = ReceiverAnaly
     context_depth: 2,
     max_targets: 32,
     max_summary_expansions: 256,
+    max_resolution_rounds: DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS,
     max_scope_nodes: 200_000,
 };
 
@@ -195,7 +199,10 @@ impl ReceiverValue {
 pub struct ReceiverAnalysisBudget {
     pub context_depth: usize,
     pub max_targets: usize,
+    /// Distinct owner/summary expansions within one query.
     pub max_summary_expansions: usize,
+    /// Typed convergence and lexical frontier iterations within one query.
+    pub max_resolution_rounds: usize,
     pub max_scope_nodes: usize,
 }
 
@@ -205,6 +212,7 @@ impl Default for ReceiverAnalysisBudget {
             context_depth: DEFAULT_RECEIVER_CONTEXT_DEPTH,
             max_targets: DEFAULT_RECEIVER_MAX_TARGETS,
             max_summary_expansions: DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS,
+            max_resolution_rounds: DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS,
             max_scope_nodes: DEFAULT_RECEIVER_MAX_SCOPE_NODES,
         }
     }
@@ -216,6 +224,7 @@ impl ReceiverAnalysisBudget {
             context_depth: 0,
             max_targets: 1,
             max_summary_expansions: 1,
+            max_resolution_rounds: 1,
             max_scope_nodes: 1,
         }
     }
@@ -270,6 +279,7 @@ pub struct ReceiverAnalysisCacheKey {
     pub context_depth: usize,
     pub max_targets: usize,
     pub max_summary_expansions: usize,
+    pub max_resolution_rounds: usize,
     pub max_scope_nodes: usize,
 }
 
@@ -288,6 +298,7 @@ impl ReceiverAnalysisCacheKey {
             context_depth: query.context.context_depth,
             max_targets: query.budget.max_targets,
             max_summary_expansions: query.budget.max_summary_expansions,
+            max_resolution_rounds: query.budget.max_resolution_rounds,
             max_scope_nodes: query.budget.max_scope_nodes,
         }
     }
@@ -304,6 +315,7 @@ pub struct ReceiverAnalysisBudgetTracker {
 pub struct ReceiverAnalysisWork {
     pub setup_nodes: usize,
     pub summary_expansions: usize,
+    pub resolution_rounds: usize,
     pub scope_nodes: usize,
 }
 
@@ -395,6 +407,7 @@ impl ReceiverAnalysisBudgetTracker {
         ReceiverAnalysisWork {
             setup_nodes: 0,
             summary_expansions: self.summary_expansions,
+            resolution_rounds: 0,
             scope_nodes: self.scope_nodes,
         }
     }
@@ -417,6 +430,7 @@ impl ReceiverAnalysisBudgetTracker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReceiverBudgetLimit {
     SummaryExpansions,
+    ResolutionRounds,
     ScopeNodes,
 }
 
@@ -424,6 +438,7 @@ impl ReceiverBudgetLimit {
     pub fn as_str(self) -> &'static str {
         match self {
             ReceiverBudgetLimit::SummaryExpansions => "summary_expansions",
+            ReceiverBudgetLimit::ResolutionRounds => "resolution_rounds",
             ReceiverBudgetLimit::ScopeNodes => "scope_nodes",
         }
     }

@@ -689,6 +689,14 @@ impl ClosedForwardSource<'_> {
 }
 
 impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
+    fn identity_content_digest(
+        &self,
+        key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<[u8; 32]>> {
+        self.base.identity_content_digest(key, cancellation)
+    }
+
     /// The persisted selection behind this source names the authority.
     ///
     /// This source also serves the relations the provider has closed, and that

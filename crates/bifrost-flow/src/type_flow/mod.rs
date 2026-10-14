@@ -25,6 +25,10 @@ mod report;
 mod solve;
 mod summary;
 
+pub(crate) use correlations::{
+    CorrelationError, analyze_correlations_with_observations, guard_condition_bindings,
+};
+
 use crate::analyzer::semantic::{CancellationToken, ClassSeed, SemanticBudget, ValueId};
 use crate::hash::{HashMap, HashSet};
 

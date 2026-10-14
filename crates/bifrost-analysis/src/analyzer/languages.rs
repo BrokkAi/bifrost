@@ -75,7 +75,7 @@ pub(crate) enum SavedDefaultKind {
     KeywordOnly,
 }
 
-/// Query-local evidence about which Python function defaults may have changed.
+/// Bounded evidence about which Python function defaults may have changed.
 /// Dynamic writes without a proven receiver are represented by the workspace
 /// flags; exact receivers add only their function key to the affected set.
 #[derive(Debug, Clone, Default)]
@@ -87,13 +87,6 @@ pub(crate) struct SavedDefaultArgumentSafety {
 }
 
 impl SavedDefaultArgumentSafety {
-    pub(crate) fn all_defaults_available(&self) -> bool {
-        !self.positional_workspace_open
-            && !self.keyword_only_workspace_open
-            && self.positional_functions_open.is_empty()
-            && self.keyword_only_functions_open.is_empty()
-    }
-
     #[cfg(test)]
     pub(crate) fn workspace_is_open(&self, kind: SavedDefaultKind) -> bool {
         match kind {
@@ -115,9 +108,25 @@ impl SavedDefaultArgumentSafety {
     }
 
     pub(crate) fn mark_workspace_open(&mut self, kind: SavedDefaultKind) {
+        let (open, functions) = self.kind_evidence_mut(kind);
+        *open = true;
+        // Release the allocation, rather than retaining a redundant set.
+        *functions = HashSet::default();
+    }
+
+    fn kind_evidence_mut(
+        &mut self,
+        kind: SavedDefaultKind,
+    ) -> (&mut bool, &mut HashSet<SavedDefaultFunction>) {
         match kind {
-            SavedDefaultKind::Positional => self.positional_workspace_open = true,
-            SavedDefaultKind::KeywordOnly => self.keyword_only_workspace_open = true,
+            SavedDefaultKind::Positional => (
+                &mut self.positional_workspace_open,
+                &mut self.positional_functions_open,
+            ),
+            SavedDefaultKind::KeywordOnly => (
+                &mut self.keyword_only_workspace_open,
+                &mut self.keyword_only_functions_open,
+            ),
         }
     }
 
@@ -125,14 +134,18 @@ impl SavedDefaultArgumentSafety {
         &mut self,
         function: SavedDefaultFunction,
         kind: SavedDefaultKind,
+        max_functions: usize,
     ) {
-        match kind {
-            SavedDefaultKind::Positional => {
-                self.positional_functions_open.insert(function);
-            }
-            SavedDefaultKind::KeywordOnly => {
-                self.keyword_only_functions_open.insert(function);
-            }
+        let (open, functions) = self.kind_evidence_mut(kind);
+        if *open || functions.contains(&function) {
+            return;
+        }
+        if functions.len() == max_functions {
+            // #5112: bounded residency per the architecture guidance. Collapse
+            // conservatively: every default of this kind becomes unavailable.
+            self.mark_workspace_open(kind);
+        } else {
+            functions.insert(function);
         }
     }
 
@@ -312,6 +325,17 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// The `Language` variant this support serves. Must equal the registry match key.
     fn language(&self) -> Language;
 
+    /// Exact package identity published for an import by this language's
+    /// activated semantic model. Framework callers supply the selected overlay
+    /// so this lookup does not depend on a language delegate's local cache.
+    fn modeled_external_package_identity(
+        &self,
+        _overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+        _import_path: &str,
+    ) -> Option<ModeledExternalPackageIdentity> {
+        None
+    }
+
     /// Provider identities for external declaration inventories owned by this
     /// language's analyzer. Shared resolution gathers these through the
     /// registered language hooks instead of reaching into a language module.
@@ -338,6 +362,49 @@ pub(crate) trait LanguageSupport: Send + Sync {
         _file: &ProjectFile,
         _reference: &ResolvedReferenceSite,
     ) -> Option<String> {
+        None
+    }
+
+    /// The qualified name this language's own packs give a hierarchy edge whose
+    /// recorded target is a bare, unqualified spelling.
+    ///
+    /// A producer that records a supertype by source spelling leaves the
+    /// enclosing module implicit: a legacy Python pack records
+    /// `class Child(Base)` as `Base`, where `Base` means the base in the
+    /// declaring declaration's own module. The rule is the language's, so
+    /// shared overlay code asks here instead of naming the language module.
+    /// `None` leaves the recorded spelling as the only candidate.
+    fn qualified_hierarchy_target(
+        &self,
+        _declaring_locator_path: Option<&str>,
+        _declaring_qualified_name: &str,
+        _target: &str,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Speculatively answer this language's own retained reverse call sites
+    /// before the demanding walk asks for them. `sites` can hold several
+    /// languages' sites, so an implementation answers only the ones its own
+    /// language owns. `None` leaves the framework's ordinary demand path in
+    /// charge, which is the only path a language without a selected native
+    /// reverse operation has.
+    fn prefetch_reverse_call_targets(
+        &self,
+        _workspace: &crate::analyzer::WorkspaceAnalyzer,
+        _sites: &[crate::analyzer::usages::CallSite],
+        _cancellation: &crate::CancellationToken,
+        _snapshot: Option<
+            std::sync::Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>,
+        >,
+    ) -> Option<
+        crate::analyzer::store::Result<
+            crate::hash::HashMap<
+                crate::analyzer::ProjectFile,
+                crate::analyzer::usages::call_relations::PrefetchedCallFile,
+            >,
+        >,
+    > {
         None
     }
 
@@ -492,13 +559,14 @@ pub(crate) trait LanguageSupport: Send + Sync {
         None
     }
 
-    /// Bounded, query-local evidence about saved callable defaults. `None`
+    /// Bounded evidence about saved callable defaults. `None`
     /// leaves default-argument binding unproven because the language has no
-    /// such capability, the analyzer is absent, or its scan was incomplete.
+    /// such capability or the analyzer is absent. Incomplete scans leave all
+    /// defaults open.
     fn saved_default_argument_safety(
         &self,
         _analyzer: &dyn IAnalyzer,
-    ) -> Option<SavedDefaultArgumentSafety> {
+    ) -> Option<Arc<SavedDefaultArgumentSafety>> {
         None
     }
 
@@ -988,6 +1056,18 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// future one can be analyzable without shipping highlights instead of returning an
     /// empty query that silently produces no captures.
     fn highlight_query(&self) -> Option<&'static str>;
+}
+
+/// Package clause name and exact selected-artifact provenance for one modeled
+/// external import. The language adapter decides whether its model proves this
+/// identity; shared resolution carries these fields without interpreting them.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct ModeledExternalPackageIdentity {
+    pub(crate) package_name: String,
+    pub(crate) symbol_id: String,
+    pub(crate) pack_id: String,
+    pub(crate) pack_digest: String,
+    pub(crate) record_id: String,
 }
 
 /// Identity of one whole-workspace edge resolver family.

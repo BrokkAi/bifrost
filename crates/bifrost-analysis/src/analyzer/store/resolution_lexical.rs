@@ -1016,6 +1016,165 @@ pub(crate) struct SelectedResolutionLexicalSource<'selection, 'store> {
 const CANDIDATE_ROW_CANCELLATION_QUANTUM: usize = 32;
 
 impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
+    fn canonical_content_digest(
+        &self,
+        key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        use crate::analyzer::resolution::{
+            ResolutionIdentityDigestKey as Key, mounted_identity_digest,
+        };
+        // This bounded authority lookup also runs while retaining already
+        // returned cancellation evidence. Resolve its finite content keys;
+        // the enclosing work loop owns semantic cancellation.
+        static CONTENT_LOOKUP: std::sync::LazyLock<CancellationToken> =
+            std::sync::LazyLock::new(CancellationToken::default);
+        let cancellation = &*CONTENT_LOOKUP;
+        let (mount, kind, digest) = match key {
+            Key::Fragment(fragment) => {
+                return Ok(Some(
+                    self.mount_record_of_fragment(fragment)?
+                        .fragment_digest()
+                        .as_bytes(),
+                ));
+            }
+            Key::Semantic(semantic) => {
+                if semantic.shared_name_id().is_some() {
+                    return self
+                        .authority
+                        .shared_name_digest_for_identity(semantic, cancellation);
+                }
+                // A persisted gap has source provenance instead of a semantic
+                // catalog row. Reconstruct its producer's exact digest from
+                // those rows with the same shared helper as lowering.
+                if let (Some(ordinal), Some(local_key)) = (semantic.ordinal(), semantic.local_key())
+                    && super::resolution_stage::allocation::is_ordinary_key(local_key)
+                {
+                    let mount = self.mount_record(SelectedResolutionMountOrdinal::new(ordinal))?;
+                    if let Some(SelectedSemanticProvenance::FragmentLocal(value)) = self
+                        .authority
+                        .semantic_catalog_provenance(semantic, cancellation)?
+                        .flatten()
+                    {
+                        return Ok(Some(mounted_identity_digest(
+                            b"semantic",
+                            mount.fragment_digest().as_bytes(),
+                            value.identity().fragment_local_digest(),
+                        )));
+                    }
+                    let gap = self.selection.connection().prepare_cached(
+                            "SELECT site,origin FROM resolution_gap_reasons WHERE blob_id=?1 AND reason=?2",
+                        )?.query_row(params![mount.blob_id(),local_key], |row| Ok((row.get::<_,u32>(0)?,row.get::<_,i64>(1)?))).optional()?;
+                    if let Some((site, origin)) = gap {
+                        let identity = crate::analyzer::resolution::gap_reason_semantic_identity(
+                            ResolutionSiteId::new(site),
+                            super::resolution_prepare::resolution_rows::gap_origin_from_code(
+                                origin,
+                            ),
+                        );
+                        return Ok(Some(mounted_identity_digest(
+                            b"semantic",
+                            mount.fragment_digest().as_bytes(),
+                            identity.fragment_local_digest(),
+                        )));
+                    }
+                }
+                let Some(provenance) = self.semantic_provenance(semantic, cancellation)? else {
+                    return Ok(None);
+                };
+                let (ordinal, digest) = match provenance {
+                    SelectedSemanticProvenance::FragmentLocal(value) => (
+                        value.mount().ordinal(),
+                        value.identity().fragment_local_digest(),
+                    ),
+                    SelectedSemanticProvenance::Stage(value) => (
+                        value.mount().ordinal(),
+                        value.identity().fragment_local_digest(),
+                    ),
+                    SelectedSemanticProvenance::Shared(_) => {
+                        unreachable!("shared semantics were resolved above")
+                    }
+                };
+                (self.mount_record(ordinal)?, b"semantic".as_slice(), digest)
+            }
+            Key::Node(node) => {
+                if node == BindingNodeId::universal_root() {
+                    return Ok(Some(
+                        brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                            b"bifrost-resolution-universal-root:v1",
+                            &[],
+                        ),
+                    ));
+                }
+                if let (Some(ordinal), Some(key)) = (node.ordinal(), node.local_key())
+                    && super::resolution_stage::allocation::is_ordinary_key(key)
+                    && let Some(SelectedNodeProvenance::FragmentLocal(value)) = self
+                        .authority
+                        .node_catalog_provenance(node, cancellation)?
+                        .flatten()
+                {
+                    let mount = self.mount_record(SelectedResolutionMountOrdinal::new(ordinal))?;
+                    return Ok(Some(mounted_identity_digest(
+                        b"node",
+                        mount.fragment_digest().as_bytes(),
+                        value.identity().digest(),
+                    )));
+                }
+                let Some(provenance) = self.node_provenance(node, cancellation)? else {
+                    return Ok(None);
+                };
+                let (ordinal, digest) = match provenance {
+                    Some(SelectedNodeProvenance::FragmentLocal(value)) => {
+                        (value.mount().ordinal(), value.identity().digest())
+                    }
+                    Some(SelectedNodeProvenance::Stage(value)) => {
+                        (value.mount().ordinal(), value.identity().digest())
+                    }
+                    other => {
+                        return Err(invalid_fact(format!(
+                            "node has no canonical selected content: {node:?}, {other:?}"
+                        )));
+                    }
+                };
+                (self.mount_record(ordinal)?, b"node".as_slice(), digest)
+            }
+            Key::Path(path) => {
+                let ordinal = path
+                    .ordinal()
+                    .expect("context and operation paths resolve in their number registry");
+                let local_key = path
+                    .local_key()
+                    .expect("a mounted path carries its content catalog position");
+                let mount = self.mount_record(SelectedResolutionMountOrdinal::new(ordinal))?;
+                let digest = if super::resolution_stage::allocation::is_ordinary_key(local_key) {
+                    let present: bool=self.selection.connection().prepare_cached(
+                        "SELECT EXISTS(SELECT 1 FROM resolution_paths WHERE blob_id=?1 AND path=?2)",
+                    )?.query_row(params![mount.blob_id(),local_key],|row| row.get(0))?;
+                    assert!(
+                        present,
+                        "a demanded ordinary path has its immutable publication: {path:?}"
+                    );
+                    // Ordinary path positions are assigned by canonical content
+                    // order at publication, not by this operation. The artifact
+                    // content key plus its position is a stable content locator.
+                    brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                        b"bifrost-resolution-published-path-position:v1",
+                        &local_key.to_be_bytes(),
+                    )
+                } else {
+                    self.selection.connection().prepare_cached(
+                        "SELECT identity_digest FROM temp.selected_resolution_stage_path_coordinates WHERE host_ordinal=?1 AND runtime_key=?2",
+                    )?.query_row(params![ordinal,super::resolution_stage::codec::encode_path_id(path)],|row|row.get::<_,[u8;32]>(0))?
+                };
+                (mount, b"path".as_slice(), digest)
+            }
+        };
+        Ok(Some(mounted_identity_digest(
+            kind,
+            mount.fragment_digest().as_bytes(),
+            digest,
+        )))
+    }
+
     /// Read a page of positioned reference names from their native lookup
     /// paths, in the namespace the reference spells them in. The stored
     /// lookup recipes retain parser-derived identifiers.
@@ -4773,6 +4932,32 @@ fn read_reference_local_path_evidence(
 }
 
 impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
+    fn identity_content_digest(
+        &self,
+        key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        if let Some(digest) = self
+            .selection
+            .authority_request_memo()
+            .borrow()
+            .canonical_digests
+            .get(&key)
+            .copied()
+        {
+            return Ok(Some(digest));
+        }
+        let digest = self.canonical_content_digest(key)?;
+        if let Some(digest) = digest {
+            self.selection
+                .authority_request_memo()
+                .borrow_mut()
+                .canonical_digests
+                .insert(key, digest);
+        }
+        Ok(digest)
+    }
+
     /// This source answers under its selection, and the selection already
     /// carries the three values that name it for the seed-key profile.
     fn selection_authority(&self) -> Option<crate::analyzer::resolution::SeedReadAuthority> {

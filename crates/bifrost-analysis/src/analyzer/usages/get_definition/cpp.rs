@@ -153,7 +153,7 @@ pub(super) struct CppNavigationSelection {
 }
 
 pub(super) fn select_navigation_targets(
-    context: &mut DefinitionBatchContext<'_>,
+    context: &mut DefinitionBatchContext<'_, '_>,
     token: QueryToken<'_>,
     reference_file: &ProjectFile,
     candidates: &[CodeUnit],
@@ -286,14 +286,21 @@ pub(super) fn select_navigation_targets(
     // The branches of one #if/#elif/#else chain are alternate spellings of a
     // single declaration: at most one of them is compiled. Keep the first
     // branch so a completed conditional family answers with one target instead
-    // of an ambiguity between build configurations.
+    // of an ambiguity between build configurations. A callable's signature
+    // keeps overloads apart. An alias's signature is only the type its branch
+    // aliases, so alias branches of one chain stay one declaration (#2430);
+    // an alias and a class in alternate branches stay apart.
     let mut seen_families = HashSet::default();
     selected.retain(|(candidate, _, _, family, _)| {
         family.is_none_or(|family| {
+            let is_alias = cpp_unit_is_type_alias(context.analyzer, candidate);
             seen_families.insert((
                 candidate.source().clone(),
                 definition_symbol_key(candidate),
-                candidate.signature().map(str::to_owned),
+                is_alias,
+                (!is_alias)
+                    .then(|| candidate.signature().map(str::to_owned))
+                    .flatten(),
                 family,
             ))
         })
@@ -376,7 +383,7 @@ fn distinct_units(
 /// genuine overloads declared in one file, and the declaration agreement alone
 /// admits two like-signed `static` helpers in unrelated translation units.
 fn cpp_declarations_without_own_body<'a>(
-    context: &mut DefinitionBatchContext<'a>,
+    context: &mut DefinitionBatchContext<'a, '_>,
     cpp: &'a CppAnalyzer,
     token: QueryToken<'_>,
     reference_file: &ProjectFile,
@@ -411,7 +418,7 @@ fn cpp_declarations_without_own_body<'a>(
 pub(super) fn resolve_cpp<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
-    context: &mut DefinitionBatchContext<'a>,
+    context: &mut DefinitionBatchContext<'a, '_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -3319,7 +3326,7 @@ fn cpp_resolve_qualified_via_enclosing_namespaces(
 fn resolve_cpp_type(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
-    context: &mut DefinitionBatchContext<'_>,
+    context: &mut DefinitionBatchContext<'_, '_>,
     file: &ProjectFile,
     visibility: &CppVisibilityIndex,
     source: &str,
@@ -3616,7 +3623,7 @@ fn resolve_cpp_type(
                 .into_iter()
                 .flat_map(|unit| {
                     cpp_selected_type_definition_candidates(
-                        analyzer, visibility, file, support, node, unit,
+                        analyzer, visibility, file, support, unit,
                     )
                 })
                 .collect();
@@ -3666,7 +3673,6 @@ fn resolve_cpp_type(
                 visibility,
                 file,
                 context.bounded_support(),
-                node,
                 unit,
             ));
         }
@@ -5023,7 +5029,7 @@ fn cpp_qualifier_scope_component<'a>(scope: Node<'_>, source: &'a str) -> Option
 
 fn cpp_focused_type_qualifier_candidates(
     analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext<'_>,
+    context: &mut DefinitionBatchContext<'_, '_>,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     qualifier: &CppFocusedQualifier,
@@ -5058,7 +5064,7 @@ fn cpp_focused_type_qualifier_candidates(
 
 fn cpp_focused_type_enclosing_class_tiers(
     analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext<'_>,
+    context: &mut DefinitionBatchContext<'_, '_>,
     enclosing_owner: Option<CodeUnit>,
 ) -> Vec<Vec<CodeUnit>> {
     let Some(owner) = enclosing_owner else {
@@ -5162,7 +5168,7 @@ fn cpp_qualifier_lookup_tiers(
 
 fn cpp_type_qualifier_matches_exact_path(
     analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext<'_>,
+    context: &mut DefinitionBatchContext<'_, '_>,
     unit: &CodeUnit,
     lookup_path: &str,
 ) -> bool {
@@ -5178,7 +5184,7 @@ fn cpp_type_qualifier_matches_exact_path(
 }
 
 fn cpp_structural_alias_paths(
-    context: &mut DefinitionBatchContext<'_>,
+    context: &mut DefinitionBatchContext<'_, '_>,
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
 ) -> Vec<String> {
@@ -5226,8 +5232,16 @@ fn cpp_type_definition_candidates_for_spelling(
     reference: Node<'_>,
     unit: CodeUnit,
 ) -> Vec<CodeUnit> {
+    // Navigation stops at the type the reference spells: a typedef or using
+    // alias navigates to the alias declaration the resolver bound, not to the
+    // type it names (#2430), and not to same-named aliases in other headers.
+    // Type resolution, receiver typing and member lookup follow the alias
+    // through their own resolver.
+    if cpp_unit_is_type_alias(analyzer, &unit) {
+        return vec![unit];
+    }
     let reference_byte = reference.start_byte();
-    let target = cpp_navigation_type_target(analyzer, visibility, file, reference, unit);
+    let target = unit;
     let dispatch = CppDispatch::new(analyzer, visibility.token());
     let graph_source = dispatch.source();
     let is_complete_class = |candidate: &CodeUnit| {
@@ -5358,20 +5372,12 @@ fn cpp_ambiguous_type_definition_candidates(
     definitions
 }
 
-/// Select the reachable physical spelling from an identical alias family
-/// before canonical navigation turns that spelling into its target class.
+/// Select the reachable physical spelling from an identical alias family.
 ///
-/// `cpp_navigation_type_target` is intentionally used for a single alias: it
-/// resolves an alias in the alias declaration's scope, rather than resolving
-/// its right-hand side in the consumer's scope. When the same alias is copied
-/// into multiple headers, however, canonicalizing first loses the alias family
-/// and leaves only physical class redeclarations for the later deduplication
-/// pass. Those redeclarations have the same canonical type but can point at a
-/// header outside the reference's include closure. Identical aliases are one
-/// logical declaration, so select the reachable physical spelling here and
-/// let the caller canonicalize that exact spelling. Returning the alias itself
-/// would make definition navigation stop at a declaration-only typedef even
-/// when its tagged struct body is indexed.
+/// Navigation on an alias name answers with the alias declaration (#2430).
+/// When the same alias is copied into multiple headers, the copies are one
+/// logical declaration, but some can sit outside the reference's include
+/// closure, so select the copy the reference can reach.
 ///
 /// Aliases with different signatures are deliberately not handled here. They
 /// can name different targets and must continue through canonical resolution,
@@ -5549,14 +5555,12 @@ fn cpp_selected_type_definition_candidates(
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     support: &dyn BoundedDefinitionLookup,
-    reference: Node<'_>,
     unit: CodeUnit,
 ) -> Vec<CodeUnit> {
     let spellings = cpp_reachable_identical_alias(analyzer, visibility, file, support, &unit)
         .unwrap_or_else(|| vec![unit]);
     let mut definitions = Vec::new();
-    for spelling in spellings {
-        let target = cpp_navigation_type_target(analyzer, visibility, file, reference, spelling);
+    for target in spellings {
         let indexed = support
             .fqn(&target.fq_name())
             .into_iter()
@@ -5572,23 +5576,6 @@ fn cpp_selected_type_definition_candidates(
         }
     }
     definitions
-}
-
-fn cpp_navigation_type_target(
-    analyzer: &dyn IAnalyzer,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
-    reference: Node<'_>,
-    unit: CodeUnit,
-) -> CodeUnit {
-    if !cpp_unit_is_type_alias(analyzer, &unit) {
-        return unit;
-    }
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let dispatch = CppDispatch::new(analyzer, scope.token());
-    visibility
-        .canonical_type_unit_in_context(&dispatch.source(), file, reference, &unit)
-        .unwrap_or(unit)
 }
 
 /// Resolve one call expression.
@@ -11855,7 +11842,7 @@ void advance(ring_t *ring) { get(ring, ring->count - 2)->next = 0; }
     #[hardwon(
         "a787c7778210: canonical navigation lost a tagged struct body behind an identical typedef"
     )]
-    fn reachable_identical_typedef_still_navigates_to_its_tagged_struct_body() {
+    fn reachable_identical_typedef_navigates_to_its_reachable_copy() {
         let fixture = AnalyzerFixture::new_for_language(
             Language::Cpp,
             &[
@@ -11886,12 +11873,14 @@ void advance(ring_t *ring) { get(ring, ring->count - 2)->next = 0; }
         );
 
         assert_eq!(result.results[0].status, "resolved", "{result:#?}");
+        // Navigation answers with the alias the reference spells (#2430), and
+        // of the two identical copies only the included one is reachable.
+        let definitions = &result.results[0].definitions;
         assert!(
-            result.results[0].definitions.iter().any(|definition| {
-                definition.fqn.as_deref() == Some("internal_tag")
-                    && definition.path == "visible.hpp"
-            }),
-            "the reachable typedef spelling must canonicalize to its reachable tagged body: {result:#?}"
+            definitions.iter().all(|definition| {
+                definition.fqn.as_deref() == Some("public_name") && definition.path == "visible.hpp"
+            }) && !definitions.is_empty(),
+            "the typedef must navigate to its reachable copy: {result:#?}"
         );
     }
 

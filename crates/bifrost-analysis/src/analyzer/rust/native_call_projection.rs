@@ -634,17 +634,32 @@ mod tests {
             .filter(|unit| matches!(unit.identifier(), "delayed" | "generic"))
             .collect::<Vec<_>>();
         assert_eq!(targets.len(), 2);
-        reset_selected_fact_operation_construction_count_for_test();
-        let selected =
-            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
-                let bindings = queries.inverse_for(&targets)?.expect("binding rows");
-                assert!(
-                    bindings
-                        .iter()
-                        .flat_map(|row| &row.edges)
-                        .all(|edge| edge.proof == UsageProof::Proven)
+        // Observe the thread-local demand counter on the same sole worker
+        // that dispatches and confirms the reverse query.
+        let (selected, construction_count) = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                reset_selected_fact_operation_construction_count_for_test();
+                let selected = with_rust_selected_reverse_queries(
+                    &rust,
+                    &CancellationToken::new(),
+                    |queries| {
+                        let bindings = queries.inverse_for(&targets)?.expect("binding rows");
+                        assert!(
+                            bindings
+                                .iter()
+                                .flat_map(|row| &row.edges)
+                                .all(|edge| edge.proof == UsageProof::Proven)
+                        );
+                        queries.incoming_calls_for(&targets, rich_limits())
+                    },
                 );
-                queries.incoming_calls_for(&targets, rich_limits())
+                (
+                    selected,
+                    selected_fact_operation_construction_count_for_test(),
+                )
             });
         let RustSelectedReverseOutcome::Ready(Some(results)) = selected else {
             panic!("rich incoming result must be ready: {selected:?}");
@@ -652,8 +667,7 @@ mod tests {
         // Proven callee bindings need no semantic point operation for their
         // arguments or receivers, leaving four reverse-confirmation operations.
         assert_eq!(
-            selected_fact_operation_construction_count_for_test(),
-            4,
+            construction_count, 4,
             "reverse confirmation constructs one fact operation per candidate blob"
         );
         assert_eq!(results.len(), 2);

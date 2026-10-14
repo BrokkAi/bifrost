@@ -17,12 +17,18 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, Utc};
 use sha2::{Digest, Sha256};
 #[path = "bifrost/code_query_repl.rs"]
 mod code_query_repl;
 
+use brokk_bifrost::analyzer::semantic_model::{
+    ActivationReceipt, ActivationReceiptInvocation, ActivationReceiptStage,
+    ActivationReceiptStageStatus,
+};
 use brokk_bifrost::mcp_common::McpRenderOptions;
 use brokk_bifrost::mcp_install::install_mcp_hosts;
 use brokk_bifrost::mcp_registry::{
@@ -52,7 +58,9 @@ use brokk_bifrost::rmcp_host::{
     run_stdio_server_with_build_identity,
 };
 use brokk_bifrost::rql::query::QuerySourceOperation;
-use brokk_bifrost::scoped_project::{create_cli_tool_service, create_scoped_service};
+use brokk_bifrost::scoped_project::{
+    create_cli_tool_service, create_cli_tool_service_with_activation_receipt, create_scoped_service,
+};
 use brokk_bifrost::searchtools_render::RenderOptions;
 use brokk_bifrost::tool_arguments::normalize_tool_arguments_for_cli;
 use brokk_bifrost::{CancellationToken, ToolOutput};
@@ -1135,6 +1143,7 @@ fn option_requires_value(argument: &str) -> bool {
             | "--server"
             | "--tool"
             | "--args"
+            | "--activation-receipt"
             | "--diff-snapshot-object-dir"
             | "--query-file"
             | "--sources"
@@ -1204,6 +1213,7 @@ fn run_inner(
     let mut tool_args = json!({});
     let mut tool_args_seen = false;
     let mut tool_sources = Vec::new();
+    let mut activation_receipt_path: Option<PathBuf> = None;
     let mut diff_snapshot_object_dir: Option<PathBuf> = None;
     let mut query_file: Option<String> = None;
     let mut workspace_scaled_limits = false;
@@ -1230,7 +1240,7 @@ fn run_inner(
     // Reuse is on by default; the switch exists to take it away for a run that
     // needs to compare against the full dual-snapshot evaluation.
     let mut policy_incremental = true;
-    // Scope the taint composition to the files the diff base changed (spec M4.0).
+    // Scope taint sink procedures to changed hunks from the diff base.
     let mut policy_diff_scoped = false;
     let mut policy_timings = false;
     let mut policy_output: Option<PathBuf> = None;
@@ -1315,6 +1325,14 @@ fn run_inner(
                 tool_args = serde_json::from_str(&value)
                     .map_err(|err| format!("--args must be valid JSON: {err}"))?;
                 tool_args_seen = true;
+            }
+            "--activation-receipt" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--activation-receipt requires a path".to_string())?;
+                if activation_receipt_path.replace(value.into()).is_some() {
+                    return Err("--activation-receipt may only be provided once".to_string());
+                }
             }
             "--diff-snapshot-object-dir" => {
                 let value = args
@@ -1598,6 +1616,41 @@ fn run_inner(
             other => {
                 return Err(format!("Unknown argument: {other}"));
             }
+        }
+    }
+
+    if activation_receipt_path.is_some() {
+        if policy_invocation || policy_flag || !policy_files.is_empty() {
+            return Err(
+                "--activation-receipt is only available with --tool query_code".to_string(),
+            );
+        }
+        if query_file.is_some() {
+            return Err("--activation-receipt cannot be combined with --query-file".to_string());
+        }
+        if tool_name.as_deref() != Some("query_code") {
+            return Err("--activation-receipt requires --tool query_code".to_string());
+        }
+        if mcp_mode.is_some() || run_repl || !named_workspaces.is_empty() {
+            return Err(
+                "--activation-receipt cannot be combined with --mcp, --repl, or --workspace"
+                    .to_string(),
+            );
+        }
+        if !tool_sources.is_empty() {
+            return Err("--activation-receipt cannot be combined with --sources".to_string());
+        }
+        if diff_snapshot_object_dir.is_some() {
+            return Err(
+                "--activation-receipt cannot be combined with --diff-snapshot-object-dir"
+                    .to_string(),
+            );
+        }
+        if workspace_scaled_limits {
+            return Err(
+                "--activation-receipt cannot be combined with --workspace-scaled-limits"
+                    .to_string(),
+            );
         }
     }
 
@@ -1887,6 +1940,8 @@ fn run_inner(
             render_options,
             None,
             workspace_scaled_limits,
+            None,
+            Ok(()),
         )
         .map(|()| CliRunResult::Complete);
     }
@@ -1905,11 +1960,71 @@ fn run_inner(
         let canonical_root = root.canonicalize().map_err(|error| {
             format!("Failed to resolve project root {}: {error}", root.display())
         })?;
-        normalize_tool_arguments_for_cli(&tool_name, tool_args.clone(), &canonical_root)?;
-        if tool_activates_open_packs(&tool_name) {
-            acquire_open_packs_for_process()?;
+        let (_, overlays) =
+            normalize_tool_arguments_for_cli(&tool_name, tool_args.clone(), &canonical_root)?;
+        if activation_receipt_path.is_some() && !overlays.is_empty() {
+            return Err("--activation-receipt cannot be used with query overlays".to_string());
         }
-        install_semantic_model_packs_for_process()?;
+        let activation_receipt_path = activation_receipt_path
+            .map(|path| validate_activation_receipt_path(path, &canonical_root))
+            .transpose()?;
+        let activation_receipt = activation_receipt_path
+            .map(|path| {
+                let invocation_id = format!(
+                    "{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |elapsed| elapsed.as_nanos())
+                );
+                ActivationReceipt::create(
+                    path,
+                    &ActivationReceiptInvocation {
+                        invocation_id,
+                        tool: tool_name.clone(),
+                    },
+                )
+                .map_err(|error| format!("Failed to create activation receipt: {error}"))
+            })
+            .transpose()?;
+        let setup_result = if let Some(receipt) = activation_receipt.as_ref() {
+            if tool_activates_open_packs(&tool_name) {
+                if let Err(error) = acquire_open_packs_for_process() {
+                    receipt.record_stage_failure(
+                        ActivationReceiptStage::Configuration,
+                        ActivationReceiptStageStatus::Unavailable,
+                    );
+                    Err(error)
+                } else {
+                    install_semantic_model_packs_for_process().inspect_err(|_| {
+                        receipt.record_stage_failure(
+                            ActivationReceiptStage::CatalogBootstrap,
+                            ActivationReceiptStageStatus::Unavailable,
+                        );
+                    })
+                }
+            } else {
+                install_semantic_model_packs_for_process().inspect_err(|_| {
+                    receipt.record_stage_failure(
+                        ActivationReceiptStage::CatalogBootstrap,
+                        ActivationReceiptStageStatus::Unavailable,
+                    );
+                })
+            }
+        } else {
+            let open_packs = if tool_activates_open_packs(&tool_name) {
+                acquire_open_packs_for_process()
+            } else {
+                Ok(())
+            };
+            open_packs.and_then(|()| install_semantic_model_packs_for_process())
+        };
+        let setup_result = if activation_receipt.is_none() {
+            setup_result?;
+            Ok(())
+        } else {
+            setup_result
+        };
         return run_tool(
             root,
             &tool_name,
@@ -1918,6 +2033,8 @@ fn run_inner(
             render_options,
             diff_snapshot_object_dir,
             false,
+            activation_receipt,
+            setup_result,
         )
         .map(|()| CliRunResult::Complete);
     }
@@ -2310,6 +2427,59 @@ fn validate_diff_snapshot_object_dir(path: PathBuf) -> Result<PathBuf, String> {
         ));
     }
     Ok(path)
+}
+
+fn validate_activation_receipt_path(
+    path: PathBuf,
+    canonical_root: &Path,
+) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "--activation-receipt must be an absolute path: {}",
+            path.display()
+        ));
+    }
+    let file_name = path.file_name().ok_or_else(|| {
+        format!(
+            "--activation-receipt must name a new file: {}",
+            path.display()
+        )
+    })?;
+    if !matches!(
+        Path::new(file_name).components().next(),
+        Some(std::path::Component::Normal(_))
+    ) {
+        return Err(format!(
+            "--activation-receipt must name a new file: {}",
+            path.display()
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "--activation-receipt must have an existing parent directory: {}",
+            path.display()
+        )
+    })?;
+    let canonical_parent = parent.canonicalize().map_err(|error| {
+        format!(
+            "Failed to resolve --activation-receipt parent {}: {error}",
+            parent.display()
+        )
+    })?;
+    if !canonical_parent.is_dir() {
+        return Err(format!(
+            "--activation-receipt parent must be a directory: {}",
+            canonical_parent.display()
+        ));
+    }
+    let destination = canonical_parent.join(file_name);
+    if destination.starts_with(canonical_root) {
+        return Err(format!(
+            "--activation-receipt must be outside the analyzed root: {}",
+            destination.display()
+        ));
+    }
+    Ok(destination)
 }
 
 fn parse_policy_format(value: &str) -> Result<PolicyOutputFormat, String> {
@@ -2947,6 +3117,10 @@ fn spawn_orphan_watchdog(cancellation: CancellationToken) {
 /// `isError: false` with the tool's structured content, or `isError: true`
 /// with the failure. Argument validation that happens before dispatch keeps
 /// reporting on stderr alone.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Preserve dispatch inputs while adding the caller-owned recording lifecycle"
+)]
 fn run_tool(
     root: PathBuf,
     tool_name: &str,
@@ -2955,10 +3129,14 @@ fn run_tool(
     render_options: McpRenderOptions,
     diff_snapshot_object_dir: Option<PathBuf>,
     workspace_scaled_limits: bool,
+    activation_receipt: Option<Arc<ActivationReceipt>>,
+    setup_result: Result<(), String>,
 ) -> Result<(), String> {
+    let mut receipt_finalization_attempted = false;
     let dispatched =
         brokk_bifrost::panic_report::report_panics(format!("--tool {tool_name}"), || {
-            run_dispatched_tool(
+            setup_result?;
+            let result = run_dispatched_tool(
                 root,
                 tool_name,
                 tool_args,
@@ -2966,13 +3144,40 @@ fn run_tool(
                 render_options,
                 diff_snapshot_object_dir,
                 workspace_scaled_limits,
-            )
+                activation_receipt.clone(),
+            )?;
+            let encoded = serde_json::to_string(&result)
+                .map_err(|error| format!("Failed to serialize tool result: {error}"))?;
+            if let Some(receipt) = activation_receipt.as_ref() {
+                receipt_finalization_attempted = true;
+                receipt
+                    .finish()
+                    .map_err(|error| format!("activation receipt finalization failed: {error}"))?;
+            }
+            println!("{encoded}");
+            Ok(())
         });
-    let failure = match dispatched {
-        Ok(Ok(())) => return Ok(()),
-        Ok(Err(failure)) => failure,
-        Err(panic) => panic.to_string(),
-    };
+    match dispatched {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(failure)) => {
+            let failure = if !receipt_finalization_attempted {
+                match activation_receipt.as_ref().map(|receipt| receipt.finish()) {
+                    Some(Ok(_)) | None => failure,
+                    Some(Err(error)) => {
+                        format!("{failure}; activation receipt finalization failed: {error}")
+                    }
+                }
+            } else {
+                failure
+            };
+            write_tool_failure(failure)
+        }
+        // Keep a partial receipt without a success footer when dispatch unwinds.
+        Err(panic) => write_tool_failure(panic.to_string()),
+    }
+}
+
+fn write_tool_failure(failure: String) -> Result<(), String> {
     let encoded = serde_json::to_string(&json!({
         "isError": true,
         "error": failure,
@@ -2982,6 +3187,10 @@ fn run_tool(
     Err(failure)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Preserve dispatch inputs while adding the caller-owned recording lifecycle"
+)]
 fn run_dispatched_tool(
     root: PathBuf,
     tool_name: &str,
@@ -2990,19 +3199,30 @@ fn run_dispatched_tool(
     render_options: McpRenderOptions,
     diff_snapshot_object_dir: Option<PathBuf>,
     workspace_scaled_limits: bool,
-) -> Result<(), String> {
+    activation_receipt: Option<Arc<ActivationReceipt>>,
+) -> Result<Value, String> {
     let canonical_root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
     let (arguments, overlays) =
         normalize_tool_arguments_for_cli(tool_name, tool_args, &canonical_root)?;
-    let service = create_cli_tool_service(
-        canonical_root,
-        tool_name,
-        &arguments,
-        tool_sources,
-        overlays,
-    )?;
+    let service = match activation_receipt {
+        Some(receipt) => create_cli_tool_service_with_activation_receipt(
+            canonical_root,
+            tool_name,
+            &arguments,
+            tool_sources,
+            overlays,
+            receipt,
+        )?,
+        None => create_cli_tool_service(
+            canonical_root,
+            tool_name,
+            &arguments,
+            tool_sources,
+            overlays,
+        )?,
+    };
     let service = match diff_snapshot_object_dir {
         Some(dir) => service.with_diff_snapshot_object_dir(dir),
         None => service,
@@ -3042,10 +3262,7 @@ fn run_dispatched_tool(
             "isError": false,
         }),
     };
-    let encoded = serde_json::to_string(&result)
-        .map_err(|err| format!("Failed to serialize tool result: {err}"))?;
-    println!("{encoded}");
-    Ok(())
+    Ok(result)
 }
 
 fn print_help(topic: Option<&str>) -> Result<(), String> {
@@ -3116,6 +3333,10 @@ OPTIONS:
                            File path arguments may use <commit-ish>:<path> in --tool mode.
                            Optional; omission supplies {}, which suits get_active_workspace and
                            the default diff-tool worktree comparison.
+    --activation-receipt PATH
+                           Record bounded semantic-model activation evidence for one whole-root
+                           --tool query_code invocation. PATH must be absolute, fresh, and outside
+                           the analyzed root; cannot be combined with sources, overlays, or diff.
     --query-file PATH      Run a workspace-relative .rql or .json CodeQuery directly.
     --workspace-scaled-limits
                            Run --query-file with the source-volume-scaled execution limits
@@ -3174,9 +3395,9 @@ OPTIONS:
                            each finding as new or persisting against it, and fail only on new
                            findings. REV is any revision git rev-parse accepts; pass the pull
                            request's merge base in CI. An unresolvable base is unreliable (exit 2)
-    --diff-scoped          With --diff-base, bind the taint composition's sinks only in the files
-                           the base changed. Findings outside them are not reported, and the run
-                           says it was range-scoped, so an empty result is no claim of absence.
+    --diff-scoped          With --diff-base, bind the taint composition's sinks only in procedures
+                           overlapping a changed hunk. The run names the examined procedure
+                           ranges; an empty result claims nothing about sinks outside them.
                            Requires --diff-base; cannot be combined with --no-incremental
     --no-incremental       Evaluate every policy in full without reading or publishing policy
                            units in this repository's analyzer cache. By default full scans publish

@@ -5,6 +5,7 @@
 //! evidence. All values are query-local; no call assessment is persisted.
 
 use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
 use brokk_bifrost_core::analyzer::structural::callable::{
     ApplicabilityVerdict, CallableRejectionReason,
 };
@@ -57,6 +58,19 @@ pub(crate) enum ConversionKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntrinsicCallType {
+    Boolean,
+    String,
+    Byte,
+    Short,
+    Char,
+    Int,
+    Long,
+    Float,
+    Double,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConversionEvidence {
     pub argument_ordinal: u32,
     pub parameter_ordinal: u32,
@@ -89,6 +103,25 @@ pub(super) struct ResultApplicationRequest<'a> {
 }
 
 impl CandidateAssessment {
+    /// Exact conversion evidence must cover every supplied argument. Unknown
+    /// identities, defaults and expanded varargs cannot close an overload set.
+    pub(super) fn is_exact_match(&self, argument_count: usize) -> bool {
+        self.verdict == ApplicabilityVerdict::Applicable
+            && !self.used_vararg
+            && self.used_defaults == 0
+            && self.conversions.iter().all(|conversion| {
+                conversion.kind == ConversionKind::Exact
+                    && conversion.source_type.is_some()
+                    && conversion.target_type.is_some()
+            })
+            && self
+                .conversions
+                .iter()
+                .filter(|conversion| conversion.argument_ordinal != u32::MAX)
+                .count()
+                == argument_count
+    }
+
     pub fn unknown(candidate: SemanticId) -> Self {
         Self {
             candidate,
@@ -134,6 +167,10 @@ pub(crate) enum TypeInCallPosition {
 }
 
 pub(crate) trait CallApplicabilityAdapter: Sync {
+    fn has_intrinsic_call_type_table(&self) -> bool {
+        false
+    }
+
     fn type_in_call_position(&self) -> TypeInCallPosition {
         TypeInCallPosition::Nothing
     }
@@ -148,6 +185,22 @@ pub(crate) trait CallApplicabilityAdapter: Sync {
         &[]
     }
 
+    fn intrinsic_call_type(
+        &self,
+        _kind: IntrinsicTypeKind,
+        _spelling: &str,
+    ) -> Option<IntrinsicCallType> {
+        None
+    }
+
+    fn intrinsic_call_type_converts(
+        &self,
+        source: IntrinsicCallType,
+        target: IntrinsicCallType,
+    ) -> bool {
+        source == target
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn assess_candidate(
         &self,
@@ -156,16 +209,12 @@ pub(crate) trait CallApplicabilityAdapter: Sync {
         call: &LoweredCallApplicabilityObligation,
         signature: &LoweredCallableSignatureProperty,
         call_inventory_complete: bool,
-        _previous_answers: &AnswerMap,
+        previous_answers: &AnswerMap,
         previous_states: &StateMap,
         completion: &mut ResolutionCompletion,
     ) -> StoreResult<Option<CandidateAssessment>> {
         let mapping = self.map_arguments(call, signature);
-        if !call_inventory_complete
-            || signature.completion() != &ResolutionCompletion::Complete
-            || call.explicit_type_argument_count() != 0
-            || signature.type_parameter_count() != 0
-        {
+        if !call_inventory_complete || signature.completion() != &ResolutionCompletion::Complete {
             return Ok(Some(CandidateAssessment::unknown(candidate)));
         }
         match mapping {
@@ -175,6 +224,18 @@ pub(crate) trait CallApplicabilityAdapter: Sync {
                 used_vararg,
                 result_application_lists,
             } => {
+                let Some(type_substitution) = evaluation.explicit_call_type_substitution(
+                    candidate,
+                    call,
+                    signature,
+                    previous_states,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(type_substitution) = type_substitution else {
+                    return Ok(Some(CandidateAssessment::unknown(candidate)));
+                };
                 let Some(mut assessment) = self.assess_mapped_candidate(
                     evaluation,
                     candidate,
@@ -182,6 +243,8 @@ pub(crate) trait CallApplicabilityAdapter: Sync {
                     signature,
                     &bindings,
                     used_vararg,
+                    &type_substitution,
+                    previous_answers,
                     previous_states,
                     completion,
                 )?
@@ -231,6 +294,8 @@ pub(crate) trait CallApplicabilityAdapter: Sync {
         signature: &LoweredCallableSignatureProperty,
         bindings: &[ArgumentFormalBinding],
         used_vararg: bool,
+        type_substitution: &super::CallTypeSubstitution,
+        _previous_answers: &AnswerMap,
         previous_states: &StateMap,
         completion: &mut ResolutionCompletion,
     ) -> StoreResult<Option<CandidateAssessment>> {
@@ -240,6 +305,7 @@ pub(crate) trait CallApplicabilityAdapter: Sync {
             signature,
             bindings,
             used_vararg,
+            type_substitution,
             previous_states,
             completion,
         )
@@ -286,7 +352,58 @@ pub(crate) trait CallApplicabilityAdapter: Sync {
         evaluation: &mut FactEvaluation<'_, '_>,
         pairs: &[(SemanticId, SemanticId)],
     ) -> StoreResult<Option<CallCandidateApplicability>> {
-        evaluation.classify_java_primitive_pairs(pairs)
+        evaluation.classify_intrinsic_call_pairs(self, pairs)
+    }
+}
+
+impl FactEvaluation<'_, '_> {
+    fn classify_intrinsic_call_pairs<A: CallApplicabilityAdapter + ?Sized>(
+        &mut self,
+        adapter: &A,
+        pairs: &[(SemanticId, SemanticId)],
+    ) -> StoreResult<Option<CallCandidateApplicability>> {
+        if !adapter.has_intrinsic_call_type_table() {
+            return Ok(Some(CallCandidateApplicability::Unresolved));
+        }
+        let identities = pairs
+            .iter()
+            .flat_map(|(source, target)| [*source, *target])
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let Some(intrinsics) = self.session.intrinsic_call_type_descriptors(&identities)? else {
+            return Ok(None);
+        };
+        let mut types = HashMap::default();
+        for intrinsic in intrinsics {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            if let Some(value_type) =
+                adapter.intrinsic_call_type(intrinsic.kind(), intrinsic.spelling())
+            {
+                types.insert(intrinsic.identity(), value_type);
+            }
+        }
+        let applicable = pairs.iter().all(|(source, target)| {
+            types
+                .get(source)
+                .zip(types.get(target))
+                .is_some_and(|(&source, &target)| {
+                    adapter.intrinsic_call_type_converts(source, target)
+                })
+        });
+        if applicable {
+            return Ok(Some(CallCandidateApplicability::ProvenApplicable));
+        }
+        let every_pair_is_intrinsic = pairs
+            .iter()
+            .all(|(source, target)| types.contains_key(source) && types.contains_key(target));
+        Ok(Some(if every_pair_is_intrinsic {
+            CallCandidateApplicability::PrimitiveTypeMismatch
+        } else {
+            CallCandidateApplicability::Unresolved
+        }))
     }
 }
 
@@ -326,18 +443,23 @@ pub(crate) fn map_call_shape(
     if call.argument_lists().is_empty() || signature.parameter_lists().is_empty() {
         return MappingAssessment::Unknown;
     }
-    if call.argument_lists() != signature.parameter_lists() {
+    let Some(mapping) = map_explicit_argument_lists(call.argument_lists(), signature, false) else {
         return MappingAssessment::Inapplicable(CallableRejectionReason::ListShapeMismatch);
+    };
+    if signature.parameter_lists()[mapping.next_parameter_list..]
+        .iter()
+        .any(|list| !signature.contextual_parameter_lists().contains(list))
+    {
+        return MappingAssessment::Unknown;
     }
-
     map_matching_argument_lists(
         call,
         signature,
-        call.argument_lists(),
+        &mapping.mapped_lists,
         allow_defaults,
         allow_labels,
         missing_required_reason,
-        Vec::new(),
+        mapping.result_application_lists,
     )
 }
 
@@ -351,30 +473,69 @@ pub(crate) fn map_scala_call_shape(
     if call.argument_lists().is_empty() {
         return MappingAssessment::Unknown;
     }
-    let matched_count = call
-        .argument_lists()
-        .len()
-        .min(signature.parameter_lists().len());
-    let matched_lists = &call.argument_lists()[..matched_count];
-    if matched_lists != &signature.parameter_lists()[..matched_count] {
+    let Some(mapping) = map_explicit_argument_lists(call.argument_lists(), signature, true) else {
         return MappingAssessment::Inapplicable(CallableRejectionReason::ListShapeMismatch);
-    }
-    let result_application_lists = call.argument_lists()[matched_count..].to_vec();
+    };
     map_matching_argument_lists(
         call,
         signature,
-        matched_lists,
+        &mapping.mapped_lists,
         allow_defaults,
         allow_labels,
         missing_required_reason,
-        result_application_lists,
+        mapping.result_application_lists,
     )
+}
+
+struct ExplicitArgumentListMapping {
+    mapped_lists: Vec<(u32, u32)>,
+    result_application_lists: Vec<u32>,
+    next_parameter_list: usize,
+}
+
+fn map_explicit_argument_lists(
+    call_lists: &[u32],
+    signature: &LoweredCallableSignatureProperty,
+    allow_result_application: bool,
+) -> Option<ExplicitArgumentListMapping> {
+    let formal_lists = signature.parameter_lists();
+    let contextual_lists = signature.contextual_parameter_lists();
+    let mut mapped_lists = Vec::with_capacity(call_lists.len().min(formal_lists.len()));
+    let mut result_application_lists = Vec::new();
+    let mut parameter_list_index = 0;
+    for (call_list_index, &call_list) in call_lists.iter().enumerate() {
+        let mut skipped_contextual = false;
+        while parameter_list_index < formal_lists.len()
+            && contextual_lists.contains(&formal_lists[parameter_list_index])
+            && call_lists.len() - call_list_index < formal_lists.len() - parameter_list_index
+        {
+            parameter_list_index += 1;
+            skipped_contextual = true;
+        }
+        if let Some(&parameter_list) = formal_lists.get(parameter_list_index) {
+            if !skipped_contextual && call_list != parameter_list {
+                return None;
+            }
+            mapped_lists.push((call_list, parameter_list));
+            parameter_list_index += 1;
+        } else if allow_result_application {
+            result_application_lists.push(call_list);
+        } else {
+            return None;
+        }
+    }
+
+    Some(ExplicitArgumentListMapping {
+        mapped_lists,
+        result_application_lists,
+        next_parameter_list: parameter_list_index,
+    })
 }
 
 fn map_matching_argument_lists(
     call: &LoweredCallApplicabilityObligation,
     signature: &LoweredCallableSignatureProperty,
-    matched_lists: &[u32],
+    mapped_lists: &[(u32, u32)],
     allow_defaults: bool,
     allow_labels: bool,
     missing_required_reason: CallableRejectionReason,
@@ -388,17 +549,17 @@ fn map_matching_argument_lists(
     let mut used_defaults = 0_u32;
     let mut used_vararg = false;
 
-    for &list_ordinal in matched_lists {
+    for &(call_list_ordinal, parameter_list_ordinal) in mapped_lists {
         let list_arguments = arguments
             .iter()
             .enumerate()
-            .filter(|(_, argument)| argument.list_ordinal() == list_ordinal)
+            .filter(|(_, argument)| argument.list_ordinal() == call_list_ordinal)
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         let list_parameters = metadata
             .iter()
             .enumerate()
-            .filter(|(_, parameter)| parameter.list_ordinal() == list_ordinal)
+            .filter(|(_, parameter)| parameter.list_ordinal() == parameter_list_ordinal)
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         let repeated = list_parameters

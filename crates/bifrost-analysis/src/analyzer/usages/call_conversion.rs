@@ -2,7 +2,8 @@
 //!
 //! Binding and conversion completeness are separate: matching a formal slot
 //! does not establish its type. This query-local relation consumes the selected
-//! declaration and the shared formal layout. It never selects an overload.
+//! declaration and the shared formal layout. Model overload selection also
+//! requires competing signatures to be proven inapplicable.
 
 use std::sync::Arc;
 
@@ -15,7 +16,10 @@ use crate::analyzer::semantic::{
     LengthDelimitedDigest, StableDigest, TransferKind, TransferOperation, ValuePreservation,
     ValueTransfer,
 };
-use crate::analyzer::semantic_model::{Signature, TypeRef};
+use crate::analyzer::semantic_model::{
+    SemanticModelArgumentBinding, SemanticModelCallApplication, Signature, TypeRef,
+    bind_semantic_model_arguments,
+};
 use crate::analyzer::usages::call_binding::{
     CallBindingKind, CallBindingMapping, CallBindingReport, CallBindingRow,
 };
@@ -173,6 +177,13 @@ impl ExternalConversionIdentity {
     }
 }
 
+/// Complete conversion evidence, a proven rejection, or unresolved applicability.
+pub(crate) enum ModelArgumentApplicability {
+    Applicable(Box<ArgumentTypeConversion>),
+    Inapplicable,
+    Unknown(ConversionUnknown),
+}
+
 /// Language-owned call-argument conversion producer.
 ///
 /// The shared relation owns exact call/signature/actual/formal joins and delegates only
@@ -209,6 +220,23 @@ pub(crate) trait CallArgumentConversionProver: Send + Sync {
         _formal_type: &TypeRef,
     ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
         Err(ConversionUnknown::UnsupportedConversion)
+    }
+
+    /// An unsupported conversion is not a proof that an overload is inapplicable.
+    /// Languages may reject a candidate only from complete conversion rules and
+    /// resolved type identities; the default preserves every failure as unknown.
+    fn model_argument_applicability(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        actual: tree_sitter::Node<'_>,
+        source: &str,
+        formal_type: &TypeRef,
+    ) -> ModelArgumentApplicability {
+        match self.prove_model_argument(analyzer, file, actual, source, formal_type) {
+            Ok(proof) => ModelArgumentApplicability::Applicable(Box::new(proof)),
+            Err(reason) => ModelArgumentApplicability::Unknown(reason),
+        }
     }
 }
 
@@ -360,6 +388,8 @@ pub enum ResolvedConversionType {
     },
 }
 
+/// Bounded, language-specific conversion proofs exposed on call-binding rows.
+/// These categories also contribute to stable conversion operation identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversionKind {
     JavaIdentity,
@@ -368,6 +398,9 @@ pub enum ConversionKind {
     JavaBoxing,
     JavaUnboxing,
     CSharpIdentity,
+    /// The current C# proof is exactly `char -> int32`. Keep the public wire
+    /// label `csharp_implicit_numeric` for that pair only; any other numeric
+    /// pair must use a distinct kind and label.
     CSharpImplicitNumeric,
     TypeScriptIdentity,
     TypeScriptStructuralAssignability,
@@ -905,6 +938,13 @@ impl CallConversionCache {
         caller_source: Option<(&ProjectFile, &str)>,
         candidates: &[(String, Signature)],
     ) -> Result<Option<(String, Signature)>, ConversionUnknown> {
+        let cancellation = analyzer.active_query_cancellation();
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::CancellationToken::is_cancelled)
+        {
+            return Err(ConversionUnknown::Cancelled);
+        }
         let language = language_for_file(&shape.outcome.file);
         let Some(prover) =
             language_support(language).and_then(LanguageSupport::call_argument_conversion_prover)
@@ -926,7 +966,13 @@ impl CallConversionCache {
             }
         };
         let mut written = Vec::new();
-        for (formal_index, argument) in shape.arguments.iter().enumerate() {
+        for argument in &shape.arguments {
+            if cancellation
+                .as_ref()
+                .is_some_and(crate::CancellationToken::is_cancelled)
+            {
+                return Err(ConversionUnknown::Cancelled);
+            }
             if argument.spread || argument.name.is_some() {
                 return Err(ConversionUnknown::AmbiguousBinding);
             }
@@ -941,47 +987,84 @@ impl CallConversionCache {
             if actual.has_error() || actual.is_missing() {
                 return Err(ConversionUnknown::UnsupportedExpression);
             }
-            written.push((formal_index, actual));
+            written.push(actual);
         }
 
         let mut applicable = Vec::new();
         let mut failures = Vec::new();
+        let application = SemanticModelCallApplication::positional(
+            u32::try_from(written.len()).expect("written call arity must fit u32"),
+        );
         for (model_id, signature) in candidates {
-            let mut candidate_ok = true;
-            for (formal_index, actual) in &written {
-                let Some(formal) = signature.parameters.get(*formal_index) else {
-                    failures.push(ConversionUnknown::UnresolvedTargetType);
-                    candidate_ok = false;
-                    break;
-                };
-                if !formal.passing_mode.accepts_positional() || formal.variadic {
-                    failures.push(ConversionUnknown::UnsupportedConversion);
-                    candidate_ok = false;
-                    break;
+            if cancellation
+                .as_ref()
+                .is_some_and(crate::CancellationToken::is_cancelled)
+            {
+                return Err(ConversionUnknown::Cancelled);
+            }
+            let parameter_ordinals = match bind_semantic_model_arguments(signature, &application) {
+                SemanticModelArgumentBinding::Exact { parameter_ordinals } => parameter_ordinals,
+                SemanticModelArgumentBinding::Mismatch => continue,
+                SemanticModelArgumentBinding::PossibleSpread => {
+                    failures.push(ConversionUnknown::AmbiguousBinding);
+                    continue;
                 }
-                if let Err(reason) = prover.prove_model_argument(
+            };
+            let mut rejected = false;
+            let mut unknown = Vec::new();
+            for (actual, formal_index) in written.iter().zip(parameter_ordinals) {
+                if cancellation
+                    .as_ref()
+                    .is_some_and(crate::CancellationToken::is_cancelled)
+                {
+                    return Err(ConversionUnknown::Cancelled);
+                }
+                let formal = &signature.parameters[formal_index];
+                // Variadic conversion requires language-owned expansion semantics.
+                if formal.variadic {
+                    unknown.push(ConversionUnknown::UnsupportedConversion);
+                    continue;
+                }
+                match prover.model_argument_applicability(
                     analyzer,
                     &shape.outcome.file,
                     *actual,
                     &source.source,
                     &formal.r#type,
                 ) {
-                    failures.push(reason);
-                    candidate_ok = false;
-                    break;
+                    ModelArgumentApplicability::Applicable(_proof) => {}
+                    ModelArgumentApplicability::Inapplicable => rejected = true,
+                    ModelArgumentApplicability::Unknown(
+                        reason
+                        @ (ConversionUnknown::Cancelled | ConversionUnknown::BudgetExhausted),
+                    ) => return Err(reason),
+                    ModelArgumentApplicability::Unknown(reason) => unknown.push(reason),
                 }
             }
-            if candidate_ok {
+            if rejected {
+                continue;
+            }
+            if unknown.is_empty() {
                 applicable.push((model_id.clone(), signature.clone()));
+            } else {
+                failures.extend(unknown);
             }
         }
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::CancellationToken::is_cancelled)
+        {
+            return Err(ConversionUnknown::Cancelled);
+        }
         match applicable.as_slice() {
-            [(model_id, signature)] => Ok(Some((model_id.clone(), signature.clone()))),
-            [] if failures.windows(2).all(|pair| pair[0] == pair[1]) && !failures.is_empty() => {
+            [_, _, ..] => Err(ConversionUnknown::AmbiguousBinding),
+            [(model_id, signature)] if failures.is_empty() => {
+                Ok(Some((model_id.clone(), signature.clone())))
+            }
+            _ if failures.windows(2).all(|pair| pair[0] == pair[1]) && !failures.is_empty() => {
                 Err(failures[0])
             }
-            [] => Err(ConversionUnknown::SignatureApplicability),
-            _ => Err(ConversionUnknown::AmbiguousBinding),
+            _ => Err(ConversionUnknown::SignatureApplicability),
         }
     }
 

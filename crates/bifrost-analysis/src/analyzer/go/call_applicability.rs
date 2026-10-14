@@ -1,7 +1,8 @@
 use crate::analyzer::resolution::{
-    AnswerMap, ArgumentFormalBinding, CallApplicabilityAdapter, CandidateAssessment,
-    FactEvaluation, LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty,
-    MappingAssessment, ResolutionCompletion, SemanticId, StateMap, TypeInCallPosition,
+    AnswerMap, ArgumentFormalBinding, CallApplicabilityAdapter, CallTypeSubstitution,
+    CandidateAssessment, FactEvaluation, LoweredCallApplicabilityObligation,
+    LoweredCallableSignatureProperty, MappingAssessment, ResolutionCompletion, SemanticId,
+    StateMap, TypeInCallPosition,
 };
 use crate::analyzer::store::Result;
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
@@ -92,6 +93,8 @@ impl CallApplicabilityAdapter for GoCallApplicabilityAdapter {
         signature: &LoweredCallableSignatureProperty,
         bindings: &[ArgumentFormalBinding],
         used_vararg: bool,
+        type_substitution: &CallTypeSubstitution,
+        previous_answers: &AnswerMap,
         previous_states: &StateMap,
         completion: &mut ResolutionCompletion,
     ) -> Result<Option<CandidateAssessment>> {
@@ -101,6 +104,8 @@ impl CallApplicabilityAdapter for GoCallApplicabilityAdapter {
             signature,
             bindings,
             used_vararg,
+            type_substitution,
+            previous_answers,
             previous_states,
             completion,
         )

@@ -1270,6 +1270,23 @@ pub struct EffectGraphEdge {
     /// The `call_shape` site identity of the call that creates this edge, so a
     /// witness step joins the `call_effect` and `call_shape` domains by id.
     pub site_id: String,
+    /// Source AST identity shared with the independently domain-separated
+    /// dispatch site. Never substitute one operation site id for another.
+    pub site_ast_id: String,
+    /// The exact dispatch arm identity published for this hop.
+    pub target_id: String,
+    /// The canonical modeled identity of an unmaterialized external callee,
+    /// when the resolver supplied one. This metadata does not change the
+    /// dispatch proof or completeness of the edge.
+    pub external_callee_key: Option<ModeledProcedureKey>,
+    /// The exact dispatch proof published for this hop.
+    pub proof: EffectProof,
+    /// The exact completeness bit published for this dispatch arm. This is
+    /// independent of the aggregate coverage of the procedure-effect row.
+    pub dispatch_complete: bool,
+    /// The exact candidate coverage of this call site, before graph-wide
+    /// coverage is propagated.
+    pub site_coverage: EffectCoverage,
     /// Whether dispatch proved this exact edge and nothing else.
     pub certainty: EffectCertainty,
     /// When the callee invocation executes relative to the caller.
@@ -1286,10 +1303,22 @@ pub struct EffectGraph {
 }
 
 /// One retained witness step: the call site that carries the hop.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EffectWitnessStep {
+    pub caller_procedure_id: String,
+    pub callee_procedure_id: String,
     pub site_id: String,
+    pub site_ast_id: String,
+    pub target_id: String,
+    pub proof: EffectProof,
+    pub dispatch_complete: bool,
+    pub site_coverage: EffectCoverage,
+    pub certainty: EffectCertainty,
+    pub execution_timing: ExecutionTiming,
     pub callee_display_name: String,
+    /// Resolver-owned matching key copied from the graph edge; it does not
+    /// strengthen dispatch or identify same-arity parameter-type overloads.
+    pub external_callee_key: Option<ModeledProcedureKey>,
 }
 
 /// One procedure-effect summary row.
@@ -1373,11 +1402,12 @@ struct AttributedEffect {
 impl AttributedEffect {
     /// Merge another attribution of the same effect onto the same procedure.
     ///
-    /// The retained witness is the shallowest chain, and ties break on the
-    /// chain's own site ids, so the answer does not depend on visit order.
-    /// Certainty joins to the best-evidenced chain; timing joins to `Unknown`
-    /// on disagreement, which is what keeps a deferred path from being
-    /// laundered into an immediate claim.
+    /// The retained witness is the shallowest chain, and ties break first on
+    /// the complete site-id sequence and then on canonical hop metadata, so
+    /// the answer does not depend on visit order. Aggregate certainty joins
+    /// to the best-evidenced path and timing joins to `Unknown` on
+    /// disagreement; neither aggregate is copied back onto the retained
+    /// witness.
     fn merge(&mut self, other: Self) -> bool {
         let mut changed = false;
         let certainty = self.certainty.join(other.certainty);
@@ -1410,8 +1440,11 @@ impl AttributedEffect {
     }
 }
 
-fn witness_key(witness: &[EffectWitnessStep]) -> Vec<&str> {
-    witness.iter().map(|step| step.site_id.as_str()).collect()
+fn witness_key(witness: &[EffectWitnessStep]) -> (Vec<&str>, &[EffectWitnessStep]) {
+    (
+        witness.iter().map(|step| step.site_id.as_str()).collect(),
+        witness,
+    )
 }
 
 /// Run the bounded deterministic fixpoint and project one report per procedure.
@@ -1518,7 +1551,17 @@ pub fn summarize_procedure_effects(
                         }
                         let mut witness = Vec::with_capacity(source.witness.len() + 1);
                         witness.push(EffectWitnessStep {
+                            caller_procedure_id: graph.procedures[node].declaration_id.clone(),
+                            callee_procedure_id: graph.procedures[callee].declaration_id.clone(),
                             site_id: edge.site_id.clone(),
+                            site_ast_id: edge.site_ast_id.clone(),
+                            target_id: edge.target_id.clone(),
+                            external_callee_key: edge.external_callee_key.clone(),
+                            proof: edge.proof,
+                            dispatch_complete: edge.dispatch_complete,
+                            site_coverage: edge.site_coverage,
+                            certainty: edge.certainty,
+                            execution_timing: edge.execution_timing,
                             callee_display_name: graph.procedures[callee].display_name.clone(),
                         });
                         witness.extend(source.witness.iter().cloned());
@@ -2123,6 +2166,12 @@ func caller() {
             caller,
             callee,
             site_id: site.to_owned(),
+            site_ast_id: format!("ast:{site}"),
+            target_id: format!("target:{site}"),
+            external_callee_key: None,
+            proof: EffectProof::Proven,
+            dispatch_complete: true,
+            site_coverage: EffectCoverage::Exhaustive,
             certainty: EffectCertainty::Definite,
             execution_timing: ExecutionTiming::SameEvaluation,
         }
@@ -2158,9 +2207,115 @@ func caller() {
             vec!["site.pure", "site.helper"]
         );
         assert_eq!(
+            row.witness
+                .iter()
+                .map(|step| {
+                    (
+                        step.caller_procedure_id.as_str(),
+                        step.callee_procedure_id.as_str(),
+                        step.target_id.as_str(),
+                        step.proof,
+                        step.dispatch_complete,
+                        step.site_coverage,
+                        step.certainty,
+                        step.execution_timing,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "decl:App.pure",
+                    "decl:App.helper",
+                    "target:site.pure",
+                    EffectProof::Proven,
+                    true,
+                    EffectCoverage::Exhaustive,
+                    EffectCertainty::Definite,
+                    ExecutionTiming::SameEvaluation,
+                ),
+                (
+                    "decl:App.helper",
+                    "decl:AcmeHttpClient.send",
+                    "target:site.helper",
+                    EffectProof::Proven,
+                    true,
+                    EffectCoverage::Exhaustive,
+                    EffectCertainty::Definite,
+                    ExecutionTiming::SameEvaluation,
+                ),
+            ]
+        );
+        assert_eq!(
             row.witness_chain().as_deref(),
             Some("App.pure -> App.helper -> AcmeHttpClient.send")
         );
+    }
+
+    #[test]
+    fn a_transitive_external_key_survives_without_changing_quality_or_id_domains() {
+        let external_key = ModeledProcedureKey {
+            language: "java".to_owned(),
+            owner: "com.acme.AcmeHttpClient".to_owned(),
+            member: "send".to_owned(),
+            has_receiver: true,
+            parameter_count: 1,
+        };
+        let mut external_edge = edge(1, 2, "site.external");
+        external_edge.target_id = "dispatch-target:external".to_owned();
+        external_edge.external_callee_key = Some(external_key.clone());
+        external_edge.proof = EffectProof::Unproven;
+        external_edge.dispatch_complete = false;
+        external_edge.site_coverage = EffectCoverage::Open;
+        external_edge.certainty = EffectCertainty::Possible;
+
+        let mut helper = procedure("App.helper", Vec::new());
+        helper.local_gaps.push(EffectReason::DispatchUnresolved);
+        let graph = EffectGraph {
+            procedures: vec![
+                procedure("App.entry", Vec::new()),
+                helper,
+                procedure(
+                    "com.acme.AcmeHttpClient.send",
+                    vec![declared(
+                        "acme.network_io",
+                        ExecutionTiming::SameEvaluation,
+                        EffectCertainty::Definite,
+                    )],
+                ),
+            ],
+            edges: vec![edge(0, 1, "site.source"), external_edge],
+            truncated: false,
+        };
+
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        let row = &reports[0].rows[0];
+        assert_eq!(row.coverage, EffectCoverage::Open);
+        assert_eq!(row.certainty, Some(EffectCertainty::Possible));
+        assert_eq!(row.witness.len(), 2);
+
+        let source_step = &row.witness[0];
+        assert_eq!(source_step.site_id, "site.source");
+        assert_eq!(source_step.site_ast_id, "ast:site.source");
+        assert_eq!(source_step.target_id, "target:site.source");
+        assert_eq!(source_step.external_callee_key, None);
+
+        let external_step = &row.witness[1];
+        assert_eq!(external_step.external_callee_key, Some(external_key));
+        assert_eq!(external_step.caller_procedure_id, "decl:App.helper");
+        assert_eq!(
+            external_step.callee_procedure_id,
+            "decl:com.acme.AcmeHttpClient.send"
+        );
+        assert_eq!(external_step.site_id, "site.external");
+        assert_eq!(external_step.site_ast_id, "ast:site.external");
+        assert_eq!(external_step.target_id, "dispatch-target:external");
+        assert_eq!(external_step.proof, EffectProof::Unproven);
+        assert!(!external_step.dispatch_complete);
+        assert_eq!(external_step.site_coverage, EffectCoverage::Open);
+        assert_eq!(external_step.certainty, EffectCertainty::Possible);
+        assert_ne!(external_step.site_id, external_step.target_id);
+        assert_ne!(external_step.site_ast_id, external_step.target_id);
+        assert_ne!(external_step.callee_procedure_id, external_step.target_id);
     }
 
     #[test]
@@ -2296,9 +2451,16 @@ func caller() {
     fn an_ambiguous_call_edge_downgrades_the_inherited_certainty() {
         let mut ambiguous = edge(0, 1, "site.pure");
         ambiguous.certainty = EffectCertainty::Possible;
+        ambiguous.proof = EffectProof::Unproven;
+        ambiguous.dispatch_complete = false;
+        ambiguous.site_coverage = EffectCoverage::Open;
         let graph = EffectGraph {
             procedures: vec![
-                procedure("App.pure", Vec::new()),
+                {
+                    let mut pure = procedure("App.pure", Vec::new());
+                    pure.local_gaps.push(EffectReason::DispatchUnresolved);
+                    pure
+                },
                 procedure(
                     "AcmeHttpClient.send",
                     vec![declared(
@@ -2315,6 +2477,93 @@ func caller() {
         assert_eq!(
             reports[0].rows[0].certainty,
             Some(EffectCertainty::Possible)
+        );
+        assert_eq!(reports[0].rows[0].coverage, EffectCoverage::Open);
+        let witness = &reports[0].rows[0].witness[0];
+        assert_eq!(witness.proof, EffectProof::Unproven);
+        assert!(!witness.dispatch_complete);
+        assert_eq!(witness.site_coverage, EffectCoverage::Open);
+        assert_eq!(witness.certainty, EffectCertainty::Possible);
+    }
+
+    #[test]
+    fn equal_site_alternatives_have_order_independent_typed_witnesses() {
+        let mut unproven = edge(0, 1, "site.same");
+        unproven.target_id = "target.a".to_owned();
+        unproven.proof = EffectProof::Unproven;
+        unproven.dispatch_complete = false;
+        unproven.site_coverage = EffectCoverage::Open;
+        unproven.certainty = EffectCertainty::Possible;
+        unproven.execution_timing = ExecutionTiming::DeferredCallback;
+
+        let mut proven = edge(0, 1, "site.same");
+        proven.target_id = "target.z".to_owned();
+        proven.proof = EffectProof::Proven;
+        proven.dispatch_complete = true;
+        proven.site_coverage = EffectCoverage::Open;
+        proven.certainty = EffectCertainty::Definite;
+        proven.execution_timing = ExecutionTiming::SameEvaluation;
+
+        let mut pure = procedure("App.pure", Vec::new());
+        pure.local_gaps.push(EffectReason::DispatchUnresolved);
+        let procedures = vec![
+            pure,
+            procedure("App.helper", Vec::new()),
+            procedure(
+                "AcmeHttpClient.send",
+                vec![declared(
+                    "acme.network_io",
+                    ExecutionTiming::SameEvaluation,
+                    EffectCertainty::Definite,
+                )],
+            ),
+        ];
+        let forward = summarize_procedure_effects(
+            &EffectGraph {
+                procedures: procedures.clone(),
+                edges: vec![unproven.clone(), proven.clone(), edge(1, 2, "site.helper")],
+                truncated: false,
+            },
+            ProcedureEffectBudget::default(),
+        );
+        let reversed = summarize_procedure_effects(
+            &EffectGraph {
+                procedures,
+                edges: vec![proven, unproven, edge(1, 2, "site.helper")],
+                truncated: false,
+            },
+            ProcedureEffectBudget::default(),
+        );
+
+        let forward_row = forward[0]
+            .rows
+            .iter()
+            .find(|row| row.effect_id.as_deref() == Some("acme.network_io"))
+            .expect("the complete helper path carries the declared effect");
+        let reversed_row = reversed[0]
+            .rows
+            .iter()
+            .find(|row| row.effect_id.as_deref() == Some("acme.network_io"))
+            .expect("the reversed complete helper path carries the declared effect");
+        assert_eq!(forward_row.witness, reversed_row.witness);
+        assert_eq!(forward_row.certainty, Some(EffectCertainty::Definite));
+        assert_eq!(forward_row.coverage, EffectCoverage::Open);
+        assert_eq!(
+            forward_row.witness[0],
+            EffectWitnessStep {
+                caller_procedure_id: "decl:App.pure".to_owned(),
+                callee_procedure_id: "decl:App.helper".to_owned(),
+                site_id: "site.same".to_owned(),
+                site_ast_id: "ast:site.same".to_owned(),
+                target_id: "target.a".to_owned(),
+                external_callee_key: None,
+                proof: EffectProof::Unproven,
+                dispatch_complete: false,
+                site_coverage: EffectCoverage::Open,
+                certainty: EffectCertainty::Possible,
+                execution_timing: ExecutionTiming::DeferredCallback,
+                callee_display_name: "App.helper".to_owned(),
+            }
         );
     }
 

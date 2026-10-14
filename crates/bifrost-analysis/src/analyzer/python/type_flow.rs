@@ -5483,19 +5483,7 @@ fn python_external_direct_bases_for_record(
             by_id.records
         };
         if records.is_empty() && !relation.to.contains('.') {
-            let module = class
-                .locator_path
-                .as_deref()
-                .and_then(|path| {
-                    super::external::python_module_name_from_relative(std::path::Path::new(path))
-                })
-                .or_else(|| {
-                    class
-                        .qualified_name
-                        .rsplit_once('.')
-                        .map(|(module, _)| module.to_owned())
-                })?;
-            let local_name = format!("{module}.{}", relation.to);
+            let local_name = overlay.ancestry_target_name(class, &relation.to);
             if let Some(ClassIdentity::External { symbol_id, .. }) = external_class_identity(
                 Some(overlay),
                 Language::Python,

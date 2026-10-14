@@ -32,14 +32,13 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionDeclaredTypeArgumentFact, ResolutionDeclaredTypeRelationFact,
     ResolutionDeclaredTypeRelationKind, ResolutionDeferredMemberOwnerFact,
     ResolutionEngineRuleEligibilityFact, ResolutionEngineRuleKind, ResolutionGapFact,
-    ResolutionGapKind, ResolutionGenericFormalFact, ResolutionGoPackageImportFact,
-    ResolutionGoPackageImportKind, ResolutionIdentifierRole, ResolutionMemberAccess,
-    ResolutionMemberKind, ResolutionMemberOwnerFact, ResolutionMemberQualifierCompatibility,
-    ResolutionNameId, ResolutionNamespace, ResolutionPackageMemberFact,
-    ResolutionReferenceOwnerFact, ResolutionRootExportFact, ResolutionRootImportAnchor,
-    ResolutionRootImportDemandTarget, ResolutionRootImportDemandTargetFact,
-    ResolutionRootImportFact, ResolutionRootImportKind, ResolutionRootImportKindFact,
-    ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
+    ResolutionGapKind, ResolutionGoPackageImportFact, ResolutionGoPackageImportKind,
+    ResolutionIdentifierRole, ResolutionMemberAccess, ResolutionMemberKind,
+    ResolutionMemberOwnerFact, ResolutionMemberQualifierCompatibility, ResolutionNameId,
+    ResolutionNamespace, ResolutionPackageMemberFact, ResolutionReferenceOwnerFact,
+    ResolutionRootExportFact, ResolutionRootImportAnchor, ResolutionRootImportDemandTarget,
+    ResolutionRootImportDemandTargetFact, ResolutionRootImportFact, ResolutionRootImportKind,
+    ResolutionRootImportKindFact, ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
     ResolutionRootReferenceSegmentFact, ResolutionScopeFact, ResolutionScopeId,
     ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSiteFact, ResolutionSiteId,
     ResolutionSiteKind, ResolutionSupertypeFact, ResolutionSupertypeKind,
@@ -1777,13 +1776,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                         slot: identity,
                         role: DeclarationTypeRole::Identity,
                     });
-                self.facts
-                    .generic_formals
-                    .push(ResolutionGenericFormalFact {
-                        owner,
-                        ordinal: count,
-                        parameter: declaration,
-                    });
+                self.facts.add_generic_formal(owner, count, declaration);
                 // Navigation can bind the formal, but stage A does not infer
                 // which concrete type this formal represents.
                 self.add_gap(declaration, ResolutionGapKind::UnsupportedExpressionType);
@@ -4005,13 +3998,11 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                         slot: identity,
                         role: DeclarationTypeRole::Identity,
                     });
-                self.facts
-                    .generic_formals
-                    .push(ResolutionGenericFormalFact {
-                        owner: callable.declaration,
-                        ordinal: dense_ordinal(ordinal, "Go receiver formal"),
-                        parameter: declaration,
-                    });
+                self.facts.add_generic_formal(
+                    callable.declaration,
+                    dense_ordinal(ordinal, "Go receiver formal"),
+                    declaration,
+                );
                 self.add_gap(declaration, ResolutionGapKind::UnsupportedExpressionType);
                 identity
             } else {
@@ -5126,6 +5117,40 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 return;
             }
         };
+        self.facts
+            .engine_rule_eligibilities
+            .push(ResolutionEngineRuleEligibilityFact {
+                site: call,
+                rule: ResolutionEngineRuleKind::ArgumentIndependentBinding,
+            });
+        if function.is_some_and(|function| go_node_text(function, self.source).trim() == "new")
+            && let Some(type_node) = node
+                .child_by_field_name("arguments")
+                .and_then(first_named_child)
+                .filter(|argument| self.go_builtin_type_argument(node, *argument))
+        {
+            // new(T) is &T{} without a literal body. Keep the construction
+            // and address-of transfers identical to composite literal lowering.
+            let syntax = self.lower_type(type_node);
+            let value = self.add_slot(call, ResolutionTypeSlotRole::ExpressionValue);
+            self.add_transfer(
+                syntax.input,
+                value,
+                ResolutionTypeTransferKind::Construction,
+                syntax.indirection_delta,
+                ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+            );
+            let result = self.add_call_result(call, callee, receiver, explicit_type_argument_count);
+            self.add_transfer(
+                value,
+                result,
+                ResolutionTypeTransferKind::AddressOf,
+                1,
+                ResolutionTypeTransferValueTransform::RuntimeOnly,
+            );
+            self.finish_call_arguments(node, call, result);
+            return;
+        }
         // This gap belongs to invocation semantics. Go's argument-independent
         // name binding can select the callee without it; any result type still
         // comes from selected callable signature facts.
@@ -5139,12 +5164,6 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         if let Some(arguments) = explicit_type_arguments {
             self.attach_call_type_arguments(call, arguments);
         }
-        self.facts
-            .engine_rule_eligibilities
-            .push(ResolutionEngineRuleEligibilityFact {
-                site: call,
-                rule: ResolutionEngineRuleKind::ArgumentIndependentBinding,
-            });
         self.finish_call_arguments(node, call, result);
     }
 
@@ -7219,6 +7238,9 @@ func namedResult() (result string) {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2771: builtin new(T) omitted the construction and pointer result facts used by receiver queries"
+    )]
     fn conversions_and_builtin_type_operands_lower_type_positions() {
         let source = r#"package p
 type Value struct{}
@@ -7226,6 +7248,7 @@ func exercise(value Value, input string, size int, values, more []int) {
     _ = []byte(input)
     _ = make([]Value, size)
     _ = new(Value)
+    _ = &Value{}
     _ = append(values, more...)
 }
 "#;
@@ -7320,6 +7343,44 @@ func exercise(value Value, input string, size int, values, more []int) {
         };
         assert_eq!(call_argument_count(named_call("make")), 1);
         assert_eq!(call_argument_count(named_call("new")), 0);
+        let allocation = facts
+            .calls
+            .iter()
+            .find(|call| {
+                let site = &facts.sites[call.call.index()];
+                site.start_byte == named_call("new").start_byte()
+            })
+            .expect("builtin new has a call result");
+        let allocation_address = transfer_to(&facts, allocation.result);
+        let literal_address = facts
+            .type_transfers
+            .iter()
+            .find(|transfer| {
+                transfer.kind == ResolutionTypeTransferKind::AddressOf
+                    && transfer.output != allocation.result
+            })
+            .expect("address-of literal transfer");
+        for (allocation_transfer, literal_transfer) in [
+            (allocation_address, *literal_address),
+            (
+                transfer_to(&facts, allocation_address.input),
+                transfer_to(&facts, literal_address.input),
+            ),
+        ] {
+            assert_eq!(allocation_transfer.kind, literal_transfer.kind);
+            assert_eq!(
+                allocation_transfer.indirection_delta,
+                literal_transfer.indirection_delta
+            );
+            assert_eq!(
+                allocation_transfer.reference_indirection_delta,
+                literal_transfer.reference_indirection_delta
+            );
+            assert_eq!(
+                allocation_transfer.value_transform,
+                literal_transfer.value_transform
+            );
+        }
         let mut conversions = Vec::new();
         let mut pending = vec![tree.root_node()];
         while let Some(node) = pending.pop() {

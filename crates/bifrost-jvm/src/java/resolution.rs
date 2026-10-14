@@ -2308,7 +2308,11 @@ impl<'source> JavaResolutionBuilder<'source> {
                         target_reference: Some(reference),
                         target: Some(bound_slot),
                     });
-                self.add_transfer(bound_slot, identity, ResolutionTypeTransferKind::TypeUnion);
+                crate::call_arguments::publish_jvm_type_union_transfer(
+                    &mut self.facts,
+                    bound_slot,
+                    identity,
+                );
             }
         }
     }

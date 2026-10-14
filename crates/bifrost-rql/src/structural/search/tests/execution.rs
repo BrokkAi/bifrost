@@ -496,6 +496,7 @@ fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
             .expect("immutable workspace configuration"),
         &[DependencyPackEcosystem::Jvm],
         DependencyPackWorkspaceContext {
+            activation_receipt: None,
             catalog: &catalog,
             persistence: None,
             activation: &SemanticModelActivationRequest {

@@ -116,6 +116,26 @@ hydration, and the pattern is then checked against the canonical structural
 unit. Re-labeling matches selected only by provisional names would lose exact
 canonical searches and make the census/scan/search round trip inconsistent.
 
+### JavaScript and TypeScript local declarations
+
+In JavaScript and TypeScript, one declaration is one binding scope plus one
+name and kind. Sites that share all three, such as TypeScript overload
+signatures with their implementation, an ambient declaration with its
+implementation, merged interface or namespace declarations, and repeated `var`
+declarations in one function, are several sites of one declaration. Sites
+whose binding scopes differ are different declarations, even when their
+rendered names match.
+
+A local object created in a function, such as `const options = { ... }`, owns
+its properties, so their identities are scoped to that binding: the enclosing
+indexed declaration's name, one segment for each enclosing anonymous function
+or block that binds the object, and then the local name. `let` and `const`
+bind to their block; `var` binds to the function, so `var` sites in separate
+blocks stay one declaration. A function's own body adds no segment.
+Properties assigned through a parameter or through a local that holds an
+object from elsewhere keep a file-scoped name, because that object can be
+shared with other functions.
+
 ### Module and package source anchors
 
 A source-declared module uses its declaration item as its primary range.
@@ -226,6 +246,19 @@ outermost `__init__.py` package convention remains in effect; namespace paths
 without such a package retain their workspace-relative components. Import
 resolution and workspace-boundary checks use these same indexed identities.
 They do not search for matching suffixes or add alternate module names.
+
+### Aliases
+
+Definition navigation answers with what the selected token binds. A C or C++
+`typedef` or `using` alias name therefore navigates to the alias declaration,
+not to the type the alias names. Type lookup (`get_type_by_location`),
+receiver typing, and member lookup follow the alias to that type. An alias
+template applied to arguments, such as `Node<Item>`, is the exception: it
+navigates to the class specialization its arguments select. An alias
+redefined in the branches of one `#if`/`#elif`/`#else` chain is one
+declaration, so navigation answers with one branch rather than an ambiguity.
+When identical aliases are copied into several headers, navigation selects the
+copy the reference can reach through its include closure.
 
 ### Hierarchy and members
 

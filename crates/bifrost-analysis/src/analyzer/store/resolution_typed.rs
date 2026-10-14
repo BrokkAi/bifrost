@@ -956,6 +956,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         self.selection.has_jvm_semantics()
     }
 
+    fn external_callable_result_type_identities(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(SemanticId, SemanticId)>>> {
+        SelectedResolutionTypedSource::external_callable_result_type_identities(
+            self,
+            definitions,
+            cancellation,
+        )
+    }
+
     fn fragment_type_qualifiers_search_companion_members(
         &self,
         fragment: BindingFragmentId,
@@ -3200,13 +3212,105 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         else {
             return cancelled();
         };
-        self.visit_typed_rows(
-            &mounts,
-            super::resolution_operation::rust_crate_access::REASON_OWNERS_SQL,
-            cancellation,
-            visitor,
-            |context, row| Ok((context.semantic(row.get(0)?), context.semantic(row.get(1)?))),
-        )
+        let sql = super::resolution_operation::rust_crate_access::REASON_OWNERS_SQL;
+        for (ordinal, keys) in mounts {
+            let mount = &*self.mount(ordinal)?;
+            let blob_id = mount.blob_id();
+            let misses = {
+                let memo = self.selection.authority_request_memo().borrow();
+                keys.iter()
+                    .copied()
+                    .filter(|key| !memo.rust_reason_owners.contains_key(&(blob_id, *key)))
+                    .collect::<Vec<_>>()
+            };
+            #[cfg(all(test, debug_assertions))]
+            let had_hits = misses.len() < keys.len();
+            if !misses.is_empty() {
+                let missing_mounts = [(ordinal, misses)];
+                let mut rows = Vec::<(i64, i64)>::new();
+                let outcome = self.visit_typed_rows(
+                    &missing_mounts,
+                    sql,
+                    cancellation,
+                    &mut TypedFactPageVisitor::new(&mut |page| {
+                        rows.extend_from_slice(page);
+                        Ok(true)
+                    }),
+                    |_, row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                if outcome.is_cancelled() || cancellation.is_cancelled() {
+                    return cancelled();
+                }
+                assert!(outcome.is_exhausted(), "the collecting visitor never stops");
+                let mut memo = self.selection.authority_request_memo().borrow_mut();
+                for key in &missing_mounts[0].1 {
+                    memo.rust_reason_owners.insert((blob_id, *key), None);
+                }
+                for (reason, owner) in rows {
+                    let previous = memo
+                        .rust_reason_owners
+                        .insert((blob_id, reason), Some(owner));
+                    assert_eq!(previous, Some(None), "a reason has one declaration owner");
+                }
+            }
+            let mut raw_rows = {
+                let memo = self.selection.authority_request_memo().borrow();
+                keys.iter()
+                    .filter_map(|key| {
+                        memo.rust_reason_owners[&(blob_id, *key)].map(|owner| (*key, owner))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            raw_rows.sort_unstable();
+            // Test builds verify reuse against the publication, including negative
+            // hits. Production never issues this extra read.
+            #[cfg(all(test, debug_assertions))]
+            if had_hits {
+                let mut fresh_rows = Vec::<(i64, i64)>::new();
+                let outcome = self.visit_typed_rows(
+                    &[(ordinal, keys)],
+                    sql,
+                    cancellation,
+                    &mut TypedFactPageVisitor::new(&mut |page| {
+                        fresh_rows.extend_from_slice(page);
+                        Ok(true)
+                    }),
+                    |_, row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                if outcome.is_cancelled() || cancellation.is_cancelled() {
+                    return cancelled();
+                }
+                debug_assert_eq!(raw_rows, fresh_rows);
+            }
+            let names = self
+                .selection
+                .shared_name_table()
+                .interner(self.selection.connection());
+            let context = TypedRowContext {
+                fragment: mount.fragment_id(),
+                ordinal: ordinal.get(),
+                language: mount.semantic_language(),
+                names: &names,
+            };
+            let rows = raw_rows
+                .into_iter()
+                .map(|(reason, owner)| (context.semantic(reason), context.semantic(owner)))
+                .collect::<Vec<_>>();
+            match Self::page_out(&rows, cancellation, visitor)? {
+                PageOutcome::Exhausted => {}
+                PageOutcome::Stopped => {
+                    return Ok(TypedFactReadOutcome::stopped(
+                        ResolutionCompletion::Complete,
+                    ));
+                }
+                PageOutcome::Cancelled => return cancelled(),
+            }
+        }
+        Ok(if cancellation.is_cancelled() {
+            TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete)
+        } else {
+            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+        })
     }
 }
 
@@ -3386,15 +3490,17 @@ fn decode_member_owner(
     context: TypedRowContext,
     row: &Row<'_>,
 ) -> StoreResult<SelectedTypedRow<LoweredMemberOwnerProperty>> {
-    let kind: String = row.get(3)?;
-    let access: String = row.get(4)?;
-    let compatibility: String = row.get(5)?;
+    let member_name: String = row.get(3)?;
+    let kind: String = row.get(4)?;
+    let access: String = row.get(5)?;
+    let compatibility: String = row.get(6)?;
     Ok(SelectedTypedRow::new(
         context.fragment,
         typed_rows::decode_member_owner_fields(
             context.semantic(row.get(0)?),
             context.semantic(row.get(1)?),
             context.node(row.get(2)?),
+            &member_name,
             &kind,
             &access,
             &compatibility,
@@ -3855,6 +3961,7 @@ impl TypedRowEvidence for SelectedTypedRow<LoweredIntrinsicSeed> {
 
 impl TypedRowEvidence for SelectedGapReasonProvenance {}
 impl TypedRowEvidence for (SemanticId, SemanticId) {}
+impl TypedRowEvidence for (i64, i64) {}
 
 impl TypedRowEvidence for SelectedTypeFrontierCompletion {
     fn include_evidence(&self, evidence: &mut PolledCompletionAccumulator<'_>) {
@@ -3920,6 +4027,121 @@ mod row_evidence_tests {
     use brokk_bifrost_core::analyzer::resolution_facts::{
         IntrinsicTypeKind, ResolutionTypeSlotRole,
     };
+
+    #[test]
+    fn rust_reason_owner_memo_rebases_shared_blob_and_preserves_terminals() {
+        use super::super::resolution_selection::tests::SelectionFixture;
+        let fixture = SelectionFixture::shared_rust_source(
+            2,
+            "pub trait Service { fn run<T>(&self, value: T); } fn main() { missing(); }",
+        );
+        let selection = fixture.open_ready(&[]);
+        let (blob, reasons, expected) = {
+            let connection = selection.connection();
+            let blob: i64 = connection
+                .query_row(
+                    "SELECT blob_id FROM temp.selected_resolution_mounts WHERE mount_ordinal=0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let reasons = connection
+                .prepare(
+                    "SELECT gap.reason, authority.semantic_key FROM resolution_gap_reasons gap
+                 LEFT JOIN resolution_sites site ON site.blob_id=gap.blob_id
+                   AND site.site=gap.site AND site.role=1
+                 LEFT JOIN resolution_rust_declaration_authorities authority
+                   ON authority.blob_id=site.blob_id AND authority.source_site=site.site
+                 WHERE gap.blob_id=?1 ORDER BY gap.reason",
+                )
+                .unwrap()
+                .query_map([blob], |row| {
+                    Ok((row.get::<_, u32>(0)?, row.get::<_, Option<u32>>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                reasons.iter().any(|(_, owner)| owner.is_some()),
+                "{reasons:?}"
+            );
+            assert!(
+                reasons.iter().any(|(_, owner)| owner.is_none()),
+                "{reasons:?}"
+            );
+            let expected = reasons
+                .iter()
+                .filter_map(|(reason, owner)| owner.map(|owner| (*reason, owner)))
+                .collect::<Vec<_>>();
+            (blob, reasons, expected)
+        };
+        let source = SelectedResolutionTypedSource::new_on_demand(&selection);
+        let read = |ordinal, cancellation: &CancellationToken, keep_going| {
+            let requested = reasons
+                .iter()
+                .map(|(reason, _)| SemanticId::local(ordinal, *reason))
+                .collect::<Vec<_>>();
+            let mut pages = Vec::new();
+            let outcome = source
+                .visit_rust_reason_owners(
+                    TypedFactRequest::new(&requested),
+                    cancellation,
+                    &mut TypedFactPageVisitor::with_maximum_rows(
+                        &mut |page| {
+                            pages.push(page.to_vec());
+                            Ok(keep_going)
+                        },
+                        1,
+                    ),
+                )
+                .unwrap();
+            (outcome, pages)
+        };
+        let live = CancellationToken::new();
+        for ordinal in [0, 1, 0] {
+            let (outcome, pages) = read(ordinal, &live, true);
+            assert!(outcome.is_exhausted());
+            assert_eq!(
+                pages.into_iter().flatten().collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|(reason, owner)| {
+                        (
+                            SemanticId::local(ordinal, *reason),
+                            SemanticId::local(ordinal, *owner),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            );
+            let memo = selection.authority_request_memo().borrow();
+            assert_eq!(memo.rust_reason_owners.len(), reasons.len());
+            for (reason, owner) in &reasons {
+                assert_eq!(
+                    memo.rust_reason_owners[&(blob, i64::from(*reason))],
+                    owner.map(i64::from)
+                );
+            }
+        }
+        let (outcome, pages) = read(1, &live, false);
+        assert_eq!(
+            outcome.terminal(),
+            crate::analyzer::resolution::TypedFactReadTerminal::Stopped
+        );
+        assert_eq!(pages.len(), 1);
+        let (outcome, pages) = read(0, &CancellationToken::cancel_after_checks_for_test(0), true);
+        assert!(outcome.is_cancelled());
+        assert!(pages.is_empty());
+        drop(source);
+        drop(selection);
+        let fresh_selection = fixture.open_ready(&[]);
+        assert!(
+            fresh_selection
+                .authority_request_memo()
+                .borrow()
+                .rust_reason_owners
+                .is_empty()
+        );
+    }
 
     #[test]
     fn selected_hierarchy_terminals_preserve_mounts_and_cancellation() {

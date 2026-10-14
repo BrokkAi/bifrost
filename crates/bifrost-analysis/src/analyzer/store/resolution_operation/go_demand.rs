@@ -495,7 +495,66 @@ impl DemandLanguage for GoDemandLanguage<'_, '_, '_> {
             return Ok(LanguageRootDiscovery::Cancelled(cancelled_completion()));
         }
         if endpoint.node() != BindingNodeId::universal_root() {
-            return Ok(LanguageRootDiscovery::AlreadyReady {
+            // A foreign file's default import names belong to its selected
+            // package context. Its lexical file-scope endpoint must admit
+            // that context before a prefix can be answered in this request.
+            let Some(ordinal) = endpoint.node().ordinal() else {
+                return Ok(LanguageRootDiscovery::AlreadyReady {
+                    completion: ResolutionCompletion::Complete,
+                });
+            };
+            let mount = SelectedResolutionMountOrdinal::new(ordinal);
+            if mount == self.caller
+                || self.base_context_mounts.contains(&mount)
+                || self.remote_root_expansion == GoRemoteRootExpansion::CallerContextOnly
+                || self.arena.borrow().endpoints.contains_key(endpoint)
+            {
+                return Ok(LanguageRootDiscovery::AlreadyReady {
+                    completion: ResolutionCompletion::Complete,
+                });
+            }
+            let record = self.operation.mount_table().mount_by_ordinal(mount)?;
+            if record.semantic_language() != Language::Go {
+                return Ok(LanguageRootDiscovery::AlreadyReady {
+                    completion: ResolutionCompletion::Complete,
+                });
+            }
+            let local_key = endpoint
+                .node()
+                .local_key()
+                .expect("a mounted file scope has a local key");
+            let imports: bool = self.operation.ready.inventory.connection().query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM temp.selected_resolution_mounts mounted
+                   JOIN main.resolution_go_package_imports imports ON imports.blob_id=mounted.blob_id
+                   WHERE mounted.mount_ordinal=?1 AND imports.file_scope_key=?2 AND imports.kind='named'
+                   UNION ALL
+                   SELECT 1 FROM temp.selected_resolution_stage_go_package_imports
+                   WHERE host_ordinal=?1 AND file_scope_key=?3 AND kind='named')",
+                rusqlite::params![ordinal, local_key, crate::analyzer::store::resolution_stage::codec::encode_node(endpoint.node())], |row| row.get(0),
+            )?;
+            let Some(symbol) = endpoint.symbols().fixed().first().filter(|_| imports) else {
+                return Ok(LanguageRootDiscovery::AlreadyReady {
+                    completion: ResolutionCompletion::Complete,
+                });
+            };
+            let source_role = self.source_role_for_mount(mount)?;
+            if source_role.is_none() {
+                return Ok(LanguageRootDiscovery::Unavailable {
+                    reason: DemandRootUnavailableReason::IncompletePreparation,
+                    completion: ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(symbol.symbol()),
+                    ]),
+                });
+            }
+            return Ok(LanguageRootDiscovery::Ready {
+                question: GoSourceDemand {
+                    mount,
+                    root_semantic: symbol.symbol(),
+                    source_role,
+                    qualified: None,
+                    prefix_answer: None,
+                },
                 completion: ResolutionCompletion::Complete,
             });
         }

@@ -396,7 +396,8 @@ pub use call_sites::call_signature_context;
 pub(crate) use call_sites::{
     CallSiteSyntax, ExactCallReference, ExactCallReferenceGap, call_reference_ranges_in_tree,
     call_reference_requires_point_lookup, call_site_syntax_for_reference,
-    exact_call_reference_for_call, is_call_reference_range_in_tree, range_is_call_keyword_label,
+    exact_call_reference_for_call, exact_call_reference_for_reverse_site,
+    is_call_reference_range_in_tree, range_is_call_keyword_label,
 };
 pub(crate) use cpp::{
     CppBoundedLocalBindingIndex, cpp_bounded_local_binding_index,
@@ -2596,7 +2597,7 @@ pub fn is_adjudicated_answer_diagnostic_kind(kind: &str) -> bool {
 
 fn with_definition_batch_context<T>(
     analyzer: &dyn IAnalyzer,
-    resolve: impl for<'a> FnOnce(&'a dyn IAnalyzer, &mut DefinitionBatchContext<'a>) -> T,
+    resolve: impl for<'a> FnOnce(&'a dyn IAnalyzer, &mut DefinitionBatchContext<'a, '_>) -> T,
 ) -> T {
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token());
@@ -2639,7 +2640,7 @@ pub(crate) fn resolve_navigation_batch(
 fn resolve_navigation_requests<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
-    context: &mut DefinitionBatchContext<'a>,
+    context: &mut DefinitionBatchContext<'a, '_>,
     requests: Vec<DefinitionLookupRequest>,
     operation: NavigationOperation,
     cancellation: Option<&CancellationToken>,
@@ -2692,7 +2693,7 @@ fn resolve_navigation_requests<'a>(
 fn resolve_definition_requests<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
-    context: &mut DefinitionBatchContext<'a>,
+    context: &mut DefinitionBatchContext<'a, '_>,
     requests: Vec<DefinitionLookupRequest>,
     cancellation: Option<&CancellationToken>,
     operation: Option<NavigationOperation>,
@@ -2722,7 +2723,7 @@ fn resolve_definition_requests<'a>(
 /// every request names its speculative keys here before it resolves.
 fn record_definition_batch_probe_reads(
     analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext<'_>,
+    context: &mut DefinitionBatchContext<'_, '_>,
     requests: &[DefinitionLookupRequest],
 ) {
     if !analyzer.read_ledger_attached() {
@@ -2876,13 +2877,19 @@ fn record_definition_probe_reads(
     }
 }
 
-struct RustDefinitionBatchOperation<'analyzer, 'factory> {
+struct RustDefinitionBatchOperation<'analyzer, 'factory, 'selection, 'borrow> {
     factory:
         &'factory crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'analyzer>,
     operation: Option<
         crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
             'analyzer,
-            'factory,
+            'selection,
+        >,
+    >,
+    borrowed_operation: Option<
+        &'borrow mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
+            'analyzer,
+            'selection,
         >,
     >,
     reuse_disabled: bool,
@@ -2890,17 +2897,24 @@ struct RustDefinitionBatchOperation<'analyzer, 'factory> {
     precomputed_index: usize,
 }
 
-impl<'analyzer, 'factory> RustDefinitionBatchOperation<'analyzer, 'factory> {
+impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
+    RustDefinitionBatchOperation<'analyzer, 'factory, 'selection, 'borrow>
+{
     fn resolver_parts<'operation>(
         &'operation mut self,
     ) -> (
         Option<&'factory crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'analyzer>>,
-        Option<&'operation mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, 'factory>>,
+        Option<&'operation mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, 'selection>>,
     ){
         if self.reuse_disabled {
             (None, None)
         } else {
-            (Some(self.factory), self.operation.as_mut())
+            (
+                Some(self.factory),
+                self.borrowed_operation
+                    .as_deref_mut()
+                    .or(self.operation.as_mut()),
+            )
         }
     }
 
@@ -2921,7 +2935,7 @@ impl<'analyzer, 'factory> RustDefinitionBatchOperation<'analyzer, 'factory> {
         if self.reuse_disabled {
             return;
         }
-        if self.operation.is_none() {
+        if self.operation.is_none() && self.borrowed_operation.is_none() {
             match self.factory.open(cancellation) {
                 Ok(
                     crate::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome::Ready(
@@ -2960,8 +2974,9 @@ impl<'analyzer, 'factory> RustDefinitionBatchOperation<'analyzer, 'factory> {
             }
         }
         let results = self.factory.resolve_many(
-            self.operation
-                .as_mut()
+            self.borrowed_operation
+                .as_deref_mut()
+                .or(self.operation.as_mut())
                 .expect("ready Rust batch operation is retained"),
             &queries,
             cancellation,
@@ -2980,6 +2995,7 @@ impl<'analyzer, 'factory> RustDefinitionBatchOperation<'analyzer, 'factory> {
             )
         }) {
             self.operation.take();
+            self.borrowed_operation.take();
             self.reuse_disabled = true;
         }
     }
@@ -3005,7 +3021,7 @@ impl<'analyzer, 'factory> RustDefinitionBatchOperation<'analyzer, 'factory> {
         if self.reuse_disabled {
             return crate::analyzer::rust::native_points::resolve_rust_definition_bounded(query);
         }
-        if self.operation.is_none() {
+        if self.operation.is_none() && self.borrowed_operation.is_none() {
             let cancellation = query.cancellation.cloned().unwrap_or_default();
             let opened = self.factory.open(&cancellation);
             match opened {
@@ -3024,8 +3040,9 @@ impl<'analyzer, 'factory> RustDefinitionBatchOperation<'analyzer, 'factory> {
             }
         }
         let result = self.factory.resolve(
-            self.operation
-                .as_mut()
+            self.borrowed_operation
+                .as_deref_mut()
+                .or(self.operation.as_mut())
                 .expect("ready Rust batch operation is retained"),
             query,
         );
@@ -3037,18 +3054,19 @@ impl<'analyzer, 'factory> RustDefinitionBatchOperation<'analyzer, 'factory> {
                 })
         ) {
             self.operation.take();
+            self.borrowed_operation.take();
             self.reuse_disabled = true;
         }
         result
     }
 }
 
-fn precompute_rust_call_target_batch(
+fn precompute_rust_call_target_batch<'analyzer: 'selection, 'selection>(
     analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext<'_>,
+    context: &mut DefinitionBatchContext<'_, '_>,
     requests: &[DefinitionLookupRequest],
     cancellation: Option<&CancellationToken>,
-    batch: &mut RustDefinitionBatchOperation<'_, '_>,
+    batch: &mut RustDefinitionBatchOperation<'analyzer, '_, 'selection, '_>,
 ) {
     let Some(first) = requests.first() else {
         return;
@@ -3118,7 +3136,7 @@ fn precompute_rust_call_target_batch(
 fn resolve_definition_resolutions<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
-    context: &mut DefinitionBatchContext<'a>,
+    context: &mut DefinitionBatchContext<'a, '_>,
     requests: Vec<DefinitionLookupRequest>,
     cancellation: Option<&CancellationToken>,
     operation: Option<NavigationOperation>,
@@ -3160,6 +3178,7 @@ fn resolve_definition_resolutions<'a>(
             .map(|factory| RustDefinitionBatchOperation {
                 factory,
                 operation: None,
+                borrowed_operation: None,
                 reuse_disabled: false,
                 precomputed: Vec::new(),
                 precomputed_index: 0,
@@ -3254,12 +3273,12 @@ pub fn resolve_definition_batch_with_source(
     resolve_definition_requests(analyzer, token, &mut context, requests, None, None)
 }
 
-fn definition_batch_context_with_source<'a>(
+fn definition_batch_context_with_source<'a, 'token>(
     analyzer: &'a dyn IAnalyzer,
-    token: QueryToken<'a>,
+    token: QueryToken<'token>,
     file: ProjectFile,
     source: Arc<str>,
-) -> DefinitionBatchContext<'a> {
+) -> DefinitionBatchContext<'a, 'token> {
     let mut context = DefinitionBatchContext::new(analyzer, token);
     context.sources.insert(file, Ok(source));
     context
@@ -3949,18 +3968,75 @@ pub fn resolve_call_target_batch_with_source(
         )
     })
     .flatten();
-    let mut rust_definition_batch =
+    let rust_definition_batch =
         rust_operation_factory
             .as_ref()
             .map(|factory| RustDefinitionBatchOperation {
                 factory,
                 operation: None,
+                borrowed_operation: None,
                 reuse_disabled: false,
                 precomputed: Vec::new(),
                 precomputed_index: 0,
             });
+    resolve_call_target_requests(
+        analyzer,
+        token,
+        &mut context,
+        requests,
+        cancellation,
+        rust_definition_batch,
+    )
+}
+
+/// Resolve native call targets on an already captured worker operation.
+/// The returned vocabulary contains no semantic artifact or relation handles.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_call_target_batch_in_operation<'a: 'selection, 'selection>(
+    analyzer: &'a dyn IAnalyzer,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<str>,
+    cancellation: &CancellationToken,
+    factory: &crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'a>,
+    operation: &mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
+        'a,
+        'selection,
+    >,
+) -> Vec<CallTargetLookupOutcome> {
+    let _timing = profiling::scope("get_definition::resolve_call_target_batch");
+    let scope = AnalyzerQueryScope::with_cancellation(analyzer, cancellation);
+    let mut context = DefinitionBatchContext::new(analyzer, scope.token());
+    context.sources.insert(file, Ok(source));
+    record_definition_batch_probe_reads(analyzer, &mut context, &requests);
+    let batch = RustDefinitionBatchOperation {
+        factory,
+        operation: None,
+        borrowed_operation: Some(operation),
+        reuse_disabled: false,
+        precomputed: Vec::new(),
+        precomputed_index: 0,
+    };
+    resolve_call_target_requests(
+        analyzer,
+        scope.token(),
+        &mut context,
+        requests,
+        Some(cancellation),
+        Some(batch),
+    )
+}
+
+fn resolve_call_target_requests<'a: 'selection, 'selection>(
+    analyzer: &'a dyn IAnalyzer,
+    token: QueryToken<'_>,
+    context: &mut DefinitionBatchContext<'a, '_>,
+    requests: Vec<DefinitionLookupRequest>,
+    cancellation: Option<&CancellationToken>,
+    mut rust_definition_batch: Option<RustDefinitionBatchOperation<'a, '_, 'selection, '_>>,
+) -> Vec<CallTargetLookupOutcome> {
     if let Some(batch) = rust_definition_batch.as_mut() {
-        precompute_rust_call_target_batch(analyzer, &mut context, &requests, cancellation, batch);
+        precompute_rust_call_target_batch(analyzer, context, &requests, cancellation, batch);
     }
     requests
         .into_iter()
@@ -3973,7 +4049,7 @@ pub fn resolve_call_target_batch_with_source(
             CallTargetLookupOutcome::from_resolution(resolve_one_with_evidence(
                 analyzer,
                 token,
-                &mut context,
+                context,
                 request,
                 None,
                 cancellation,
@@ -4048,11 +4124,11 @@ pub(super) struct ScalaDefinitionContext {
     pub(super) imports: Arc<Vec<ImportInfo>>,
 }
 
-struct DefinitionBatchContext<'a> {
+struct DefinitionBatchContext<'a: 'token, 'token> {
     analyzer: &'a dyn IAnalyzer,
     /// Proof that the batch's request scope is open for the batch's whole life
     /// (issue #2414 step 3).
-    token: QueryToken<'a>,
+    token: QueryToken<'token>,
     bounded_support: AnalyzerDefinitionLookup<'a>,
     js_ts_contexts: HashMap<(ProjectFile, Language), JsTsDefinitionContext>,
     go_contexts: HashMap<ProjectFile, GoDefinitionContext>,
@@ -4065,7 +4141,7 @@ struct DefinitionBatchContext<'a> {
     // Covers visibility construction as well as candidate lookup. Incomplete
     // inputs stay visible after a nested or concurrent cancelling scope closes.
     cpp_read_scope: AnalyzerQueryScope<'a>,
-    cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex<'a>>>,
+    cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex<'token>>>,
     cpp_live_sources_seeded: bool,
     cpp_structural_alias_paths: HashMap<CodeUnit, Vec<String>>,
     cpp_class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
@@ -4082,8 +4158,8 @@ struct DefinitionBatchContext<'a> {
     cpp_class_range_builds: usize,
 }
 
-impl<'a> DefinitionBatchContext<'a> {
-    fn new(analyzer: &'a dyn IAnalyzer, token: QueryToken<'a>) -> Self {
+impl<'a: 'token, 'token> DefinitionBatchContext<'a, 'token> {
+    fn new(analyzer: &'a dyn IAnalyzer, token: QueryToken<'token>) -> Self {
         Self {
             analyzer,
             token,
@@ -4248,7 +4324,7 @@ impl<'a> DefinitionBatchContext<'a> {
         cpp: &'a crate::analyzer::CppAnalyzer,
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
-    ) -> Arc<CppVisibilityIndex<'a>> {
+    ) -> Arc<CppVisibilityIndex<'token>> {
         let token = self.token;
         let dispatch = CppDispatch::new(analyzer, token);
         if !self.cpp_live_sources_seeded {
@@ -4378,7 +4454,7 @@ impl<'a> DefinitionBatchContext<'a> {
 /// without probing. A second spelling of this in either place would record a
 /// name the resolver never asked for and, worse, miss the one it did.
 fn focused_reference_site(
-    context: &mut DefinitionBatchContext<'_>,
+    context: &mut DefinitionBatchContext<'_, '_>,
     request: &DefinitionLookupRequest,
     language: Language,
     source: &str,
@@ -4413,7 +4489,7 @@ fn focused_reference_site(
 fn resolve_one<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
-    context: &mut DefinitionBatchContext<'a>,
+    context: &mut DefinitionBatchContext<'a, '_>,
     request: DefinitionLookupRequest,
     operation: Option<NavigationOperation>,
     cancellation: Option<&CancellationToken>,
@@ -4432,15 +4508,17 @@ fn resolve_one<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_one_with_evidence<'a, 'batch, 'factory>(
+fn resolve_one_with_evidence<'a: 'selection, 'batch, 'factory, 'selection, 'borrow>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
-    context: &mut DefinitionBatchContext<'a>,
+    context: &mut DefinitionBatchContext<'a, '_>,
     request: DefinitionLookupRequest,
     operation: Option<NavigationOperation>,
     cancellation: Option<&CancellationToken>,
     go_session: Option<&ResolutionSession>,
-    mut rust_definition_batch: Option<&'batch mut RustDefinitionBatchOperation<'a, 'factory>>,
+    mut rust_definition_batch: Option<
+        &'batch mut RustDefinitionBatchOperation<'a, 'factory, 'selection, 'borrow>,
+    >,
 ) -> DefinitionResolution {
     let _scope = profiling::scope("get_definition::resolve_one");
     context.navigation_operation = operation;
@@ -5488,7 +5566,7 @@ fn finalize_navigation_outcome(
 fn navigation_lookup_outcome(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
-    context: &mut DefinitionBatchContext<'_>,
+    context: &mut DefinitionBatchContext<'_, '_>,
     reference_file: &ProjectFile,
     resolution: DefinitionResolution,
     language: Language,

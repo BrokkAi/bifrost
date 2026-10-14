@@ -39,17 +39,18 @@ use crate::analyzer::semantic::{
     CallableTargetResolution, CallerReceiverBinding, CandidateCoverage, CaptureBinding,
     CaptureSource, ControlEdgeKind, DeclarationSegmentKind, DispatchCandidate,
     EvidenceCompleteness, EvidenceHandle, FormalMultiplicity, HeapOracle, ImplicitArgumentKind,
-    IndexSelector, MemoryLocationId, MemoryLocationKind, MemoryValueCopy, ObjectCardinality,
-    OracleCallContext, OracleCandidate, OracleLimits, OracleRelationArena, OracleRelationHandle,
-    OracleRelationId, OracleRelationKind, OracleRelationOwner, OracleRelationRecord,
-    ProcedureCallBoundary, ProcedureHandle, ProcedureKind, ProcedurePortHandle, ProcedurePortKind,
-    ProcedureReceiverBinding, ProgramPointHandle, ProgramPointId, ProofStatus,
-    ScopedSemanticLocator, SemanticCapability, SemanticEffect, SemanticGapDischarge, SemanticGapId,
-    SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
-    SynchronizationPayload, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle, ValueFlowRelation,
-    ValueFlowRelationKind, ValueFlowSnapshot, ValueHandle, ValueId, ValueTransfer,
-    assignment_transfer, constructor_call_result, gap_certifies_canonical_index_identity,
+    IndexSelector, MemoryLocationId, MemoryLocationKind, MemoryRelationOrigin, MemoryRelationRole,
+    MemoryValueCopy, ObjectCardinality, OracleCallContext, OracleCandidate, OracleLimits,
+    OracleRelationArena, OracleRelationHandle, OracleRelationId, OracleRelationKind,
+    OracleRelationOwner, OracleRelationRecord, ProcedureCallBoundary, ProcedureHandle,
+    ProcedureKind, ProcedurePortHandle, ProcedurePortKind, ProcedureReceiverBinding,
+    ProgramPointHandle, ProgramPointId, ProofStatus, ScopedSemanticLocator, SemanticCapability,
+    SemanticEffect, SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapKind,
+    SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest,
+    SemanticValueKind, SemanticWork, SynchronizationPayload, ValueFlowEndpoint, ValueFlowKind,
+    ValueFlowOracle, ValueFlowRelation, ValueFlowRelationKind, ValueFlowRelationPayload,
+    ValueFlowSnapshot, ValueHandle, ValueId, ValueTransfer, assignment_transfer,
+    constructor_call_result, gap_certifies_canonical_index_identity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,17 +106,9 @@ fn merge_gap_quality(
 
 #[derive(Clone)]
 struct FlowRelationDraft {
-    point: ProgramPointHandle,
-    event_index: u32,
-    kind: ValueFlowRelationKind,
-    transfer: Option<ValueTransfer>,
-    source: ValueFlowEndpoint,
-    target: ValueFlowEndpoint,
-    proof: ProofStatus,
-    completeness: EvidenceCompleteness,
+    payload: ValueFlowRelationPayload,
+    memory_origin: Option<MemoryRelationOrigin>,
     evidence: Vec<EvidenceHandle>,
-    strong_update: bool,
-    direct_cell_overwrite: bool,
 }
 
 /// A direct lexical store replaces one activation-local slot even when a
@@ -3172,13 +3165,19 @@ fn materialize_flow_snapshot(
     let records = drafts
         .iter()
         .map(|draft| {
-            OracleRelationRecord::new(
+            let record = OracleRelationRecord::new(
                 OracleRelationKind::ValueFlow,
                 draft.evidence.clone(),
                 limits,
-            )
+            )?;
+            Ok(match draft.memory_origin {
+                Some(origin) => {
+                    record.with_memory_origin(origin, draft.payload.memory_seal(&origin, context))
+                }
+                None => record,
+            })
         })
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<Result<Vec<_>, crate::analyzer::semantic::OracleContractError>>()
         .map_err(|error| internal_contract("could not create value-flow provenance", error))?;
     let arena = OracleRelationArena::new(
         OracleRelationOwner::ProcedureValueFlow {
@@ -3196,20 +3195,19 @@ fn materialize_flow_snapshot(
             let id = u32::try_from(index)
                 .map(OracleRelationId::new)
                 .map_err(|_| SemanticProviderError::internal("value-flow relation ID overflow"))?;
-            Ok(ValueFlowRelation {
-                point: draft.point,
-                event_index: draft.event_index,
-                id: arena
-                    .handle(id)
-                    .expect("value-flow record was inserted into the arena"),
-                kind: draft.kind,
-                transfer: draft.transfer,
-                source: draft.source,
-                target: draft.target,
-                proof: draft.proof,
-                completeness: draft.completeness,
-                strong_update: draft.strong_update,
-                direct_cell_overwrite: draft.direct_cell_overwrite,
+            let id = arena
+                .handle(id)
+                .expect("value-flow record was inserted into the arena");
+            Ok(match draft.memory_origin {
+                Some(_) => {
+                    let seal = id
+                        .record()
+                        .memory_origin_binding()
+                        .expect("the trusted draft attested its memory origin")
+                        .seal();
+                    ValueFlowRelation::sealed(id, draft.payload, seal)
+                }
+                None => ValueFlowRelation::unsealed(id, draft.payload),
             })
         })
         .collect::<Result<Vec<_>, SemanticProviderError>>()?;
@@ -5210,6 +5208,7 @@ pub(crate) fn project_procedure_relations(
             /// #2446 handler binding is.
             struct DerivedRelation {
                 kind: ValueFlowRelationKind,
+                memory_role: Option<MemoryRelationRole>,
                 source: ValueFlowEndpoint,
                 target: ValueFlowEndpoint,
                 quality: Option<(ProofStatus, EvidenceCompleteness)>,
@@ -5249,6 +5248,7 @@ pub(crate) fn project_procedure_relations(
                     let target = ValueFlowEndpoint::Value(value_handle(procedure, *target)?);
                     smashed.push(DerivedRelation {
                         kind: ValueFlowRelationKind::Assignment,
+                        memory_role: None,
                         source: ValueFlowEndpoint::Location(Box::new(allocation_location)),
                         target: target.clone(),
                         quality: Some((
@@ -5396,6 +5396,7 @@ pub(crate) fn project_procedure_relations(
                     if let Some(base) = indexed_base_value(procedure, *memory)? {
                         smashed.push(DerivedRelation {
                             kind: ValueFlowRelationKind::MemoryLoad,
+                            memory_role: Some(MemoryRelationRole::Supplemental),
                             source: ValueFlowEndpoint::Value(base),
                             target: loaded.clone(),
                             quality: None,
@@ -5404,6 +5405,7 @@ pub(crate) fn project_procedure_relations(
                     if let Some(container) = indexed_container_endpoint(&location, limits)? {
                         smashed.push(DerivedRelation {
                             kind: ValueFlowRelationKind::MemoryLoad,
+                            memory_role: Some(MemoryRelationRole::Supplemental),
                             source: container,
                             target: loaded.clone(),
                             quality: None,
@@ -5419,6 +5421,7 @@ pub(crate) fn project_procedure_relations(
                     {
                         smashed.push(DerivedRelation {
                             kind: ValueFlowRelationKind::MemoryLoad,
+                            memory_role: Some(MemoryRelationRole::Supplemental),
                             source: cell,
                             target: loaded.clone(),
                             quality: None,
@@ -5429,6 +5432,7 @@ pub(crate) fn project_procedure_relations(
                             materialize_abstract_location(procedure, alternative, limits)?;
                         smashed.push(DerivedRelation {
                             kind: ValueFlowRelationKind::MemoryLoad,
+                            memory_role: Some(MemoryRelationRole::Alternative),
                             source: ValueFlowEndpoint::Location(Box::new(alternative)),
                             target: loaded.clone(),
                             quality: None,
@@ -5477,6 +5481,7 @@ pub(crate) fn project_procedure_relations(
                         )?;
                         smashed.push(DerivedRelation {
                             kind: ValueFlowRelationKind::MemoryStore,
+                            memory_role: Some(MemoryRelationRole::Alternative),
                             source: stored.clone(),
                             target: ValueFlowEndpoint::Location(Box::new(target)),
                             quality: Some((
@@ -5496,6 +5501,7 @@ pub(crate) fn project_procedure_relations(
                     if let Some(cell) = wildcard_index_endpoint(&location, limits)? {
                         smashed.push(DerivedRelation {
                             kind: ValueFlowRelationKind::MemoryStore,
+                            memory_role: Some(MemoryRelationRole::Supplemental),
                             source: stored.clone(),
                             target: cell,
                             quality: None,
@@ -5511,6 +5517,7 @@ pub(crate) fn project_procedure_relations(
                     {
                         smashed.push(DerivedRelation {
                             kind: ValueFlowRelationKind::MemoryStore,
+                            memory_role: Some(MemoryRelationRole::Supplemental),
                             source: stored.clone(),
                             target: container,
                             quality: None,
@@ -5521,6 +5528,7 @@ pub(crate) fn project_procedure_relations(
                             materialize_abstract_location(procedure, alternative, limits)?;
                         smashed.push(DerivedRelation {
                             kind: ValueFlowRelationKind::MemoryStore,
+                            memory_role: Some(MemoryRelationRole::Alternative),
                             source: stored.clone(),
                             target: ValueFlowEndpoint::Location(Box::new(alternative)),
                             quality: None,
@@ -5576,6 +5584,7 @@ pub(crate) fn project_procedure_relations(
                     for binder in handler_bindings.alternatives_for(point.id) {
                         smashed.push(DerivedRelation {
                             kind: ValueFlowRelationKind::HandlerBinding,
+                            memory_role: None,
                             source: ValueFlowEndpoint::Value(value_handle(procedure, *value)?),
                             target: ValueFlowEndpoint::Value(value_handle(procedure, *binder)?),
                             quality: Some((
@@ -5714,18 +5723,34 @@ pub(crate) fn project_procedure_relations(
             } else {
                 false
             };
+            let memory_location = match event.effect {
+                SemanticEffect::MemoryLoad { location, .. }
+                | SemanticEffect::MemoryStore { location, .. } => Some(location),
+                _ => None,
+            };
+            let memory_origin = memory_location.map(|location| {
+                MemoryRelationOrigin::new(
+                    point.id,
+                    relation_event,
+                    location,
+                    MemoryRelationRole::Canonical,
+                )
+            });
             let draft = FlowRelationDraft {
-                point: relation_point.clone(),
-                event_index: relation_event,
-                kind,
-                transfer,
-                source,
-                target,
-                proof: proof.clone(),
-                completeness: completeness.clone(),
+                payload: ValueFlowRelationPayload {
+                    point: relation_point.clone(),
+                    event_index: relation_event,
+                    kind,
+                    transfer,
+                    source,
+                    target,
+                    proof: proof.clone(),
+                    completeness: completeness.clone(),
+                    strong_update,
+                    direct_cell_overwrite,
+                },
+                memory_origin,
                 evidence: vec![evidence.clone()],
-                strong_update,
-                direct_cell_overwrite,
             };
             if !push_flow_relation(&mut drafts, &mut retained_evidence, limits, draft) {
                 truncated = true;
@@ -5741,25 +5766,31 @@ pub(crate) fn project_procedure_relations(
                     .unwrap_or_else(|| (proof.clone(), completeness.clone()));
                 container_elements.observe(&derived.source, &derived_proof, &derived_completeness);
                 container_elements.observe(&derived.target, &derived_proof, &derived_completeness);
+                let memory_origin = derived.memory_role.map(|role| {
+                    MemoryRelationOrigin::new(
+                        point.id,
+                        relation_event,
+                        memory_location.expect("a derived memory dependency rides a memory event"),
+                        role,
+                    )
+                });
                 let draft = FlowRelationDraft {
-                    point: relation_point.clone(),
-                    event_index: relation_event,
-                    kind: derived.kind,
-                    transfer: None,
-                    source: derived.source,
-                    target: derived.target,
-                    proof: derived_proof,
-                    completeness: derived_completeness,
+                    payload: ValueFlowRelationPayload {
+                        point: relation_point.clone(),
+                        event_index: relation_event,
+                        kind: derived.kind,
+                        transfer: None,
+                        source: derived.source,
+                        target: derived.target,
+                        proof: derived_proof,
+                        completeness: derived_completeness,
+                        // Supplemental summaries and alternative candidates join;
+                        // none inherits the direct store's overwrite authority.
+                        strong_update: false,
+                        direct_cell_overwrite: false,
+                    },
+                    memory_origin,
                     evidence: vec![evidence.clone()],
-                    // No derived relation replaces what its target holds.
-                    // A smashed container cell is a summary of many
-                    // elements by construction, so no store into it can
-                    // replace what another store put there (#2453), and a
-                    // handler binding the analysis did not prove is
-                    // selected must join with whatever else reaches the
-                    // binding (#2446).
-                    strong_update: false,
-                    direct_cell_overwrite: false,
                 };
                 if !push_flow_relation(&mut drafts, &mut retained_evidence, limits, draft) {
                     truncated = true;
@@ -5954,20 +5985,36 @@ pub(crate) fn project_procedure_relations(
                         ValueFlowEndpoint::Value(value_handle(procedure, read.value)?),
                     )
                 };
+                let event = &procedure
+                    .semantics()
+                    .point(read.point.id())
+                    .expect("container read names a validated point")
+                    .events[read.event_index as usize];
+                let memory_origin = match event.effect {
+                    SemanticEffect::MemoryLoad { location, .. } => Some(MemoryRelationOrigin::new(
+                        read.point.id(),
+                        read.event_index,
+                        location,
+                        MemoryRelationRole::Supplemental,
+                    )),
+                    _ => None,
+                };
                 let draft = FlowRelationDraft {
-                    point: read.point.clone(),
-                    event_index: read.event_index,
-                    kind,
-                    transfer: None,
-                    source: ValueFlowEndpoint::Location(Box::new(element.location.clone())),
-                    target,
-                    proof,
-                    completeness,
+                    payload: ValueFlowRelationPayload {
+                        point: read.point.clone(),
+                        event_index: read.event_index,
+                        kind,
+                        transfer: None,
+                        source: ValueFlowEndpoint::Location(Box::new(element.location.clone())),
+                        target,
+                        proof,
+                        completeness,
+                        // Reading a member never overwrites it.
+                        strong_update: false,
+                        direct_cell_overwrite: false,
+                    },
+                    memory_origin,
                     evidence: vec![read.evidence.clone()],
-                    // Reading or returning a member copies its current
-                    // contents; it never replaces the source member.
-                    strong_update: false,
-                    direct_cell_overwrite: false,
                 };
                 if !push_flow_relation(&mut drafts, &mut retained_evidence, limits, draft) {
                     truncated = true;
@@ -5978,8 +6025,8 @@ pub(crate) fn project_procedure_relations(
     }
 
     let has_unproven_relation = drafts.iter().any(|draft| {
-        !matches!(draft.proof, ProofStatus::Proven)
-            || !matches!(draft.completeness, EvidenceCompleteness::Complete)
+        !matches!(draft.payload.proof, ProofStatus::Proven)
+            || !matches!(draft.payload.completeness, EvidenceCompleteness::Complete)
     });
     let coverage = if truncated {
         CandidateCoverage::Truncated

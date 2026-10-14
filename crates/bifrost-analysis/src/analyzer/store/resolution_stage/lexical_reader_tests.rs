@@ -2177,6 +2177,14 @@ fn generated_include_boundary_classifies_only_with_scoped_catalog_authority() {
                 ),
                 &original,
                 BindingNodeKind::Definition(definition),
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-path-content:v1",
+                    &[]
+                ),
+                brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                    b"test-generated-scope-content:v1",
+                    &[]
+                ),
                 &cancellation,
             )
             .unwrap(),

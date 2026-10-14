@@ -40,6 +40,10 @@ pub use callable_materialization::{
     GoMaterializedAnonymousCallable, materialize_go_anonymous_callable,
 };
 
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
 const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v92";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);

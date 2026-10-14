@@ -50,15 +50,17 @@ pub fn parse_javascript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
         program_scoped_field_identity
     };
     let mut module_has_imports = false;
+    let lexical_bindings = crate::syntax::JsTsLexicalBindingIndex::build(root, source);
     let exported_roots = js_exported_binding_roots(root, source);
     let mut assignment_state = JsAssignmentDeclarationState::new(
         js_commonjs_exported_roots(root, source),
         js_commonjs_exported_members(root, source),
     );
-    crate::primary::parse_primary(
+    crate::primary::parse_primary_with_lexical_bindings(
         source,
         tree,
         &crate::structural::JAVASCRIPT_STRUCTURAL_SPEC,
+        lexical_bindings,
         |parsed, event| {
             if blocked {
                 return;
@@ -138,14 +140,18 @@ pub fn parse_javascript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
                         // Local literal keys have the same lookup-only surface as
                         // properties established by local member assignments.
                         // Do not publish the local binding as a global declaration.
-                        let name = node_text(name, source);
+                        let binding_name = name;
+                        let name = node_text(binding_name, source);
+                        let fq = parsed
+                            .local_binding_fq(child, binding_name, name)
+                            .expect("local object literal binder has an indexed binding scope");
+                        let short_name = fq.display_native(file.language(), segment_interner());
                         let owner = CodeUnit::new_fq(
                             file.clone(),
                             brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
                             "",
-                            name,
-                            FqName::new()
-                                .with_pushed(segment_interner().intern(name, SegmentKind::Member)),
+                            short_name,
+                            fq,
                         );
                         visit_js_object_literal_properties_for_surface(
                             file,
@@ -765,13 +771,8 @@ fn visit_js_object_literal_properties_for_surface(
                 .fq()
                 .clone()
                 .with_pushed(segment_interner().intern(&name, SegmentKind::Member));
-            let code_unit = CodeUnit::new_fq(
-                file.clone(),
-                kind,
-                "",
-                format!("{}.{}", parent.short_name(), name),
-                fq,
-            );
+            let short_name = fq.display_native(file.language(), segment_interner());
+            let code_unit = CodeUnit::new_fq(file.clone(), kind, "", short_name, fq);
             match surface {
                 JsAssignmentSymbolSurface::Declaration => {
                     parsed.add_code_unit(
@@ -1141,7 +1142,12 @@ fn js_parameter_label_node(parameter: Node<'_>) -> Option<Node<'_>> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JsAssignmentBindingKind {
+    /// A parameter or a local whose value comes from elsewhere. The object it
+    /// holds can outlive the scope, so its members keep a file-scoped name.
     PlainLocal,
+    /// A local declarator initialized with an object literal. The object is
+    /// created in this scope, so its members are scoped to the binding (#3864).
+    LocalObject,
     DeclarationRoot,
 }
 
@@ -1253,6 +1259,12 @@ impl JsAssignmentDeclarationState {
                 })
         {
             JsAssignmentBindingKind::DeclarationRoot
+        } else if declarator
+            .child_by_field_name("value")
+            .and_then(crate::syntax::js_ts_object_literal_value)
+            .is_some()
+        {
+            JsAssignmentBindingKind::LocalObject
         } else {
             JsAssignmentBindingKind::PlainLocal
         }
@@ -1428,7 +1440,7 @@ fn visit_js_assignment_expression(
                 surface: JsAssignmentSymbolSurface::Declaration,
             }
         })
-        .or_else(|| js_member_assignment_target(left, source, state))
+        .or_else(|| js_member_assignment_target(left, source, state, parsed))
     else {
         return;
     };
@@ -1437,7 +1449,10 @@ fn visit_js_assignment_expression(
     } else {
         brokk_bifrost_core::analyzer::model::CodeUnitType::Field
     };
-    let code_unit = CodeUnit::new_fq(file.clone(), kind, "", target.name, target.fq);
+    let short_name = target
+        .fq
+        .display_native(file.language(), segment_interner());
+    let code_unit = CodeUnit::new_fq(file.clone(), kind, "", short_name, target.fq);
     add_js_assignment_code_unit(parsed, target.surface, code_unit.clone(), node, source);
     let (signature, parameter_text) = js_assignment_signature(node, left, value, source);
     if let Some(value) = value.filter(|_| value_is_function) {
@@ -1516,7 +1531,8 @@ fn js_commonjs_export_assignment_property(node: Node<'_>, source: &str) -> Optio
         .trim_matches('\'')
         .to_string();
 
-    if node_text(object, source).trim() == "exports" || js_is_module_exports_object(object, source)
+    if object.kind() == "identifier" && trimmed_identifier_text(object, source) == Some("exports")
+        || js_is_module_exports_object(object, source)
     {
         return Some(property_name);
     }
@@ -1528,6 +1544,7 @@ fn js_member_assignment_target(
     node: Node<'_>,
     source: &str,
     state: &JsAssignmentDeclarationState,
+    parsed: &JsTsParsedFile<'_>,
 ) -> Option<JsMemberAssignmentTarget> {
     if node.kind() != "member_expression" {
         return None;
@@ -1553,12 +1570,19 @@ fn js_member_assignment_target(
     let (object_name, object_fq) = match object.kind() {
         "identifier" | "property_identifier" => {
             let object_name = node_text(object, source).trim().to_string();
-            let object_fq = FqName::new()
-                .with_pushed(segment_interner().intern(&object_name, SegmentKind::Member));
+            let object_fq =
+                if state.binding_of(&object_name) == Some(JsAssignmentBindingKind::LocalObject) {
+                    parsed
+                        .local_binding_fq(object, object, &object_name)
+                        .expect("local assignment receiver has an indexed binding scope")
+                } else {
+                    FqName::new()
+                        .with_pushed(segment_interner().intern(&object_name, SegmentKind::Member))
+                };
             (object_name, object_fq)
         }
         "member_expression" => {
-            let nested = js_member_assignment_target(object, source, state)?;
+            let nested = js_member_assignment_target(object, source, state, parsed)?;
             (nested.name, nested.fq)
         }
         _ => return None,
@@ -1590,7 +1614,10 @@ fn js_member_assignment_has_plain_local_root(
     let Some(root) = js_member_expression_root_identifier(node, source) else {
         return false;
     };
-    state.binding_of(root) == Some(JsAssignmentBindingKind::PlainLocal)
+    matches!(
+        state.binding_of(root),
+        Some(JsAssignmentBindingKind::PlainLocal | JsAssignmentBindingKind::LocalObject)
+    )
 }
 
 fn js_member_expression_root_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -1671,20 +1698,31 @@ fn js_commonjs_exported_root_identifier<'a>(node: Node<'_>, source: &'a str) -> 
 }
 
 fn js_is_commonjs_root_export_assignment_target(node: Node<'_>, source: &str) -> bool {
-    let text = node_text(node, source).trim();
-    text == "exports" || text == "module.exports"
+    (node.kind() == "identifier" && trimmed_identifier_text(node, source) == Some("exports"))
+        || js_is_module_exports_object(node, source)
 }
 
 fn js_is_commonjs_root_or_property_export_assignment_target(node: Node<'_>, source: &str) -> bool {
     js_is_commonjs_root_export_assignment_target(node, source)
-        || js_commonjs_export_assignment_property(node, source).is_some()
+        || js_commonjs_root_identifier_node(node, source).is_some()
 }
 
 fn js_is_commonjs_export_assignment_target(node: Node<'_>, source: &str) -> bool {
-    let text = node_text(node, source).trim();
-    js_is_commonjs_root_export_assignment_target(node, source)
-        || text.starts_with("module.exports.")
-        || text.starts_with("exports.")
+    js_commonjs_root_identifier_node(node, source).is_some()
+}
+
+fn js_commonjs_root_identifier_node<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    match node.kind() {
+        "identifier" => (trimmed_identifier_text(node, source) == Some("exports")).then_some(node),
+        "member_expression" => {
+            if js_is_module_exports_object(node, source) {
+                return node.child_by_field_name("object");
+            }
+            node.child_by_field_name("object")
+                .and_then(|object| js_commonjs_root_identifier_node(object, source))
+        }
+        _ => None,
+    }
 }
 
 fn js_is_module_exports_object(node: Node<'_>, source: &str) -> bool {
@@ -1697,7 +1735,10 @@ fn js_is_module_exports_object(node: Node<'_>, source: &str) -> bool {
     let Some(property) = node.child_by_field_name("property") else {
         return false;
     };
-    node_text(object, source).trim() == "module" && node_text(property, source).trim() == "exports"
+    object.kind() == "identifier"
+        && property.kind() == "property_identifier"
+        && trimmed_identifier_text(object, source) == Some("module")
+        && trimmed_identifier_text(property, source) == Some("exports")
 }
 
 fn js_assignment_signature(

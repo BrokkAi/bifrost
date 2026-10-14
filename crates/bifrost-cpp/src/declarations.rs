@@ -4858,7 +4858,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                     );
                     self.capture_source_dependencies(&mut fact, node, unit);
                     fact.occurrence_role =
-                        crate::identity::cpp_occurrence_role_for_node(node, unit);
+                        crate::identity::cpp_occurrence_role_for_node(node, self.source, unit);
                     fact.conditional_family = family;
                     fact.guard_requirements = guard_requirements;
                     fact.callable_guards = callable_guards;
@@ -4963,7 +4963,8 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                 ancestry,
             );
             self.capture_source_dependencies(&mut fact, node, unit);
-            fact.occurrence_role = crate::identity::cpp_occurrence_role_for_node(node, unit);
+            fact.occurrence_role =
+                crate::identity::cpp_occurrence_role_for_node(node, self.source, unit);
             fact.conditional_family = family;
             fact.guard_requirements = guard_requirements;
             fact.callable_guards = callable_guards;
@@ -12144,7 +12145,7 @@ fn fragmented_parenthesized_typedef_type(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("type")
 }
 
-fn extract_typedef_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn extract_typedef_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
     match node.kind() {
         "identifier" | "field_identifier" | "type_identifier" => {
             direct_identifier_name(node, source)

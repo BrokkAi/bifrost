@@ -9,13 +9,18 @@ projection and its commit history does not contain every source commit.
 
 ### Added
 
+- Python uninitialized-local analysis tracks correlated guards, local deletion,
+  and proven exception handlers, reporting the first unsafe read on a path
+  while keeping unresolved call effects incomplete.
+
 - RQL exposes cross-language callable size, nesting, and complexity metrics.
   Cleanup-flow queries can identify when JavaScript `finally` or Ruby `ensure`
   overrides pending control flow; unsupported or incomplete paths stay open.
 
 - Rust taint policies compose stored per-procedure flow evidence and support
   diff-scoped runs through the CLI and MCP, retaining explicit analysis scope
-  and incomplete-boundary reporting.
+  and incomplete-boundary reporting. Changed-hunk runs limit sink selection
+  to overlapping procedures and report the examined procedure locations.
 
 - Complete, accepted semantic summaries now let taint analysis report definite
   findings; stale, missing, conflicting, or partial model evidence remains
@@ -47,6 +52,9 @@ projection and its commit history does not contain every source commit.
 - Python queries and policies expose more precise receiver, member, iterator,
   type-guard, import, and annotation evidence while keeping shadowed or
   ambiguous cases incomplete.
+
+- Python flow analysis keeps constructor results uncertain when imports or
+  nested class identities can be shadowed, avoiding unsupported type claims.
 
 - PHP import queries now follow supported literal and `__DIR__` `include` and
   `require` paths; dynamic targets remain incomplete.
@@ -115,6 +123,33 @@ projection and its commit history does not contain every source commit.
 
 - Rust reverse usages enumerate each target candidate set once per request,
   retaining generation checks and explicit macro frontier gaps.
+
+- Python member analysis no longer treats incomplete inherited-member evidence
+  as proof of absence, avoiding false findings for standard-library members
+  while preserving uncertainty for unresolved ancestry.
+
+- Analyzer cache upgrades stage one copy at a time and clean up abandoned
+  upgrade copies, preventing concurrent or interrupted upgrades from accumulating
+  large temporary stores.
+
+- C/C++ definition lookup respects split language-linkage guards, so C callers
+  do not select an inactive C++ overload from a shared header.
+
+- Policy reports retain valid requested policies as typed `not_run` outcomes
+  when their qualified locators cannot bind, rather than dropping them from
+  reports; explicit requests remain unreliable until the missing evidence is
+  available.
+
+- Rust analysis preserves importer and re-export routes through incremental
+  summary refreshes and correctly refreshes reached detached crates after edits.
+
+- Rust destructor analysis uses proven declaration-level `Copy` and `Drop`
+  evidence inside unsafe code without treating unsafe ownership transfers as
+  proven; unknown types remain incomplete.
+
+- Taint policies distinguish provably absent operands from missing analysis
+  evidence, retaining advisory diagnostics without making otherwise complete
+  runs inconclusive.
 
 - Semantic-pack startup treats a stale or foreign cached manifest index as a
   cache miss rather than aborting, while preserving corrupt-cache integrity

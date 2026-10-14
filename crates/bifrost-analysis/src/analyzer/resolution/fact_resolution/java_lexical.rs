@@ -304,7 +304,10 @@ impl JavaLexicalReplay {
         if lookups.is_empty() {
             return Ok(None);
         }
-        let current_type = if gaps.is_empty() {
+        // Traversal and applicability placeholders do not change the enclosing
+        // template's nominal identity. Infer it from declaration ownership even
+        // while those later phases are pending.
+        let mut current_type = {
             // This replay has the reference seed, but it does not add it to the
             // evaluation's root or qualified-seed metadata cache.
             let Some(Some(reference_owner)) = metadata.reference_owner() else {
@@ -334,9 +337,17 @@ impl JavaLexicalReplay {
             } else {
                 Some(owners[0].get(evaluation.session).row().owner_definition())
             }
-        } else {
-            None
         };
+        if let Some(owner) = current_type
+            && provenance.iter().any(|gap| {
+                gap.origin()
+                    == LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedScopeOrBinder)
+                    && super::super::fact_lowering::site_semantic(gap.fragment(), gap.source_site())
+                        == owner
+            })
+        {
+            current_type = None;
+        }
         let current_type_is_jvm = if let Some(current_type) = current_type {
             let Some(jvm_declarations) = evaluation
                 .session
@@ -354,6 +365,9 @@ impl JavaLexicalReplay {
         };
         if gaps.is_empty() && !current_type_is_jvm {
             return Ok(None);
+        }
+        if !current_type_is_jvm {
+            current_type = None;
         }
         if lookups.len() != 1
             && (!matches!(
@@ -1019,11 +1033,20 @@ impl FactEvaluation<'_, '_> {
                 ) else {
                     return Ok((additions, false));
                 };
-                let mut hash = CanonicalHasher::new(b"bifrost-java-lexical-hierarchy-frontier:v1");
-                hash.field("branch", &branch_identity.path().as_bytes());
-                hash.field("branch-fragment", &branch_identity.fragment().as_bytes());
-                hash.field("lookup", &shape.lookup.as_bytes());
-                let path_id = self.hierarchy.operation_path(hash.finish());
+                let mut descriptor = CanonicalIdentityDescriptor::new(
+                    b"bifrost-java-lexical-hierarchy-frontier:v1",
+                    |key| self.session.identity_digest(self.hierarchy, key),
+                );
+                descriptor.field(
+                    "branch",
+                    CanonicalIdentityPart::identity(branch_identity.path()),
+                )?;
+                descriptor.field(
+                    "branch-fragment",
+                    CanonicalIdentityPart::identity(branch_identity.fragment()),
+                )?;
+                descriptor.field("lookup", CanonicalIdentityPart::identity(shape.lookup))?;
+                let path_id = self.hierarchy.operation_path(descriptor.finish());
                 additions.push((
                     CandidatePathIdentity::new(branch_identity.fragment(), path_id),
                     path,
@@ -1095,14 +1118,28 @@ impl FactEvaluation<'_, '_> {
                     if !local.direct_definitions.contains(&definition) {
                         continue;
                     }
-                    let mut hash =
-                        CanonicalHasher::new(b"bifrost-java-lexical-hierarchy-bridge:v1");
-                    hash.field("branch", &branch_identity.path().as_bytes());
-                    hash.field("branch-fragment", &branch_identity.fragment().as_bytes());
-                    hash.field("candidate", &identity.path().as_bytes());
-                    hash.field("candidate-fragment", &identity.fragment().as_bytes());
-                    hash.field("lookup", &shape.lookup.as_bytes());
-                    let path_id = self.hierarchy.operation_path(hash.finish());
+                    let mut descriptor = CanonicalIdentityDescriptor::new(
+                        b"bifrost-java-lexical-hierarchy-bridge:v1",
+                        |key| self.session.identity_digest(self.hierarchy, key),
+                    );
+                    descriptor.field(
+                        "branch",
+                        CanonicalIdentityPart::identity(branch_identity.path()),
+                    )?;
+                    descriptor.field(
+                        "branch-fragment",
+                        CanonicalIdentityPart::identity(branch_identity.fragment()),
+                    )?;
+                    descriptor.field(
+                        "candidate",
+                        CanonicalIdentityPart::identity(identity.path()),
+                    )?;
+                    descriptor.field(
+                        "candidate-fragment",
+                        CanonicalIdentityPart::identity(identity.fragment()),
+                    )?;
+                    descriptor.field("lookup", CanonicalIdentityPart::identity(shape.lookup))?;
+                    let path_id = self.hierarchy.operation_path(descriptor.finish());
                     additions.push((
                         CandidatePathIdentity::new(branch_identity.fragment(), path_id),
                         composed,
@@ -1116,7 +1153,7 @@ impl FactEvaluation<'_, '_> {
 
     /// Whether the lookup `lookup`, filed in `fragment`, spells no member of
     /// its language's implicit root supertype. `None` reports cancellation.
-    fn lookup_is_outside_implicit_root(
+    pub(super) fn lookup_is_outside_implicit_root(
         &mut self,
         fragment: BindingFragmentId,
         lookup: SemanticId,

@@ -219,7 +219,11 @@ pub(crate) fn resolve_native_definition_bounded<A: LanguageAdapter>(
                     answer,
                     selected_import_model,
                 );
-                state_absent_member(&mut value, query, &absent_member_owners);
+                let member = query
+                    .source
+                    .get(query.site.focus_start_byte..query.site.focus_end_byte)
+                    .expect("a resolved reference site's focus lies inside its source");
+                state_absent_member(&mut value, member, &absent_member_owners);
                 BoundedResolution::Complete { value, work }
             }
         },
@@ -230,16 +234,13 @@ pub(crate) fn resolve_native_definition_bounded<A: LanguageAdapter>(
 /// Say that a member is absent where the answer proved it: the lookup searched
 /// complete owner inventories and none declares the member.
 ///
-/// The JVM definition surface reports this as `no_indexed_definition`, the kind
-/// every JVM `no_definition` about an unindexed target carries, and names the
-/// member and its owners. The fact itself (`FactResolutionAnswer::
-/// absent_member_owners`) is language-neutral; this wording is the JVM
-/// realm's, and the only callers of this resolver are the JVM readers. An
-/// answer that already carries a diagnostic keeps it.
-#[cfg(any(test, feature = "test-support"))]
+/// JVM member points and Go composite-literal labels report this shared
+/// absent-member proof as `no_indexed_definition`. An answer that already
+/// carries a diagnostic keeps it. The caller supplies the structurally
+/// selected member token; this helper does not interpret source syntax.
 fn state_absent_member(
     value: &mut DefinitionLookupOutcome,
-    query: BoundedReceiverQuery<'_>,
+    member: &str,
     owners: &[crate::analyzer::CodeUnit],
 ) {
     if owners.is_empty()
@@ -250,11 +251,6 @@ fn state_absent_member(
     {
         return;
     }
-    // The focus is the member's own token, the leaf the site was resolved at.
-    let member = query
-        .source
-        .get(query.site.focus_start_byte..query.site.focus_end_byte)
-        .expect("a resolved reference site's focus lies inside its source");
     let owners = owners
         .iter()
         .map(|owner| format!("`{}`", owner.fq_name_str()))
@@ -493,6 +489,11 @@ fn adapt_definition_answer_with_import_model(
     selected_import_model: Option<crate::analyzer::semantic_model::SemanticModelSymbol>,
 ) -> DefinitionLookupOutcome {
     let member_contexts = answer.member_contexts;
+    let absent_literal_member = language == Language::Go
+        && answer.answer.site_metadata().is_some_and(|metadata| {
+            metadata.site_kind()
+                == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::CompositeLiteralKeyReference
+        });
     if answer.predeclared_go_symbol {
         return DefinitionLookupOutcome {
             modeled_definitions: Vec::new(),
@@ -580,6 +581,14 @@ fn adapt_definition_answer_with_import_model(
     definitions.sort_unstable();
     definitions.dedup();
     let completion = answer.answer.binding().completion();
+    let mut incomplete_hierarchy_names = answer
+        .named_reasons
+        .iter()
+        .filter(|(kind, _)| *kind == "UnsupportedHierarchyTraversal")
+        .map(|(_, evidence)| evidence.clone())
+        .collect::<Vec<_>>();
+    incomplete_hierarchy_names.sort_unstable();
+    incomplete_hierarchy_names.dedup();
     let mut diagnostics = answer
         .named_reasons
         .into_iter()
@@ -630,10 +639,17 @@ fn adapt_definition_answer_with_import_model(
         });
     }
     if is_incomplete {
+        let message = if language == Language::Scala && !incomplete_hierarchy_names.is_empty() {
+            format!(
+                "selected native binding is incomplete because hierarchy traversal is unavailable for unindexed supertype(s): {incomplete_hierarchy_names:?}"
+            )
+        } else {
+            format!("selected native binding is incomplete: {completion:?}")
+        };
         diagnostics.push(DefinitionLookupDiagnostic {
             claim: None,
             kind: "incomplete_binding".into(),
-            message: format!("selected native binding is incomplete: {completion:?}"),
+            message,
         });
     }
     let external_family = answer.external_members.first().filter(|first| {
@@ -665,7 +681,35 @@ fn adapt_definition_answer_with_import_model(
             ),
         });
     }
-    let status = if external_family.is_some() && !ambiguous && !is_incomplete {
+    let unindexed_family = match &answer.direct_target {
+        Some(
+            crate::analyzer::store::resolution_operation::NativeExternalMemberTarget::Unindexed {
+                provider_path,
+                provider_package_id,
+                member_name,
+            },
+        ) if target_count == 0 && definitions.is_empty() && lexical_definition.is_none() => {
+            Some((provider_path, provider_package_id, member_name))
+        }
+        _ => None,
+    };
+    if let Some((path, package_id, member)) = unindexed_family {
+        diagnostics.push(DefinitionLookupDiagnostic {
+            claim: Some(
+                crate::analyzer::usages::get_definition::UnindexedClaim::external_boundary(
+                    format!("{path}.{member}"),
+                    crate::analyzer::usages::get_definition::ClaimSubjectRole::Member,
+                ),
+            ),
+            kind: "native_unindexed_external_member".into(),
+            message: format!(
+                "external member {member:?} of unindexed provider {path:?}, package_id={package_id:?}; value type unknown"
+            ),
+        });
+    }
+    let status = if unindexed_family.is_some()
+        || (external_family.is_some() && !ambiguous && !is_incomplete)
+    {
         DefinitionLookupStatus::UnresolvableImportBoundary
     } else if ambiguous {
         // Exact Go selector ties and multiple semantic targets establish
@@ -690,12 +734,14 @@ fn adapt_definition_answer_with_import_model(
         } else {
             status
         };
-    let outcome = DefinitionLookupOutcome {
+    let mut outcome = DefinitionLookupOutcome {
         modeled_definitions,
         status,
         reference: Some({
             let mut reference = site.clone();
-            if let Some(member) = external_family {
+            if let Some((path, _, member)) = unindexed_family {
+                reference.text = format!("{path}.{member}");
+            } else if let Some(member) = external_family {
                 reference.text =
                     format!("{}.{}", member.identity.owner.owner_fqn, member.member_name);
             }
@@ -705,6 +751,9 @@ fn adapt_definition_answer_with_import_model(
         lexical_definition,
         diagnostics,
     };
+    if absent_literal_member {
+        state_absent_member(&mut outcome, &site.text, &answer.absent_member_owners);
+    }
     record_native_member_contexts(language, member_contexts);
     trace::record_selected_units(&outcome);
     outcome
@@ -918,6 +967,30 @@ pub(crate) fn resolve_native_type_bounded<A: LanguageAdapter>(
     ) -> crate::analyzer::store::Result<NativePointContext>,
     after_open: impl FnOnce(),
 ) -> BoundedResolution<TypeLookupOutcome> {
+    map_bounded(
+        resolve_native_expression_value_type_bounded(inner, query, prepare_context, after_open),
+        |answer| answer.value_types,
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct NativeExpressionValueTypeLookup {
+    pub(crate) value_types: TypeLookupOutcome,
+    pub(crate) direct_target:
+        Option<crate::analyzer::store::resolution_operation::NativeExternalMemberTarget>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn resolve_native_expression_value_type_bounded<A: LanguageAdapter>(
+    inner: &TreeSitterAnalyzer<A>,
+    query: BoundedReceiverQuery<'_>,
+    prepare_context: impl FnOnce(
+        &SelectedResolutionOperation<'_, '_>,
+        &str,
+        &CancellationToken,
+    ) -> crate::analyzer::store::Result<NativePointContext>,
+    after_open: impl FnOnce(),
+) -> BoundedResolution<NativeExpressionValueTypeLookup> {
     resolve_native_point_bounded(
         inner,
         NativePointReference {
@@ -935,15 +1008,43 @@ pub(crate) fn resolve_native_type_bounded<A: LanguageAdapter>(
                 &mut SelectedResolutionContextMetrics,
             )
         },
-        |answer, work, _selected_import_model| match answer.types {
+        |answer, work, _selected_import_model| match answer.value_types {
             SelectedNativeTypes::Cancelled => BoundedResolution::Cancelled { work },
-            _ => BoundedResolution::Complete {
-                value: adapt_type_answer(query.site, inner.adapter().language(), answer),
-                work,
-            },
+            _ => {
+                let direct_target = answer.direct_target.clone();
+                BoundedResolution::Complete {
+                    value: NativeExpressionValueTypeLookup {
+                        value_types: adapt_type_answer(
+                            query.site,
+                            inner.adapter().language(),
+                            answer,
+                        ),
+                        direct_target,
+                    },
+                    work,
+                }
+            }
         },
-        unavailable_type,
+        |site, kind, message| NativeExpressionValueTypeLookup {
+            value_types: unavailable_type(site, kind, message),
+            direct_target: None,
+        },
     )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn map_bounded<T, U>(
+    value: BoundedResolution<T>,
+    map: impl FnOnce(T) -> U,
+) -> BoundedResolution<U> {
+    match value {
+        BoundedResolution::Complete { value, work } => BoundedResolution::Complete {
+            value: map(value),
+            work,
+        },
+        BoundedResolution::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
+        BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
+    }
 }
 
 pub(crate) fn unavailable_type(
@@ -968,7 +1069,12 @@ pub(crate) fn adapt_type_answer(
     language: Language,
     answer: SelectedNativeReferenceTypes,
 ) -> TypeLookupOutcome {
-    let SelectedNativeTypes::Ready { nominal, intrinsic } = answer.types else {
+    let SelectedNativeTypes::Ready {
+        nominal,
+        intrinsic,
+        external_owners,
+    } = answer.value_types
+    else {
         return unavailable_type(
             site,
             "native_type_projection_unavailable",
@@ -983,9 +1089,23 @@ pub(crate) fn adapt_type_answer(
             message,
         })
         .collect::<Vec<_>>();
+    if let Some(
+        crate::analyzer::store::resolution_operation::NativeExternalMemberTarget::Unindexed {
+            provider_path,
+            provider_package_id,
+            member_name,
+        },
+    ) = answer.direct_target
+    {
+        diagnostics.push(TypeLookupDiagnostic { kind: "native_unindexed_external_member".into(), message: format!("external member {member_name:?} of unindexed provider {provider_path:?}, package_id={provider_package_id:?}; value type unknown") });
+    }
     let resolution = answer.answer;
-    let observed = resolution.observed_type_identity();
-    let (target_kind, selected, kinds) = if observed.is_some() {
+    let observed = resolution
+        .observed_type_identity()
+        .filter(|_| answer.query_result_slot.is_none());
+    let (mut target_kind, selected, kinds) = if answer.query_result_slot.is_some() {
+        (TypeLookupTargetKind::ValueExpression, None, Vec::new())
+    } else if observed.is_some() {
         (
             TypeLookupTargetKind::TypeReference,
             Some(BindingProjectionKind::TargetTypeIdentity),
@@ -994,6 +1114,39 @@ pub(crate) fn adapt_type_answer(
     } else {
         crate::analyzer::usages::get_type::projection_target_kind(resolution.projections())
     };
+    if language == Language::Java
+        && observed.is_none()
+        && selected == Some(BindingProjectionKind::TargetTypeOrDeclaredValueType)
+    {
+        let slots = resolution
+            .projections()
+            .iter()
+            .filter(|projection| {
+                projection.kind() == BindingProjectionKind::TargetTypeOrDeclaredValueType
+            })
+            .map(|projection| projection.output_slot())
+            .collect::<Vec<_>>();
+        let frontiers = slots
+            .iter()
+            .filter_map(|slot| {
+                resolution
+                    .projected_frontiers()
+                    .iter()
+                    .find(|frontier| frontier.slot() == *slot)
+            })
+            .collect::<Vec<_>>();
+        if !frontiers.is_empty()
+            && frontiers.iter().all(|frontier| {
+                !frontier.possible_values().is_empty()
+                    && frontier
+                        .possible_values()
+                        .iter()
+                        .all(|value| matches!(value, ResolutionSlotValue::TypeObject(_)))
+            })
+        {
+            target_kind = TypeLookupTargetKind::TypeReference;
+        }
+    }
     let shapes = resolution
         .projected_type_shapes()
         .iter()
@@ -1021,7 +1174,8 @@ pub(crate) fn adapt_type_answer(
         .iter()
         .filter(|projection| Some(projection.kind()) == selected)
         .map(|projection| projection.output_slot())
-        .chain(observed);
+        .chain(observed)
+        .chain(answer.query_result_slot);
     let mut examined = false;
     let mut canonical = std::collections::BTreeMap::new();
     for slot in slots {
@@ -1075,6 +1229,12 @@ pub(crate) fn adapt_type_answer(
                             Some((unit.fq_name().to_string(), vec![unit.clone()]))
                         }
                         SelectedNativeDefinition::Lexical(_) => None,
+                    })
+                    .or_else(|| {
+                        external_owners
+                            .iter()
+                            .find(|(candidate, _)| *candidate == identity)
+                            .map(|(_, owner)| (owner.owner_fqn.to_string(), Vec::new()))
                     })
             };
             let Some((spelling, definitions)) = projected else {

@@ -442,3 +442,47 @@ pub fn chain_name_child<'tree>(node: Node<'tree>, name_field: Option<&str>) -> O
         }
     }
 }
+
+/// Grammar hooks describe one step; the shared loop owns callee traversal.
+/// Immediate-child selection is needed where a grammar has no name field.
+pub enum CalleeSpineStep {
+    Name,
+    Field(&'static str),
+    ChildKind(&'static str),
+    OnlyChild,
+    FieldOrOnlyChild(&'static str),
+}
+
+/// Follow only the callee's member/name/wrapper spine. Calls, subscripts,
+/// lambdas and other value expressions stop; their descendants cannot name
+/// the declaration invoked by the enclosing call.
+pub fn terminal_callee_leaf(
+    mut node: Node<'_>,
+    step: impl Fn(&str) -> Option<CalleeSpineStep>,
+) -> Option<Node<'_>> {
+    loop {
+        node = match if node.kind() == "parenthesized_expression" {
+            Some(CalleeSpineStep::OnlyChild)
+        } else {
+            step(node.kind())
+        }? {
+            CalleeSpineStep::Name => return Some(node),
+            CalleeSpineStep::Field(field) => {
+                crate::analyzer::tree_walk::last_named_field_child(node, field)?
+            }
+            CalleeSpineStep::ChildKind(kind) => {
+                crate::analyzer::tree_walk::single_named_child_matching(node, |child| {
+                    child.kind() == kind
+                })?
+            }
+            CalleeSpineStep::OnlyChild => {
+                crate::analyzer::tree_walk::single_named_child_matching(node, |_| true)?
+            }
+            CalleeSpineStep::FieldOrOnlyChild(field) => {
+                node.child_by_field_name(field).or_else(|| {
+                    crate::analyzer::tree_walk::single_named_child_matching(node, |_| true)
+                })?
+            }
+        };
+    }
+}

@@ -8,7 +8,7 @@ use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 use super::model::GoDefinitionNamespaces;
 use crate::CancellationToken;
 use crate::analyzer::store::{Result as StoreResult, StoreError};
-use crate::analyzer::structural::{CandidateOutcome, RejectionReason};
+use crate::analyzer::structural::{CandidateOutcome, PrecedenceTier, RejectionReason};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
 
@@ -3883,6 +3883,19 @@ fn path_shadows_with_poll(
     cancellation: &CancellationToken,
     work: &mut usize,
 ) -> Option<bool> {
+    let origin_rank = |path: &PartialPath| {
+        path.precedence()
+            .iter()
+            .rfind(|step| step.tier == PrecedenceTier::CandidateOriginRank)
+            .map(|step| step.ordinal)
+    };
+    if let (Some(left_rank), Some(right_rank)) = (origin_rank(left), origin_rank(right)) {
+        match left_rank.cmp(&right_rank) {
+            std::cmp::Ordering::Less => return Some(true),
+            std::cmp::Ordering::Greater => return Some(false),
+            std::cmp::Ordering::Equal => {}
+        }
+    }
     for left_step in left.precedence() {
         if selection_cancelled(work, cancellation) {
             return None;
@@ -3900,6 +3913,11 @@ fn path_shadows_with_poll(
         let Some(right_step) = matched else {
             continue;
         };
+        if left_step.tier == PrecedenceTier::CandidateOriginRank
+            || right_step.tier == PrecedenceTier::CandidateOriginRank
+        {
+            continue;
+        }
         match (left_step.tier, left_step.ordinal).cmp(&(right_step.tier, right_step.ordinal)) {
             std::cmp::Ordering::Less => return Some(true),
             std::cmp::Ordering::Greater => return Some(false),

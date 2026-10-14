@@ -272,9 +272,16 @@ pub(super) fn prepare_lexical_fragment(
 }
 
 impl PreparedStageLexical {
-    pub(super) fn digest(&self) -> [u8; 32] {
+    pub(super) fn digest(
+        &self,
+        host: &super::super::resolution_selection::SelectedResolutionMountRecord,
+    ) -> Result<[u8; 32]> {
+        use crate::analyzer::resolution::CanonicalIdentityHasher;
+        assert_eq!(self.fragment.ordinal(), host.ordinal().get());
         let mut digest = CanonicalHasher::new(b"bifrost-selected-stage-lexical:v1");
-        digest.field("fragment", &self.fragment.as_bytes());
+        digest.identity_field("fragment", self.fragment, |_| {
+            Ok(host.fragment_digest().as_bytes())
+        })?;
         digest.field("language", self.language.config_label().as_bytes());
         for (family, rows) in [
             ("nodes", &self.nodes),
@@ -289,7 +296,7 @@ impl PreparedStageLexical {
                     .as_bytes(),
             );
         }
-        digest.finish()
+        Ok(digest.finish())
     }
 
     /// Candidate identity is exclusive across ordinary and stage sources, even

@@ -48,6 +48,8 @@ pub(crate) struct GoDemandContext {
     pub(crate) context_id: i64,
     pub(crate) import_packages: HashMap<(SelectedResolutionMountOrdinal, SemanticId), i64>,
     pub(crate) context_completions: HashMap<SelectedResolutionMountOrdinal, ResolutionCompletion>,
+    pub(crate) modeled_imports:
+        HashMap<(SelectedResolutionMountOrdinal, SemanticId), GoSelectedExternalImport>,
 }
 
 impl GoDemandContext {
@@ -74,6 +76,14 @@ impl GoDemandContext {
                 );
             }
         }
+        for (key, provider) in other.modeled_imports {
+            if let Some(previous) = self.modeled_imports.insert(key, provider.clone()) {
+                assert_eq!(
+                    previous, provider,
+                    "one selected Go import has one model provider"
+                );
+            }
+        }
         for (mount, completion) in other.context_completions {
             if let Some(previous) = self.context_completions.insert(mount, completion.clone()) {
                 assert_eq!(
@@ -94,6 +104,7 @@ pub(crate) struct GoPreparedContextCacheKey {
     caller_path: String,
     source_role: String,
     derivation_version: i64,
+    active_model_set_hash: Option<String>,
 }
 
 #[derive(Clone)]
@@ -300,7 +311,8 @@ LEFT JOIN main.source_imports i ON i.blob_id=mounted.blob_id
 // orders by `ordinal` on the primary key, which needs no sort.
 pub(in crate::analyzer::store) const GO_FILE_IMPORT_ROWS: &str = r#"
 SELECT requested.value ->> 0, imports.source_spelling, imports.complete,
-       json(imports.gaps), target.package_name, target.package_id
+       json(imports.gaps), NULLIF(target.package_name,''), target.package_id,
+       mounted.semantic_language
 FROM json_each(?2) requested
 CROSS JOIN temp.selected_resolution_mounts mounted ON mounted.mount_ordinal=requested.value ->> 0
 CROSS JOIN main.go_context_source_files caller
@@ -354,8 +366,11 @@ WHERE i.alias='.'
 pub(super) struct GoFileImportRow {
     pub(super) complete: bool,
     pub(super) gaps: String,
-    /// Provider package name and id, absent when the import has no provider.
-    pub(super) target: Option<(String, i64)>,
+    /// A missing or nameless tool provider has no authoritative package clause.
+    pub(super) package_name: Option<String>,
+    /// Retained as provider evidence even when its package clause is unknown.
+    pub(super) package_id: Option<i64>,
+    pub(super) modeled_provider: Option<GoSelectedExternalImport>,
 }
 
 /// What one prepared Go file mount needs from SQL: its import bindings and
@@ -373,6 +388,8 @@ struct GoMountImportInputs {
 #[derive(Default)]
 pub(in crate::analyzer::store) struct GoImportInputCache {
     mounts: HashMap<u32, GoMountImportInputs>,
+    /// A captured absence must not fall through to a later publication.
+    model_overlay: Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -426,6 +443,61 @@ impl GoImportBindingRow {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
+    /// Capture the caller's overlay rather than the language delegate's cache.
+    /// A multi-language analyzer can activate models without populating its
+    /// Go delegate. This authority lives only for the selected operation.
+    pub(crate) fn with_go_model_authority(
+        self,
+        overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    ) -> Self {
+        {
+            let mut inputs = self.go_import_inputs.borrow_mut();
+            assert!(
+                inputs.model_overlay.is_none() && inputs.mounts.is_empty(),
+                "Go model authority is captured before import preparation"
+            );
+            inputs.model_overlay = Some(overlay);
+        }
+        self
+    }
+
+    fn go_semantic_model_overlay(
+        &self,
+    ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>> {
+        self.go_import_inputs
+            .borrow()
+            .model_overlay
+            .clone()
+            .unwrap_or_else(|| self.ready.analyzer.and_then(|a| a.semantic_model_overlay()))
+    }
+
+    /// Overlay authority precedes missing durable import authority, like
+    /// `model_declared_jvm_owner` in the JVM context. The registered language
+    /// hook supplies the package clause name and provider identity; no basename
+    /// is evidence.
+    /// Typed durable provider rows are deferred until a typed reader needs them.
+    fn model_declared_go_package(
+        &self,
+        language: Language,
+        import_path: &str,
+    ) -> Option<GoSelectedExternalImport> {
+        let overlay = self.go_semantic_model_overlay()?;
+        let support = crate::analyzer::languages::language_support(language)
+            .expect("selected import mount language must have registered support");
+        let identity = support.modeled_external_package_identity(&overlay, import_path)?;
+        Some(GoSelectedExternalImport {
+            source_spelling: import_path.to_owned(),
+            import_path: import_path.to_owned(),
+            package_name: identity.package_name,
+            provenance: GoExternalPackageProvenance::SemanticModel {
+                symbol_id: identity.symbol_id,
+                pack_id: identity.pack_id,
+                pack_digest: identity.pack_digest,
+                record_id: identity.record_id,
+            },
+        })
+    }
+
     /// Return this caller's complete, source-less standard/dependency import
     /// targets. The vector is request-owned and bounded by this file's imports.
     pub(crate) fn go_selected_external_imports(
@@ -469,6 +541,23 @@ impl SelectedResolutionOperation<'_, '_> {
                     module_version: row.get(5)?,
                 },
             });
+        }
+        drop(rows);
+        drop(statement);
+        if self.go_semantic_model_overlay().is_none() {
+            return Ok(imports);
+        }
+        for spelling in
+            self.go_selected_unresolved_imports(context_id, caller_path, cancellation)?
+        {
+            if cancellation.is_cancelled() {
+                return Ok(Vec::new());
+            }
+            if let Some(provider) =
+                self.model_declared_go_package(source.semantic_language(), &spelling)
+            {
+                imports.push(provider);
+            }
         }
         Ok(imports)
     }
@@ -648,6 +737,9 @@ impl SelectedResolutionOperation<'_, '_> {
             caller_path: path.to_owned(),
             source_role: source_role.to_owned(),
             derivation_version: super::super::go_package_context::DERIVATION_VERSION,
+            active_model_set_hash: self
+                .go_semantic_model_overlay()
+                .map(|overlay| overlay.active_model_set_hash().to_owned()),
         };
         if self.ready.context_identities.is_empty()
             && let Some(cached) = self.ready.store.go_prepared_context_cache().get(&cache_key)
@@ -847,20 +939,31 @@ impl SelectedResolutionOperation<'_, '_> {
             if cancellation.is_cancelled() {
                 return Ok(false);
             }
-            let target = match row.get::<_, Option<String>>(4)? {
-                Some(name) => Some((name, row.get::<_, i64>(5)?)),
-                None => None,
+            let mount: u32 = row.get(0)?;
+            let package_name: Option<String> = row.get(4)?;
+            let package_id: Option<i64> = row.get(5)?;
+            let spelling: String = row.get(1)?;
+            let language_label: String = row.get(6)?;
+            let language = Language::from_config_label(&language_label).ok_or_else(|| {
+                StoreError::corrupt(format!("unknown selected language {language_label:?}"))
+            })?;
+            let modeled_provider = if package_name.is_none() {
+                self.model_declared_go_package(language, &spelling)
+            } else {
+                None
             };
             loaded
-                .get_mut(&row.get::<_, u32>(0)?)
+                .get_mut(&mount)
                 .expect("Go import row names a requested mount")
                 .imports
                 .insert(
-                    row.get(1)?,
+                    spelling,
                     GoFileImportRow {
-                        complete: row.get(2)?,
+                        complete: modeled_provider.is_some() || row.get::<_, bool>(2)?,
                         gaps: row.get(3)?,
-                        target,
+                        package_name,
+                        package_id,
+                        modeled_provider,
                     },
                 );
         }
@@ -978,6 +1081,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let completion = context.inventory_completion().clone();
         let mut bindings = Vec::new();
         let mut import_packages = HashMap::default();
+        let mut modeled_imports = HashMap::default();
         for row in inputs.bindings.into_values() {
             if cancellation.is_cancelled() {
                 return Ok(GoPreparedImportContextOutcome::Cancelled);
@@ -1003,20 +1107,30 @@ impl SelectedResolutionOperation<'_, '_> {
                 selected,
                 &completion,
             );
-            let package_target = selected.and_then(|row| row.target.as_ref());
+            let package_name = selected.and_then(|row| row.package_name.as_deref());
+            let package_id = selected.and_then(|row| row.package_id);
+            let modeled_provider = selected.and_then(|row| row.modeled_provider.as_ref());
+            let presumed =
+                import.alias.is_none() && package_name.is_none() && modeled_provider.is_none();
             let Some(name) = import
                 .alias
                 .as_deref()
-                .or(package_target.map(|(name, _)| name.as_str()))
+                .or(package_name)
+                .or(modeled_provider.map(|provider| provider.package_name.as_str()))
+                .or_else(|| {
+                    presumed
+                        .then(|| path.segments.last().map(String::as_str))
+                        .flatten()
+                })
             else {
-                // Canonical publication keeps a missing provider explicitly
-                // incomplete; no path basename may invent the default name.
-                assert!(
-                    !matches!(import_completion, ResolutionCompletion::Complete),
-                    "missing canonical import name requires incomplete publication"
-                );
                 continue;
             };
+            if presumed {
+                assert!(
+                    !matches!(import_completion, ResolutionCompletion::Complete),
+                    "a presumed binder requires an unresolved provider"
+                );
+            }
             let Some(definition_node) =
                 lexical.lookup_definition_node(row.metadata.definition, cancellation)?
             else {
@@ -1027,10 +1141,19 @@ impl SelectedResolutionOperation<'_, '_> {
                     "Go import metadata has no selected definition node",
                 ));
             };
-            if let Some((_, package)) = package_target {
-                import_packages.insert((source.ordinal(), row.metadata.definition), *package);
+            if package_name.is_some() {
+                import_packages.insert(
+                    (source.ordinal(), row.metadata.definition),
+                    package_id.expect("a durable package clause has a provider row"),
+                );
             }
-            bindings.push(SelectedGoImportBindingDescriptor::new(
+            if let Some(provider) = modeled_provider {
+                modeled_imports.insert(
+                    (source.ordinal(), row.metadata.definition),
+                    provider.clone(),
+                );
+            }
+            let binding = SelectedGoImportBindingDescriptor::new(
                 source.fragment(),
                 &row.metadata,
                 definition_node,
@@ -1041,7 +1164,12 @@ impl SelectedResolutionOperation<'_, '_> {
                 )
                 .semantic(&names),
                 import_completion,
-            ));
+            );
+            bindings.push(if presumed {
+                binding.with_presumed_provider(spelling.into(), package_id)
+            } else {
+                binding
+            });
         }
         let mounts = self.mount_table();
         let Some(context) =
@@ -1056,6 +1184,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let demand = GoDemandContext {
             context_id,
             import_packages,
+            modeled_imports,
             context_completions: HashMap::from_iter([(
                 source.ordinal(),
                 context.inventory_completion().clone(),

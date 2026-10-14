@@ -1,0 +1,29 @@
+{
+  "created_at": "<TIMESTAMP>",
+  "engine": {
+    "build_identity": "fixture-build",
+    "executable_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version": "9.9.0"
+  },
+  "failure": {
+    "class": "integrity",
+    "message": "strictly selected manifest SHA-256 does not match its trusted pin",
+    "retryable": false
+  },
+  "inventory": null,
+  "outcome_schema_version": 1,
+  "rejections": [],
+  "request": {
+    "dependencies": [],
+    "pack_id": "bifrost.public.rules",
+    "repository": "https://github.com/BrokkAi/bifrost-packs",
+    "request_schema_version": 1,
+    "selection": {
+      "manifest_sha256": "ca4a422a94ee11f5329bb34d1468aa519f410809695ad56729afcd7fba9fbecc",
+      "mode": "strict",
+      "release_version": "1.0.0"
+    }
+  },
+  "selection": null,
+  "status": "failed"
+}

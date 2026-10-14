@@ -765,64 +765,41 @@ JOIN main.blobs AS blobs ON blobs.id = sources.blob_id
  AND blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
  AND blobs.generation = files.generation;
 
--- The one Rust summary version selected by the shared live-summary predicate:
--- an open-at-revision row, complete shared header, active producer epoch and
--- Rust derivation version. Rust detail readers join this view before reading
--- their summary-owned rows. These depend only on the selection and the file
--- versions above, so every connection that holds a workspace selection holds
--- them; a reader must not depend on which placement schema ran first.
-CREATE TEMP VIEW IF NOT EXISTS selected_rust_unit_summaries AS
-SELECT selected.workspace_id, selected.lang, selected.generation, selected.revision,
-       versions.unit_key, versions.valid_from, versions.summary_id,
-       rust_versions.manifest_file_version_id, rust_versions.topology_id
-FROM selected_workspace_revisions AS selected
-CROSS JOIN main.resolution_unit_summary_versions AS versions
-  ON versions.workspace_id = selected.workspace_id
- AND versions.lang = selected.lang AND versions.generation = selected.generation
-CROSS JOIN main.resolution_unit_summaries AS summaries
-  ON summaries.summary_id = versions.summary_id
-CROSS JOIN main.resolution_producer_epochs AS epochs
-  ON epochs.lang = versions.lang AND epochs.producer_epoch = summaries.producer_epoch
-CROSS JOIN main.rust_resolution_unit_summary_versions AS rust_versions
-  ON rust_versions.workspace_id = versions.workspace_id
- AND rust_versions.lang = versions.lang AND rust_versions.generation = versions.generation
- AND rust_versions.unit_key = versions.unit_key AND rust_versions.valid_from = versions.valid_from
- AND rust_versions.summary_id = versions.summary_id
-CROSS JOIN main.rust_resolution_unit_summary_contexts AS contexts
-  INDEXED BY rust_resolution_unit_summary_contexts_live
-  ON contexts.summary_id = versions.summary_id
-WHERE selected.lang = 'rust'
-  AND versions.valid_from <= selected.revision
-  AND (versions.valid_until IS NULL OR selected.revision < versions.valid_until)
-  AND summaries.lang = 'rust' AND summaries.unit_kind = 'rust_crate'
-  AND summaries.publication_state = 'complete'
-  AND summaries.derivation_version = 7;
+-- Selection-owned rows shared by ordinary and resolution readers. Fill after
+-- installing selected_workspace_revisions; clear with those selection inputs.
+CREATE TEMP TABLE IF NOT EXISTS selected_rust_unit_summaries(
+ workspace_id TEXT NOT NULL, lang TEXT NOT NULL, generation INTEGER NOT NULL,
+ revision INTEGER NOT NULL, unit_key BLOB NOT NULL, valid_from INTEGER NOT NULL,
+ summary_id INTEGER NOT NULL, manifest_file_version_id INTEGER,
+ topology_id INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_summaries_key
+ ON selected_rust_unit_summaries(unit_key);
+CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_summaries_summary
+ ON selected_rust_unit_summaries(summary_id);
+CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_summaries_topology
+ ON selected_rust_unit_summaries(topology_id);
+-- MODULES' detached check seeks the selected workspace before its contexts.
+CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_summaries_workspace
+ ON selected_rust_unit_summaries(workspace_id, generation, unit_key);
 
--- Root routes only need to prove that their referencing summary is selected.
--- Keep this membership view on the shared validity predicate and Rust's
--- version row, without rejoining the legacy crate-topology surface.
+-- Workspace dependency reachability, including each root itself. UNION in
+-- the fill makes cyclic and diamond graphs produce one row per root and unit.
+CREATE TEMP TABLE IF NOT EXISTS selected_rust_unit_closure(
+ root_unit_key BLOB NOT NULL, unit_key BLOB NOT NULL, summary_id INTEGER NOT NULL,
+ topology_id INTEGER NOT NULL, workspace_id TEXT NOT NULL, generation INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_closure_topology
+ ON selected_rust_unit_closure(root_unit_key, topology_id);
+CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_closure_summary
+ ON selected_rust_unit_closure(root_unit_key, summary_id);
+
+
+-- Every complete Rust summary publishes its context before its version.
+-- Route owners therefore share the selected unit membership relation.
 CREATE TEMP VIEW IF NOT EXISTS selected_rust_unit_summary_route_owners AS
-SELECT selected.workspace_id, selected.lang, selected.generation, selected.revision,
-       versions.unit_key, versions.valid_from, versions.summary_id
-FROM selected_workspace_revisions AS selected
-CROSS JOIN main.resolution_unit_summary_versions AS versions
-  ON versions.workspace_id = selected.workspace_id
- AND versions.lang = selected.lang AND versions.generation = selected.generation
-CROSS JOIN main.resolution_unit_summaries AS summaries
-  ON summaries.summary_id = versions.summary_id
-CROSS JOIN main.resolution_producer_epochs AS epochs
-  ON epochs.lang = versions.lang AND epochs.producer_epoch = summaries.producer_epoch
-CROSS JOIN main.rust_resolution_unit_summary_versions AS rust_versions
-  ON rust_versions.workspace_id = versions.workspace_id
- AND rust_versions.lang = versions.lang AND rust_versions.generation = versions.generation
- AND rust_versions.unit_key = versions.unit_key AND rust_versions.valid_from = versions.valid_from
- AND rust_versions.summary_id = versions.summary_id
-WHERE selected.lang = 'rust'
-  AND versions.valid_from <= selected.revision
-  AND (versions.valid_until IS NULL OR selected.revision < versions.valid_until)
-  AND summaries.lang = 'rust' AND summaries.unit_kind = 'rust_crate'
-  AND summaries.publication_state = 'complete'
-  AND summaries.derivation_version = 7;
+SELECT workspace_id, lang, generation, revision, unit_key, valid_from, summary_id
+FROM selected_rust_unit_summaries;
 
 -- Summary members are selected through the same revision-valid summary and
 -- must still be the selected source blob at the member's workspace path.

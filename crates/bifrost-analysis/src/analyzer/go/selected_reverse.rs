@@ -25,7 +25,9 @@ use crate::analyzer::store::resolution_operation::{
     SelectedResolutionOperationOutcome,
 };
 use crate::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
-use crate::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+use crate::analyzer::store::resolution_selection::{
+    SelectedResolutionLanguage, SelectedResolutionUnavailable,
+};
 use crate::analyzer::store::{Result, StoreError};
 use crate::analyzer::structural::EdgeProvenance;
 use crate::analyzer::structural::SiteClass;
@@ -37,12 +39,13 @@ use crate::analyzer::usages::{UsageHitKind, UsageProof};
 use crate::analyzer::{
     CodeUnit, CodeUnitIndex, IAnalyzer, Language, ProjectFile, Range, resolve_analyzer,
 };
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use brokk_bifrost_core::analyzer::go_facts::GoSourceTypeShape;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionCallableReceiverOrigin, ResolutionNamespace, ResolutionSiteKind,
 };
+use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -60,16 +63,27 @@ pub fn go_selected_inverse_for(
     target: &CodeUnit,
     cancellation: &CancellationToken,
 ) -> GoSelectedReverseOutcome<EdgeDerivationResult> {
-    go_selected_inverse_for_with_test_inclusion(go, target, true, cancellation)
+    match go_selected_inverse_for_inner(go, target, true, None, cancellation, false, None) {
+        Ok(outcome) => outcome,
+        Err(error) => GoSelectedReverseOutcome::StoreError(error.to_string()),
+    }
 }
 
-pub(crate) fn go_selected_inverse_for_with_test_inclusion(
+pub(crate) fn go_selected_inverse_for_usage_scope(
     go: &GoAnalyzer,
     target: &CodeUnit,
-    include_tests: bool,
+    scope: &UsageScanScope<'_>,
     cancellation: &CancellationToken,
 ) -> GoSelectedReverseOutcome<EdgeDerivationResult> {
-    match go_selected_inverse_for_inner(go, target, include_tests, cancellation, false, None) {
+    match go_selected_inverse_for_inner(
+        go,
+        target,
+        scope.includes_tests(),
+        scope.explicit_candidate_files(),
+        cancellation,
+        false,
+        None,
+    ) {
         Ok(outcome) => outcome,
         Err(error) => GoSelectedReverseOutcome::StoreError(error.to_string()),
     }
@@ -89,6 +103,7 @@ pub(crate) fn go_selected_inverse_for_rename_original(
         go,
         target,
         true,
+        None,
         cancellation,
         true,
         Some((new_name, &mut conflict)),
@@ -103,6 +118,7 @@ fn go_selected_inverse_for_inner(
     go: &GoAnalyzer,
     target: &CodeUnit,
     include_tests: bool,
+    explicit_candidates: Option<&HashSet<ProjectFile>>,
     cancellation: &CancellationToken,
     record_initial_rename_phases: bool,
     rename_check: Option<(&str, &mut Option<String>)>,
@@ -173,6 +189,38 @@ fn go_selected_inverse_for_inner(
             return Ok(GoSelectedReverseOutcome::Cancelled);
         }
     };
+    // Explicit candidates must be admitted even when the inverse index has no
+    // sites for them. Enumerated candidates retain the inverse inventory contract.
+    for file in explicit_candidates.into_iter().flatten() {
+        if cancellation.is_cancelled() {
+            return Ok(GoSelectedReverseOutcome::Cancelled);
+        }
+        let path = crate::path_utils::normalize_pattern(&file.rel_path().to_string_lossy());
+        let Some(mount) = operation.mount_table().mount_for_path("go", &path)? else {
+            return Ok(GoSelectedReverseOutcome::Unavailable(format!(
+                "{:?}",
+                SelectedResolutionUnavailable::MissingBlob {
+                    storage_language: "go".into(),
+                    persisted_relative_path: path,
+                }
+            )));
+        };
+        assert_eq!(mount.semantic_language(), Language::Go);
+        if operation
+            .go_package_stage_unit_for_path(context.context_id, &path, cancellation)?
+            .is_none()
+        {
+            if cancellation.is_cancelled() {
+                return Ok(GoSelectedReverseOutcome::Cancelled);
+            }
+            return Ok(GoSelectedReverseOutcome::Unavailable(format!(
+                "{:?}",
+                SelectedResolutionUnavailable::GoContextUnavailable {
+                    persisted_relative_path: path,
+                }
+            )));
+        }
+    }
     let generation = go.inner.project().analysis_generation();
     let candidate_phase =
         record_initial_rename_phases.then(|| go_rename_phase(GoRenamePhase::CandidateEnumeration));

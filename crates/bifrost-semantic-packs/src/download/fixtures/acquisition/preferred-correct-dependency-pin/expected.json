@@ -1,0 +1,261 @@
+{
+  "created_at": "<TIMESTAMP>",
+  "engine": {
+    "build_identity": "fixture-build",
+    "executable_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version": "9.9.0"
+  },
+  "failure": null,
+  "inventory": {
+    "fetched_at": "<TIMESTAMP>",
+    "fetched_online": true,
+    "index_sha256": "ef5edc023260fdd6dfefb110e0ad2e8109d33c9863908110c3f8de0082a09709"
+  },
+  "outcome_schema_version": 1,
+  "rejections": [],
+  "request": {
+    "dependencies": [
+      {
+        "manifest_sha256": "67b24c7ee5df98e90f7778329397459c4b8771f5fa84e7cbecfa4a0c038dbaa2",
+        "pack_id": "bifrost.public.packs",
+        "release_version": "1.0.0",
+        "repository": "https://github.com/BrokkAi/bifrost-packs"
+      }
+    ],
+    "pack_id": "bifrost.public.rules",
+    "repository": "https://github.com/BrokkAi/bifrost-packs",
+    "request_schema_version": 1,
+    "selection": {
+      "allowed_versions": "*",
+      "channel": "stable",
+      "mode": "preferred",
+      "preferred_version": "1.0.0"
+    }
+  },
+  "selection": {
+    "cache_reused": false,
+    "policy_pack_root": "<CACHE>/selections/63a2aea4bc2234f8149f18a8b3540841e29940452fa38dda3215710ec09a1931/root/rules",
+    "receipt": {
+      "artifacts": [
+        {
+          "cache_path": "<CACHE>/artifacts/8c6654e7100161016cbf20728b77dd0b08377556b8c05d471377c84f8140582a",
+          "name": "rules.tar.gz",
+          "pack_id": "bifrost.public.rules",
+          "release_version": "1.0.0",
+          "role": "policy",
+          "sha256": "8c6654e7100161016cbf20728b77dd0b08377556b8c05d471377c84f8140582a",
+          "size_bytes": 117
+        },
+        {
+          "cache_path": "<CACHE>/artifacts/543ee98b73fca90917c9612bdbd2f4b63fd426fbcc5bf9a3fe58c024e8f0d5d3",
+          "name": "semantic.tar.gz",
+          "pack_id": "bifrost.public.packs",
+          "release_version": "1.0.0",
+          "role": "native",
+          "sha256": "543ee98b73fca90917c9612bdbd2f4b63fd426fbcc5bf9a3fe58c024e8f0d5d3",
+          "size_bytes": 118
+        }
+      ],
+      "created_at": "<TIMESTAMP>",
+      "engine": {
+        "build_identity": "fixture-build",
+        "profile": {
+          "build_identity": "fixture-build",
+          "capabilities": [],
+          "capability_contract_version": 1,
+          "engine_version": "9.9.0",
+          "model_set_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "schemas": {
+            "builtin_catalog": [
+              1
+            ],
+            "policy_bundle": [],
+            "policy_document": [
+              1
+            ],
+            "release_index": [
+              1
+            ],
+            "rql": [
+              1
+            ],
+            "runtime": [
+              1
+            ],
+            "semantic_model_read": [
+              1
+            ],
+            "semantic_model_write": [
+              1
+            ],
+            "semantic_spec": [
+              1
+            ]
+          }
+        },
+        "version": "9.9.0"
+      },
+      "extracted_files": {
+        "dependency-bifrost.public.packs": [
+          {
+            "path": "bifrost-semantic-packs/index.json",
+            "sha256": "e7530772b916b65573dfd781eb2ffaefa7bd3e85d168186ed10a391aa6b18358",
+            "size_bytes": 12
+          }
+        ],
+        "root": [
+          {
+            "path": "rules/fixture/policy.rql",
+            "sha256": "492fb319228c539965f04c214edb901c551203197bbe4fc9720df86aa3f5306d",
+            "size_bytes": 25
+          }
+        ]
+      },
+      "receipt_schema_version": 3,
+      "rejections": [],
+      "releases": [
+        {
+          "artifacts": [
+            {
+              "name": "rules.tar.gz",
+              "role": "policy",
+              "sha256": "8c6654e7100161016cbf20728b77dd0b08377556b8c05d471377c84f8140582a",
+              "size_bytes": 117
+            }
+          ],
+          "contents": [
+            {
+              "path": "rules/fixture/policy.rql",
+              "sha256": "492fb319228c539965f04c214edb901c551203197bbe4fc9720df86aa3f5306d"
+            }
+          ],
+          "manifest_schema_version": 2,
+          "manifest_sha256": "cf1100f8fad135251fa04910e2582baed118e582742241522fd0061d8233aacb",
+          "pack_id": "bifrost.public.rules",
+          "provenance": {
+            "build_identity": "older-engine-build",
+            "engine_version": "0.0.1",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "qualification": {
+            "behavior": {
+              "evidence": [
+                "fixture behavior"
+              ],
+              "status": "qualified"
+            },
+            "integrity": {
+              "evidence": [
+                "fixture integrity"
+              ],
+              "status": "verified"
+            }
+          },
+          "release_version": "1.0.0",
+          "role": "root",
+          "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "tag": "rules/v1.0.0",
+          "tag_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "visibility": "public"
+        },
+        {
+          "artifacts": [
+            {
+              "name": "semantic.tar.gz",
+              "role": "native",
+              "sha256": "543ee98b73fca90917c9612bdbd2f4b63fd426fbcc5bf9a3fe58c024e8f0d5d3",
+              "size_bytes": 118
+            }
+          ],
+          "contents": [
+            {
+              "path": "bifrost-semantic-packs/index.json",
+              "sha256": "e7530772b916b65573dfd781eb2ffaefa7bd3e85d168186ed10a391aa6b18358"
+            }
+          ],
+          "manifest_schema_version": 2,
+          "manifest_sha256": "67b24c7ee5df98e90f7778329397459c4b8771f5fa84e7cbecfa4a0c038dbaa2",
+          "pack_id": "bifrost.public.packs",
+          "provenance": {
+            "build_identity": "older-engine-build",
+            "engine_version": "0.0.1",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "qualification": {
+            "behavior": {
+              "evidence": [
+                "fixture behavior"
+              ],
+              "status": "qualified"
+            },
+            "integrity": {
+              "evidence": [
+                "fixture integrity"
+              ],
+              "status": "verified"
+            }
+          },
+          "release_version": "1.0.0",
+          "role": "dependency",
+          "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "tag": "packs/v1.0.0",
+          "tag_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "visibility": "public"
+        }
+      ],
+      "replay": {
+        "dependencies": [
+          {
+            "manifest_sha256": "67b24c7ee5df98e90f7778329397459c4b8771f5fa84e7cbecfa4a0c038dbaa2",
+            "pack_id": "bifrost.public.packs",
+            "release_version": "1.0.0",
+            "repository": "https://github.com/BrokkAi/bifrost-packs"
+          }
+        ],
+        "pack_id": "bifrost.public.rules",
+        "repository": "https://github.com/BrokkAi/bifrost-packs",
+        "request_schema_version": 1,
+        "selection": {
+          "manifest_sha256": "cf1100f8fad135251fa04910e2582baed118e582742241522fd0061d8233aacb",
+          "mode": "strict",
+          "release_version": "1.0.0"
+        }
+      },
+      "request": {
+        "dependencies": [
+          {
+            "manifest_sha256": "67b24c7ee5df98e90f7778329397459c4b8771f5fa84e7cbecfa4a0c038dbaa2",
+            "pack_id": "bifrost.public.packs",
+            "release_version": "1.0.0",
+            "repository": "https://github.com/BrokkAi/bifrost-packs"
+          }
+        ],
+        "pack_id": "bifrost.public.rules",
+        "repository": "https://github.com/BrokkAi/bifrost-packs",
+        "request_schema_version": 1,
+        "selection": {
+          "allowed_versions": "*",
+          "channel": "stable",
+          "mode": "preferred",
+          "preferred_version": "1.0.0"
+        }
+      },
+      "selection_id": "63a2aea4bc2234f8149f18a8b3540841e29940452fa38dda3215710ec09a1931",
+      "selection_reason": "preferred-version",
+      "source": {
+        "fetched_at": "<TIMESTAMP>",
+        "fetched_online": true,
+        "index_sha256": "ef5edc023260fdd6dfefb110e0ad2e8109d33c9863908110c3f8de0082a09709",
+        "inventory_sha256_pin": null,
+        "inventory_url": null,
+        "repository": "https://github.com/BrokkAi/bifrost-packs"
+      },
+      "status": "qualified"
+    },
+    "receipt_path": "<CACHE>/selections/63a2aea4bc2234f8149f18a8b3540841e29940452fa38dda3215710ec09a1931/receipt.json",
+    "selection_id": "63a2aea4bc2234f8149f18a8b3540841e29940452fa38dda3215710ec09a1931",
+    "selection_reason": "preferred-version",
+    "semantic_bundle_root": "<CACHE>/selections/63a2aea4bc2234f8149f18a8b3540841e29940452fa38dda3215710ec09a1931/dependency-bifrost.public.packs/bifrost-semantic-packs"
+  },
+  "status": "selected"
+}

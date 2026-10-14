@@ -77,10 +77,10 @@ def partial(flag):
   "results": [
     {
       "completeness": "complete",
-      "id": "b7777869101ff392df4f5a9374e07401b1af1333f23ac8b28b8dcf63590c1acb",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "may_be_uninitialized",
-      "owner_id": "0bcce212a7e9c2fc382255a98a7baa732b3242591bfc7437f00408f3fc1f4f60",
+      "owner_id": "<public-id>",
       "path": "python/initialization.py",
       "proof": "proven",
       "range": {
@@ -153,13 +153,13 @@ def documented_function():
       "completeness": "complete",
       "decorator_count": 0,
       "docstring_present": false,
-      "id": "ce1837ccf4968d124c74522090c31957484ddb169f7e92890643d5d6e60b8e7f",
+      "id": "<public-id>",
       "is_override": false,
       "is_property_accessor": false,
       "language": "python",
       "lines_of_code": 4,
       "outcome": "issue",
-      "owner_id": "decl:v1:7b0bfc78d8c8ce4d96b57ff9a3d3d785e210ad6729492503fe50fb2dc20a8da0",
+      "owner_id": "decl:v1:<public-id>",
       "path": "python/documentation.py",
       "proof": "proven",
       "provenance": [
@@ -186,7 +186,7 @@ def documented_function():
             {
               "op": "python_documentation",
               "result": {
-                "id": "ce1837ccf4968d124c74522090c31957484ddb169f7e92890643d5d6e60b8e7f",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/documentation.py",
                 "range": {
@@ -202,7 +202,7 @@ def documented_function():
             {
               "op": "filter",
               "result": {
-                "id": "ce1837ccf4968d124c74522090c31957484ddb169f7e92890643d5d6e60b8e7f",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/documentation.py",
                 "range": {
@@ -272,14 +272,14 @@ def documented_function():
       "has_inheritance": false,
       "has_special_method": false,
       "has_subclasses": false,
-      "id": "745dc914bd8ae610a335f21d333c2f513637422081c65394631b393ad830b847",
+      "id": "<public-id>",
       "is_decorated": false,
       "is_probable_mixin": false,
       "is_stateful": false,
       "is_top_level": true,
       "language": "python",
       "outcome": "issue",
-      "owner_id": "decl:v1:e41944877afcf4d910a3d63aaa081147bec7d9f922db530f63df0481e609f02e",
+      "owner_id": "decl:v1:<public-id>",
       "path": "python/useless_class.py",
       "proof": "proven",
       "provenance": [
@@ -306,7 +306,7 @@ def documented_function():
             {
               "op": "python_useless_class",
               "result": {
-                "id": "745dc914bd8ae610a335f21d333c2f513637422081c65394631b393ad830b847",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/useless_class.py",
                 "range": {
@@ -322,7 +322,7 @@ def documented_function():
             {
               "op": "filter",
               "result": {
-                "id": "745dc914bd8ae610a335f21d333c2f513637422081c65394631b393ad830b847",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/useless_class.py",
                 "range": {
@@ -354,14 +354,14 @@ def documented_function():
       "has_inheritance": false,
       "has_special_method": false,
       "has_subclasses": false,
-      "id": "165f967aada203d39c82647a62077152e80d4926e3fbbe3afa761c3eaa9941ed",
+      "id": "<public-id>",
       "is_decorated": false,
       "is_probable_mixin": false,
       "is_stateful": false,
       "is_top_level": true,
       "language": "python",
       "outcome": "issue",
-      "owner_id": "decl:v1:6a732974a444bca1c8bda1cef8945800c64f3646eee6c9b9be5d22fb5afc4cda",
+      "owner_id": "decl:v1:<public-id>",
       "path": "python/useless_class.py",
       "proof": "proven",
       "provenance": [
@@ -388,7 +388,7 @@ def documented_function():
             {
               "op": "python_useless_class",
               "result": {
-                "id": "165f967aada203d39c82647a62077152e80d4926e3fbbe3afa761c3eaa9941ed",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/useless_class.py",
                 "range": {
@@ -404,7 +404,7 @@ def documented_function():
             {
               "op": "filter",
               "result": {
-                "id": "165f967aada203d39c82647a62077152e80d4926e3fbbe3afa761c3eaa9941ed",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/useless_class.py",
                 "range": {
@@ -507,10 +507,10 @@ class ShadowedChild(Base):
   "results": [
     {
       "completeness": "complete",
-      "id": "25e76f04d3f8567aa315adc490dd5f5618ccfe4e22ef287e9cc793d099b05732",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "issue",
-      "owner_id": "decl:v1:21498572a12d10a92bcd8f336b1ed7dbb611949d2503f8e2db9da49c7d919ae0",
+      "owner_id": "decl:v1:<public-id>",
       "path": "python/attribute_shadow.py",
       "proof": "proven",
       "provenance": [
@@ -537,7 +537,7 @@ class ShadowedChild(Base):
             {
               "op": "python_attribute_shadows_method",
               "result": {
-                "id": "25e76f04d3f8567aa315adc490dd5f5618ccfe4e22ef287e9cc793d099b05732",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/attribute_shadow.py",
                 "range": {
@@ -553,7 +553,7 @@ class ShadowedChild(Base):
             {
               "op": "filter",
               "result": {
-                "id": "25e76f04d3f8567aa315adc490dd5f5618ccfe4e22ef287e9cc793d099b05732",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/attribute_shadow.py",
                 "range": {
@@ -578,7 +578,7 @@ class ShadowedChild(Base):
       "reason": "initializer attribute write at python/attribute_shadow.py:3",
       "relation": "attribute_shadows_method",
       "result_type": "python_rule_fact",
-      "target_id": "decl:v1:d2fc8b9481a9c5c6f205af9e2ca03c8c9063480ca0f0d60e335be49d86ae9d04"
+      "target_id": "decl:v1:<public-id>"
     }
   ],
   "truncated": false
@@ -640,10 +640,10 @@ def safe_after_rebinding(items=[]):
   "results": [
     {
       "completeness": "complete",
-      "id": "87830c19f3cbf89acbdafd541d4a29e31591c9f26ba07736aa12c8fd2fc4cc0e",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "issue",
-      "owner_id": "decl:v1:f778cfb2b9704f4b6a532f6506166b2f9e56c3288b49d3b8286f32e7f2614faa",
+      "owner_id": "decl:v1:<public-id>",
       "path": "python/mutable_default.py",
       "proof": "proven",
       "provenance": [
@@ -670,7 +670,7 @@ def safe_after_rebinding(items=[]):
             {
               "op": "python_modification_of_default_value",
               "result": {
-                "id": "87830c19f3cbf89acbdafd541d4a29e31591c9f26ba07736aa12c8fd2fc4cc0e",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/mutable_default.py",
                 "range": {
@@ -686,7 +686,7 @@ def safe_after_rebinding(items=[]):
             {
               "op": "filter",
               "result": {
-                "id": "87830c19f3cbf89acbdafd541d4a29e31591c9f26ba07736aa12c8fd2fc4cc0e",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/mutable_default.py",
                 "range": {
@@ -780,10 +780,10 @@ class Simple:
     {
       "completeness": "complete",
       "cyclomatic_complexity": 4,
-      "id": "95f98e8bb2d32ffbe7ad2f78a58df66f21fbe72b504e1f06d5f1020f5853c736",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "issue",
-      "owner_id": "decl:v1:c68be755c5c1624a5a25ab4fd43a84f92ba4063a4444d7099a81ff933cbcb5a6",
+      "owner_id": "decl:v1:<public-id>",
       "path": "python/overly_complex_delete.py",
       "proof": "proven",
       "provenance": [
@@ -810,7 +810,7 @@ class Simple:
             {
               "op": "python_overly_complex_delete",
               "result": {
-                "id": "95f98e8bb2d32ffbe7ad2f78a58df66f21fbe72b504e1f06d5f1020f5853c736",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/overly_complex_delete.py",
                 "range": {
@@ -826,7 +826,7 @@ class Simple:
             {
               "op": "filter",
               "result": {
-                "id": "95f98e8bb2d32ffbe7ad2f78a58df66f21fbe72b504e1f06d5f1020f5853c736",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/overly_complex_delete.py",
                 "range": {
@@ -957,7 +957,7 @@ The `inference_failure` fact identifies a particular written base the analyzer c
 
 <!-- code-query-case:failed-inheritance-inference:expected -->
 ```json
-{"diagnostics":[{"code":"python_hierarchy_derivation_incomplete","impact":"incomplete","language":"python","message":"Python class hierarchy facts have open outcomes; unresolved or unsupported base information prevents a definite result"}],"results":[{"base_resolution":"unresolved","base_spelling":"MissingBase","coverage":"complete","fact_kind":"inference_failure","id":"3930540a51aab53fd4688a72eab684af480b05ce27a112a1c8b55d5c86d2e6f8","language":"python","ordinal":0,"outcome":"unresolved","path":"python/inference.py","provenance":[{"seed":{"end_line":5,"kind":"class","path":"python/inference.py","result_type":"structural_match","start_line":4},"steps":[{"op":"enclosing_decl","result":{"end_line":5,"fq_name":"python.inference.UnresolvedBase","kind":"class","path":"python/inference.py","result_type":"declaration","start_line":4}},{"op":"class_hierarchy","result":{"fact_kind":"inference_failure","id":"3930540a51aab53fd4688a72eab684af480b05ce27a112a1c8b55d5c86d2e6f8","outcome":"unresolved","path":"python/inference.py","range":{"end_column":9,"end_line":5,"start_column":1,"start_line":4},"result_type":"python_hierarchy_fact","root_id":"220141a010ff00e4c6dd435b78e619051f9eb32f51bbafef46aa77f58732b69a"}},{"op":"filter","result":{"fact_kind":"inference_failure","id":"3930540a51aab53fd4688a72eab684af480b05ce27a112a1c8b55d5c86d2e6f8","outcome":"unresolved","path":"python/inference.py","range":{"end_column":9,"end_line":5,"start_column":1,"start_line":4},"result_type":"python_hierarchy_fact","root_id":"220141a010ff00e4c6dd435b78e619051f9eb32f51bbafef46aa77f58732b69a"}}]}],"range":{"end_column":9,"end_line":5,"start_column":1,"start_line":4},"reason":"unresolved_base","result_type":"python_hierarchy_fact","root":{"end_line":5,"fq_name":"python.inference.UnresolvedBase","kind":"class","language":"python","path":"python/inference.py","signature":"class UnresolvedBase(MissingBase):","start_line":4},"root_declaration_id":"220141a010ff00e4c6dd435b78e619051f9eb32f51bbafef46aa77f58732b69a","root_id":"220141a010ff00e4c6dd435b78e619051f9eb32f51bbafef46aa77f58732b69a"}],"truncated":false}
+{"diagnostics":[{"code":"python_hierarchy_derivation_incomplete","impact":"incomplete","language":"python","message":"Python class hierarchy facts have open outcomes; unresolved or unsupported base information prevents a definite result"}],"results":[{"base_resolution":"unresolved","base_spelling":"MissingBase","coverage":"complete","fact_kind":"inference_failure","id":"<public-id>","language":"python","ordinal":0,"outcome":"unresolved","path":"python/inference.py","provenance":[{"seed":{"end_line":5,"kind":"class","path":"python/inference.py","result_type":"structural_match","start_line":4},"steps":[{"op":"enclosing_decl","result":{"end_line":5,"fq_name":"python.inference.UnresolvedBase","kind":"class","path":"python/inference.py","result_type":"declaration","start_line":4}},{"op":"class_hierarchy","result":{"fact_kind":"inference_failure","id":"<public-id>","outcome":"unresolved","path":"python/inference.py","range":{"end_column":9,"end_line":5,"start_column":1,"start_line":4},"result_type":"python_hierarchy_fact","root_id":"<public-id>"}},{"op":"filter","result":{"fact_kind":"inference_failure","id":"<public-id>","outcome":"unresolved","path":"python/inference.py","range":{"end_column":9,"end_line":5,"start_column":1,"start_line":4},"result_type":"python_hierarchy_fact","root_id":"<public-id>"}}]}],"range":{"end_column":9,"end_line":5,"start_column":1,"start_line":4},"reason":"unresolved_base","result_type":"python_hierarchy_fact","root":{"end_line":5,"fq_name":"python.inference.UnresolvedBase","kind":"class","language":"python","path":"python/inference.py","signature":"class UnresolvedBase(MissingBase):","start_line":4},"root_declaration_id":"<public-id>","root_id":"<public-id>"}],"truncated":false}
 ```
 
 ## Narrow A Member Call
@@ -1009,9 +1009,9 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "(self)",
         "start_line": 6
       },
-      "declaration_id": "92016e3b71f006511d8e4bc0439e6a369bfc091096fc88d65fde5a2d1b17618c",
+      "declaration_id": "<public-id>",
       "fact_kind": "call_lifecycle",
-      "id": "37bc527d1bb65f4a06ea578f1c2811c31b79e703f54f1b1d2f250b0b8c738828",
+      "id": "<public-id>",
       "language": "python",
       "member_name": "__init__",
       "mro_rank": 1,
@@ -1026,7 +1026,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "class LifecycleLeaf(LifecycleBase):",
         "start_line": 5
       },
-      "owner_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559",
+      "owner_id": "<public-id>",
       "path": "python/lifecycle.py",
       "provenance": [
         {
@@ -1053,7 +1053,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
               "op": "python_call_relations",
               "result": {
                 "fact_kind": "call_lifecycle",
-                "id": "37bc527d1bb65f4a06ea578f1c2811c31b79e703f54f1b1d2f250b0b8c738828",
+                "id": "<public-id>",
                 "outcome": "called",
                 "path": "python/lifecycle.py",
                 "range": {
@@ -1063,14 +1063,14 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 6
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559"
+                "root_id": "<public-id>"
               }
             },
             {
               "op": "filter",
               "result": {
                 "fact_kind": "call_lifecycle",
-                "id": "37bc527d1bb65f4a06ea578f1c2811c31b79e703f54f1b1d2f250b0b8c738828",
+                "id": "<public-id>",
                 "outcome": "called",
                 "path": "python/lifecycle.py",
                 "range": {
@@ -1080,7 +1080,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 6
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559"
+                "root_id": "<public-id>"
               }
             }
           ]
@@ -1102,8 +1102,8 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "class LifecycleLeaf(LifecycleBase):",
         "start_line": 5
       },
-      "root_declaration_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559",
-      "root_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559",
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>",
       "target": {
         "end_line": 3,
         "fq_name": "python.lifecycle.LifecycleBase.__init__",
@@ -1113,7 +1113,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "(self)",
         "start_line": 2
       },
-      "target_id": "a47ddb73c872d36934204ed32f1df7e3d636dc63d5f2cea02d71d4f3540adf91",
+      "target_id": "<public-id>",
       "target_owner": {
         "end_line": 3,
         "fq_name": "python.lifecycle.LifecycleBase",
@@ -1123,7 +1123,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "class LifecycleBase:",
         "start_line": 1
       },
-      "target_owner_id": "ced358501135bd4c21d6270966ae4c466e8eacad9b51c335761bc314c84dc1b3"
+      "target_owner_id": "<public-id>"
     },
     {
       "coverage": "complete",
@@ -1136,9 +1136,9 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "(self)",
         "start_line": 6
       },
-      "declaration_id": "92016e3b71f006511d8e4bc0439e6a369bfc091096fc88d65fde5a2d1b17618c",
+      "declaration_id": "<public-id>",
       "fact_kind": "call_lifecycle",
-      "id": "11d375fd57aa69f7392510a6b9d04c62527ed067f2930e96bd8cd59384f2ce07",
+      "id": "<public-id>",
       "language": "python",
       "member_name": "__init__",
       "outcome": "no_issue",
@@ -1151,7 +1151,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "class LifecycleLeaf(LifecycleBase):",
         "start_line": 5
       },
-      "owner_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559",
+      "owner_id": "<public-id>",
       "path": "python/lifecycle.py",
       "provenance": [
         {
@@ -1178,7 +1178,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
               "op": "python_call_relations",
               "result": {
                 "fact_kind": "call_lifecycle",
-                "id": "11d375fd57aa69f7392510a6b9d04c62527ed067f2930e96bd8cd59384f2ce07",
+                "id": "<public-id>",
                 "outcome": "no_issue",
                 "path": "python/lifecycle.py",
                 "range": {
@@ -1188,14 +1188,14 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 6
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559"
+                "root_id": "<public-id>"
               }
             },
             {
               "op": "filter",
               "result": {
                 "fact_kind": "call_lifecycle",
-                "id": "11d375fd57aa69f7392510a6b9d04c62527ed067f2930e96bd8cd59384f2ce07",
+                "id": "<public-id>",
                 "outcome": "no_issue",
                 "path": "python/lifecycle.py",
                 "range": {
@@ -1205,7 +1205,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 6
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559"
+                "root_id": "<public-id>"
               }
             }
           ]
@@ -1227,13 +1227,13 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "class LifecycleLeaf(LifecycleBase):",
         "start_line": 5
       },
-      "root_declaration_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559",
-      "root_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559"
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>"
     },
     {
       "coverage": "complete",
       "fact_kind": "call_lifecycle",
-      "id": "416f0c056aac849d99efeeecdc34a6461bc51a1be00becae6cb3fba27aa47c90",
+      "id": "<public-id>",
       "language": "python",
       "member_name": "__del__",
       "outcome": "no_issue",
@@ -1246,7 +1246,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "class LifecycleLeaf(LifecycleBase):",
         "start_line": 5
       },
-      "owner_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559",
+      "owner_id": "<public-id>",
       "path": "python/lifecycle.py",
       "provenance": [
         {
@@ -1273,7 +1273,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
               "op": "python_call_relations",
               "result": {
                 "fact_kind": "call_lifecycle",
-                "id": "416f0c056aac849d99efeeecdc34a6461bc51a1be00becae6cb3fba27aa47c90",
+                "id": "<public-id>",
                 "outcome": "no_issue",
                 "path": "python/lifecycle.py",
                 "range": {
@@ -1283,14 +1283,14 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 5
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559"
+                "root_id": "<public-id>"
               }
             },
             {
               "op": "filter",
               "result": {
                 "fact_kind": "call_lifecycle",
-                "id": "416f0c056aac849d99efeeecdc34a6461bc51a1be00becae6cb3fba27aa47c90",
+                "id": "<public-id>",
                 "outcome": "no_issue",
                 "path": "python/lifecycle.py",
                 "range": {
@@ -1300,7 +1300,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 5
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559"
+                "root_id": "<public-id>"
               }
             }
           ]
@@ -1322,8 +1322,8 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "class LifecycleLeaf(LifecycleBase):",
         "start_line": 5
       },
-      "root_declaration_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559",
-      "root_id": "535172ee3cb59edf22337efe7c69cfb82a59afa15efcca9bff54194c3395b559"
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -1360,9 +1360,9 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "(self)",
         "start_line": 14
       },
-      "declaration_id": "d349f9e99aac4b6537853a349bd87d86a73cb2bbb2afcdc1e850690764c0c67a",
+      "declaration_id": "<public-id>",
       "fact_kind": "call_context",
-      "id": "b0c03dfdb913d62fcd742b5778b9a7da636e7491546c0023680ca401eb82034a",
+      "id": "<public-id>",
       "language": "python",
       "member_name": "__del__",
       "mro_rank": 1,
@@ -1376,7 +1376,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "class CleanupLeaf(CleanupBase):",
         "start_line": 13
       },
-      "owner_id": "6e0307a75d6541490ba1b02e5007b421ce8b15ea0d1bf06f272daaa90d02da1e",
+      "owner_id": "<public-id>",
       "path": "python/lifecycle.py",
       "provenance": [
         {
@@ -1403,7 +1403,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
               "op": "python_call_relations",
               "result": {
                 "fact_kind": "call_context",
-                "id": "b0c03dfdb913d62fcd742b5778b9a7da636e7491546c0023680ca401eb82034a",
+                "id": "<public-id>",
                 "outcome": "approved_cleanup",
                 "path": "python/lifecycle.py",
                 "range": {
@@ -1413,14 +1413,14 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 15
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "6e0307a75d6541490ba1b02e5007b421ce8b15ea0d1bf06f272daaa90d02da1e"
+                "root_id": "<public-id>"
               }
             },
             {
               "op": "filter",
               "result": {
                 "fact_kind": "call_context",
-                "id": "b0c03dfdb913d62fcd742b5778b9a7da636e7491546c0023680ca401eb82034a",
+                "id": "<public-id>",
                 "outcome": "approved_cleanup",
                 "path": "python/lifecycle.py",
                 "range": {
@@ -1430,7 +1430,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 15
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "6e0307a75d6541490ba1b02e5007b421ce8b15ea0d1bf06f272daaa90d02da1e"
+                "root_id": "<public-id>"
               }
             }
           ]
@@ -1452,8 +1452,8 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "class CleanupLeaf(CleanupBase):",
         "start_line": 13
       },
-      "root_declaration_id": "6e0307a75d6541490ba1b02e5007b421ce8b15ea0d1bf06f272daaa90d02da1e",
-      "root_id": "6e0307a75d6541490ba1b02e5007b421ce8b15ea0d1bf06f272daaa90d02da1e",
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>",
       "target": {
         "end_line": 11,
         "fq_name": "python.lifecycle.CleanupBase.__del__",
@@ -1463,7 +1463,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "(self)",
         "start_line": 10
       },
-      "target_id": "e3de44eda7ba07083c6a7d74f3ea7953801acb3ce815080c0f7404d2b0a4a5f8",
+      "target_id": "<public-id>",
       "target_owner": {
         "end_line": 11,
         "fq_name": "python.lifecycle.CleanupBase",
@@ -1473,7 +1473,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
         "signature": "class CleanupBase:",
         "start_line": 9
       },
-      "target_owner_id": "4041f54d24685e94db8894b61206f2c3c2e3f0a9fd64a1e7e9e1634d247b8707"
+      "target_owner_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -1557,22 +1557,22 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
     {
       "actual_count": 1,
       "actual_index": 0,
-      "argument_id": "362916b538b6ec5282d4e4681312bb4348ce9ef755a714ab84079e7e17e30b37",
+      "argument_id": "<public-id>",
       "binding_kind": "positional",
       "bound_count": 1,
       "conversion_reason": "unsupported_language",
       "conversion_status": "unknown",
       "coverage": "exhaustive",
-      "declared_target_id": "decl:v1:e7fd53af94d0920970dc7b23fa4b48c59dba67e9c6935d38497a220e7f5a73d4",
+      "declared_target_id": "decl:v1:<public-id>",
       "dispatch_coverage": "open",
       "dispatch_outcome": "unknown",
       "dispatch_target_count": 0,
       "dispatch_targets_truncated": false,
       "formal_index": 0,
-      "formal_layout_id": "19fbcec6f972b52bf6454519f96fd20ab36a71d75008384e289e698621273583",
+      "formal_layout_id": "<public-id>",
       "formal_name": "value",
-      "group_id": "11198aa6162f7ac33dd7d9f1f405ab95669f8e1abb17dc24dadfd67d19208827",
-      "id": "0ff9e4bd5916fba9ba2b0a3362ccf3d31bb63ed4ad237a26e82cd9deb5bfad28",
+      "group_id": "<public-id>",
+      "id": "<public-id>",
       "language": "python",
       "mapping": "exact",
       "path": "python/app.py",
@@ -1591,7 +1591,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
               "result": {
                 "call_kind": "function",
                 "coverage": "exact",
-                "id": "4b2cfd43b428339cd8711eb5b5e07533ff241cea5a4982662a32958f86c15ed7",
+                "id": "<public-id>",
                 "path": "python/app.py",
                 "range": {
                   "end_column": 18,
@@ -1600,7 +1600,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 21
                 },
                 "result_type": "call_shape",
-                "site_id": "4b2cfd43b428339cd8711eb5b5e07533ff241cea5a4982662a32958f86c15ed7"
+                "site_id": "<public-id>"
               }
             },
             {
@@ -1608,7 +1608,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
               "result": {
                 "binding_kind": "positional",
                 "coverage": "exhaustive",
-                "id": "0ff9e4bd5916fba9ba2b0a3362ccf3d31bb63ed4ad237a26e82cd9deb5bfad28",
+                "id": "<public-id>",
                 "mapping": "exact",
                 "path": "python/app.py",
                 "range": {
@@ -1618,7 +1618,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 21
                 },
                 "result_type": "call_binding",
-                "site_id": "4b2cfd43b428339cd8711eb5b5e07533ff241cea5a4982662a32958f86c15ed7",
+                "site_id": "<public-id>",
                 "target_origin": "source"
               }
             },
@@ -1627,7 +1627,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
               "result": {
                 "binding_kind": "positional",
                 "coverage": "exhaustive",
-                "id": "0ff9e4bd5916fba9ba2b0a3362ccf3d31bb63ed4ad237a26e82cd9deb5bfad28",
+                "id": "<public-id>",
                 "mapping": "exact",
                 "path": "python/app.py",
                 "range": {
@@ -1637,7 +1637,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 21
                 },
                 "result_type": "call_binding",
-                "site_id": "4b2cfd43b428339cd8711eb5b5e07533ff241cea5a4982662a32958f86c15ed7",
+                "site_id": "<public-id>",
                 "target_origin": "source"
               }
             },
@@ -1646,7 +1646,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
               "result": {
                 "binding_kind": "positional",
                 "coverage": "exhaustive",
-                "id": "0ff9e4bd5916fba9ba2b0a3362ccf3d31bb63ed4ad237a26e82cd9deb5bfad28",
+                "id": "<public-id>",
                 "mapping": "exact",
                 "path": "python/app.py",
                 "range": {
@@ -1656,7 +1656,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 21
                 },
                 "result_type": "call_binding",
-                "site_id": "4b2cfd43b428339cd8711eb5b5e07533ff241cea5a4982662a32958f86c15ed7",
+                "site_id": "<public-id>",
                 "target_origin": "source"
               }
             }
@@ -1672,9 +1672,9 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
       "result_type": "call_binding",
       "selector_exact": true,
       "selector_proof": "derived",
-      "signature_id": "19fbcec6f972b52bf6454519f96fd20ab36a71d75008384e289e698621273583",
-      "site_ast_id": "51198bf617402caa98cd61bd6ae3a79c2f2392d82ece2c57a2588e9a6cfb827a",
-      "site_id": "4b2cfd43b428339cd8711eb5b5e07533ff241cea5a4982662a32958f86c15ed7",
+      "signature_id": "<public-id>",
+      "site_ast_id": "<public-id>",
+      "site_id": "<public-id>",
       "target": {
         "end_line": 19,
         "fq_name": "python.app.receive",
@@ -1743,9 +1743,9 @@ class Derived(Base):
         "signature": "(self, value, label)",
         "start_line": 6
       },
-      "declaration_id": "1fd391239727cdc055fdc593653c4bcda644378fdf0df59ff97377c52e2b0b69",
+      "declaration_id": "<public-id>",
       "fact_kind": "override_signature",
-      "id": "fcf4ef6402338d9e0c0bc1ad911a7c803d8062132f310020125b64b0a55d5adb",
+      "id": "<public-id>",
       "language": "python",
       "member_name": "process",
       "mro_rank": 1,
@@ -1759,7 +1759,7 @@ class Derived(Base):
         "signature": "class Derived(Base):",
         "start_line": 5
       },
-      "owner_id": "123a88aaa1b39b062841595bbcf747435aa529cd920f7d35803d554ce6fe6eee",
+      "owner_id": "<public-id>",
       "path": "python/overrides.py",
       "provenance": [
         {
@@ -1786,7 +1786,7 @@ class Derived(Base):
               "op": "python_override_signatures",
               "result": {
                 "fact_kind": "override_signature",
-                "id": "fcf4ef6402338d9e0c0bc1ad911a7c803d8062132f310020125b64b0a55d5adb",
+                "id": "<public-id>",
                 "outcome": "overrides",
                 "path": "python/overrides.py",
                 "range": {
@@ -1796,7 +1796,7 @@ class Derived(Base):
                   "start_line": 6
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "1fd391239727cdc055fdc593653c4bcda644378fdf0df59ff97377c52e2b0b69"
+                "root_id": "<public-id>"
               }
             }
           ]
@@ -1818,12 +1818,12 @@ class Derived(Base):
         "signature": "(self, value, label)",
         "start_line": 6
       },
-      "root_declaration_id": "1fd391239727cdc055fdc593653c4bcda644378fdf0df59ff97377c52e2b0b69",
-      "root_id": "1fd391239727cdc055fdc593653c4bcda644378fdf0df59ff97377c52e2b0b69",
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>",
       "source_repeated_arity": false,
       "source_required_arity": 3,
       "source_signature_coverage": "exact",
-      "source_signature_id": "e394fb4d8cd482c0cc7b19f6b95a0344615a2e67d2eb855fa181f8322ae2bbdb",
+      "source_signature_id": "<public-id>",
       "source_signature_ordinal": 0,
       "source_total_arity": 3,
       "target": {
@@ -1835,7 +1835,7 @@ class Derived(Base):
         "signature": "(self, value)",
         "start_line": 2
       },
-      "target_id": "c0c1a5bc8aed93306859722983e3840a684fbd4d9fdddf04cfa7f9a3dda2e1bc",
+      "target_id": "<public-id>",
       "target_owner": {
         "end_line": 3,
         "fq_name": "python.overrides.Base",
@@ -1845,11 +1845,11 @@ class Derived(Base):
         "signature": "class Base:",
         "start_line": 1
       },
-      "target_owner_id": "95a64935d06ac908ead76844f68c6e02225de95c6dad1c30d54060b16976a68a",
+      "target_owner_id": "<public-id>",
       "target_repeated_arity": false,
       "target_required_arity": 2,
       "target_signature_coverage": "exact",
-      "target_signature_id": "79f66533429d8bb02c5d4afd465ea0307f853664b9d630d6b26881c67e73368f",
+      "target_signature_id": "<public-id>",
       "target_signature_ordinal": 0,
       "target_total_arity": 2
     }
@@ -3721,14 +3721,14 @@ comments are excluded.
       "explicit_return_statements": 2,
       "explicit_value_returns": 1,
       "fallthrough_none_returns": 0,
-      "id": "4e03e82e5e265ea2932f1cc3e71dfe00767cde06adba8524c5c64c0254708488",
+      "id": "<public-id>",
       "is_async": false,
       "is_generator": false,
       "language": "python",
       "mixed_returns": false,
       "none_returns": 1,
       "outcome": "uniform_returns",
-      "owner_id": "f700b2164b22b0689c54b1d1a1f8a195b242c567262d84ec799ce081a6410072",
+      "owner_id": "<public-id>",
       "path": "python/public-vocabulary.py",
       "proof": "proven",
       "provenance": [
@@ -3744,7 +3744,7 @@ comments are excluded.
             {
               "op": "procedure_of",
               "result": {
-                "id": "f700b2164b22b0689c54b1d1a1f8a195b242c567262d84ec799ce081a6410072",
+                "id": "<public-id>",
                 "path": "python/public-vocabulary.py",
                 "procedure_kind": "function",
                 "range": {
@@ -3759,7 +3759,7 @@ comments are excluded.
             {
               "op": "procedure_return_profile",
               "result": {
-                "id": "4e03e82e5e265ea2932f1cc3e71dfe00767cde06adba8524c5c64c0254708488",
+                "id": "<public-id>",
                 "outcome": "uniform_returns",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -3806,7 +3806,7 @@ comments are excluded.
   "results": [
     {
       "completeness": "complete",
-      "id": "1991e32bc4bd00c34510f79c2465c12b00421b4b6e19ff32713eae05860ddaef",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "consumed",
       "owner_id": null,
@@ -3827,7 +3827,7 @@ comments are excluded.
               "result": {
                 "call_kind": "function",
                 "coverage": "exact",
-                "id": "ac323aba1f00a398c63b8fc57b8426f849ad4f015179e2e97533ea2fd1010308",
+                "id": "<public-id>",
                 "path": "python/public-vocabulary.py",
                 "range": {
                   "end_column": 36,
@@ -3836,13 +3836,13 @@ comments are excluded.
                   "start_line": 28
                 },
                 "result_type": "call_shape",
-                "site_id": "ac323aba1f00a398c63b8fc57b8426f849ad4f015179e2e97533ea2fd1010308"
+                "site_id": "<public-id>"
               }
             },
             {
               "op": "call_result_use",
               "result": {
-                "id": "1991e32bc4bd00c34510f79c2465c12b00421b4b6e19ff32713eae05860ddaef",
+                "id": "<public-id>",
                 "outcome": "consumed",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -3868,11 +3868,11 @@ comments are excluded.
       "result_type": "python_rule_fact",
       "result_use": "consumed",
       "return_contract": "may_return_value",
-      "target_id": "ad62196126533ebe80c02c4238285b85da0a416c10a9b144d81207165915d0e9"
+      "target_id": "<public-id>"
     },
     {
       "completeness": "complete",
-      "id": "a5ff0a0977a3042502b60ae6d235555c923e578b47adf1dab86ab79c0aa19382",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "consumed",
       "owner_id": null,
@@ -3893,7 +3893,7 @@ comments are excluded.
               "result": {
                 "call_kind": "function",
                 "coverage": "exact",
-                "id": "413b1f28df2ce588a24a18d1b56a1e78382176920dcabbdacd9fa4d99fbd5a31",
+                "id": "<public-id>",
                 "path": "python/public-vocabulary.py",
                 "range": {
                   "end_column": 27,
@@ -3902,13 +3902,13 @@ comments are excluded.
                   "start_line": 31
                 },
                 "result_type": "call_shape",
-                "site_id": "413b1f28df2ce588a24a18d1b56a1e78382176920dcabbdacd9fa4d99fbd5a31"
+                "site_id": "<public-id>"
               }
             },
             {
               "op": "call_result_use",
               "result": {
-                "id": "a5ff0a0977a3042502b60ae6d235555c923e578b47adf1dab86ab79c0aa19382",
+                "id": "<public-id>",
                 "outcome": "consumed",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -3934,7 +3934,7 @@ comments are excluded.
       "result_type": "python_rule_fact",
       "result_use": "consumed",
       "return_contract": "may_return_value",
-      "target_id": "ad62196126533ebe80c02c4238285b85da0a416c10a9b144d81207165915d0e9"
+      "target_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -3966,7 +3966,7 @@ unresolved unittest ancestry remains `unknown`.
   "results": [
     {
       "completeness": "complete",
-      "id": "3f9c74dfb22c51dec89f497eefeeb1ec20d0614f2a36896933eeb4a65356c817",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "no_issue",
       "owner_id": null,
@@ -3985,7 +3985,7 @@ unresolved unittest ancestry remains `unknown`.
             {
               "op": "python_assertion_context",
               "result": {
-                "id": "3f9c74dfb22c51dec89f497eefeeb1ec20d0614f2a36896933eeb4a65356c817",
+                "id": "<public-id>",
                 "outcome": "no_issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4014,7 +4014,7 @@ unresolved unittest ancestry remains `unknown`.
     },
     {
       "completeness": "complete",
-      "id": "d6a994ba9c828710719bec8a7b43c75043788026e548124831758f0f4804e1da",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "no_issue",
       "owner_id": null,
@@ -4033,7 +4033,7 @@ unresolved unittest ancestry remains `unknown`.
             {
               "op": "python_assertion_context",
               "result": {
-                "id": "d6a994ba9c828710719bec8a7b43c75043788026e548124831758f0f4804e1da",
+                "id": "<public-id>",
                 "outcome": "no_issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4062,7 +4062,7 @@ unresolved unittest ancestry remains `unknown`.
     },
     {
       "completeness": "complete",
-      "id": "7d7ced100183c6a00d89aec95b5ad987e2418c01a7615369f7a4a3d7c8a9bd99",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "no_issue",
       "owner_id": null,
@@ -4081,7 +4081,7 @@ unresolved unittest ancestry remains `unknown`.
             {
               "op": "python_assertion_context",
               "result": {
-                "id": "7d7ced100183c6a00d89aec95b5ad987e2418c01a7615369f7a4a3d7c8a9bd99",
+                "id": "<public-id>",
                 "outcome": "no_issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4160,7 +4160,7 @@ returns match that count.
       "assignment_target_count": 3,
       "completeness": "complete",
       "distinct_tuple_arities": 2,
-      "id": "66673978755ea6becfedc6c506d290133240d47bbfdb713c0b0c3fb22ef8ed2d",
+      "id": "<public-id>",
       "is_async": false,
       "is_generator": false,
       "language": "python",
@@ -4182,7 +4182,7 @@ returns match that count.
             {
               "op": "tuple_return_assignment",
               "result": {
-                "id": "66673978755ea6becfedc6c506d290133240d47bbfdb713c0b0c3fb22ef8ed2d",
+                "id": "<public-id>",
                 "outcome": "mixed_tuple_arities",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4198,7 +4198,7 @@ returns match that count.
             {
               "op": "filter",
               "result": {
-                "id": "66673978755ea6becfedc6c506d290133240d47bbfdb713c0b0c3fb22ef8ed2d",
+                "id": "<public-id>",
                 "outcome": "mixed_tuple_arities",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4222,7 +4222,7 @@ returns match that count.
       },
       "relation": "tuple_return_groups",
       "result_type": "python_rule_fact",
-      "target_id": "7fabcceb15862e49b6dcf299e906c0c44487e9f548cb159a1dbb2ebef607d91d",
+      "target_id": "<public-id>",
       "tuple_return_arities": [
         2,
         3
@@ -4272,7 +4272,7 @@ own range, so both missing-comma locations remain independently selectable.
   "results": [
     {
       "completeness": "complete",
-      "id": "e241153176028e25d0b6c447e3be5410b27f2a0d8a0816bfc2a8af717a2ae558",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "issue",
       "owner_id": null,
@@ -4291,7 +4291,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "python_implicit_string_concatenation",
               "result": {
-                "id": "e241153176028e25d0b6c447e3be5410b27f2a0d8a0816bfc2a8af717a2ae558",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4307,7 +4307,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "filter",
               "result": {
-                "id": "e241153176028e25d0b6c447e3be5410b27f2a0d8a0816bfc2a8af717a2ae558",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4334,7 +4334,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "python_implicit_string_concatenation",
               "result": {
-                "id": "e241153176028e25d0b6c447e3be5410b27f2a0d8a0816bfc2a8af717a2ae558",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4350,7 +4350,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "filter",
               "result": {
-                "id": "e241153176028e25d0b6c447e3be5410b27f2a0d8a0816bfc2a8af717a2ae558",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4377,7 +4377,7 @@ own range, so both missing-comma locations remain independently selectable.
     },
     {
       "completeness": "complete",
-      "id": "767d8a9dd445b1cd75ee01b23f5a7087080d61d7c45762d80a7118456493a291",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "issue",
       "owner_id": null,
@@ -4396,7 +4396,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "python_implicit_string_concatenation",
               "result": {
-                "id": "767d8a9dd445b1cd75ee01b23f5a7087080d61d7c45762d80a7118456493a291",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4412,7 +4412,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "filter",
               "result": {
-                "id": "767d8a9dd445b1cd75ee01b23f5a7087080d61d7c45762d80a7118456493a291",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4439,7 +4439,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "python_implicit_string_concatenation",
               "result": {
-                "id": "767d8a9dd445b1cd75ee01b23f5a7087080d61d7c45762d80a7118456493a291",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4455,7 +4455,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "filter",
               "result": {
-                "id": "767d8a9dd445b1cd75ee01b23f5a7087080d61d7c45762d80a7118456493a291",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4482,7 +4482,7 @@ own range, so both missing-comma locations remain independently selectable.
     },
     {
       "completeness": "complete",
-      "id": "a7922d6da45640f29127ca6215d6449b82d3ade4654c8bf4028e11bf9e281b3c",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "issue",
       "owner_id": null,
@@ -4501,7 +4501,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "python_implicit_string_concatenation",
               "result": {
-                "id": "a7922d6da45640f29127ca6215d6449b82d3ade4654c8bf4028e11bf9e281b3c",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4517,7 +4517,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "filter",
               "result": {
-                "id": "a7922d6da45640f29127ca6215d6449b82d3ade4654c8bf4028e11bf9e281b3c",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4544,7 +4544,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "python_implicit_string_concatenation",
               "result": {
-                "id": "a7922d6da45640f29127ca6215d6449b82d3ade4654c8bf4028e11bf9e281b3c",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4560,7 +4560,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "filter",
               "result": {
-                "id": "a7922d6da45640f29127ca6215d6449b82d3ade4654c8bf4028e11bf9e281b3c",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4587,7 +4587,7 @@ own range, so both missing-comma locations remain independently selectable.
     },
     {
       "completeness": "complete",
-      "id": "a4dcf651d6771ec01c239641839e12703b686d0291044d7d14db150756069861",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "issue",
       "owner_id": null,
@@ -4606,7 +4606,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "python_implicit_string_concatenation",
               "result": {
-                "id": "a4dcf651d6771ec01c239641839e12703b686d0291044d7d14db150756069861",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4622,7 +4622,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "filter",
               "result": {
-                "id": "a4dcf651d6771ec01c239641839e12703b686d0291044d7d14db150756069861",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4649,7 +4649,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "python_implicit_string_concatenation",
               "result": {
-                "id": "a4dcf651d6771ec01c239641839e12703b686d0291044d7d14db150756069861",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4665,7 +4665,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "filter",
               "result": {
-                "id": "a4dcf651d6771ec01c239641839e12703b686d0291044d7d14db150756069861",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4713,13 +4713,13 @@ own range, so both missing-comma locations remain independently selectable.
       "annotated": false,
       "completeness": "complete",
       "distinct_tuple_arities": 2,
-      "id": "4f92788b91e35c5d3c727548d34acf1882e9f9c8fe84f2b8c7612b36f11d459e",
+      "id": "<public-id>",
       "is_async": false,
       "is_generator": false,
       "language": "python",
       "mixed_tuple_arities": true,
       "outcome": "mixed_tuple_arities",
-      "owner_id": "dfed963f58b8d942e4f3b3eab53e42fc880be7cf6c6bd4751134a75a47d3f9b8",
+      "owner_id": "<public-id>",
       "path": "python/public-vocabulary.py",
       "proof": "proven",
       "provenance": [
@@ -4735,7 +4735,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "procedure_of",
               "result": {
-                "id": "dfed963f58b8d942e4f3b3eab53e42fc880be7cf6c6bd4751134a75a47d3f9b8",
+                "id": "<public-id>",
                 "path": "python/public-vocabulary.py",
                 "procedure_kind": "function",
                 "range": {
@@ -4750,7 +4750,7 @@ own range, so both missing-comma locations remain independently selectable.
             {
               "op": "tuple_return_groups",
               "result": {
-                "id": "4f92788b91e35c5d3c727548d34acf1882e9f9c8fe84f2b8c7612b36f11d459e",
+                "id": "<public-id>",
                 "outcome": "mixed_tuple_arities",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4808,7 +4808,7 @@ and lambdas with default parameters out of unnecessary-wrapper findings.
       "completeness": "complete",
       "default_equivalent": "yes",
       "forwarded": true,
-      "id": "a1782e95e117f60d9416e550fd72ff7d56ef8694aaa9e139aa372f736637bd5e",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "forwarded",
       "owner_id": null,
@@ -4828,7 +4828,7 @@ and lambdas with default parameters out of unnecessary-wrapper findings.
             {
               "op": "lambda_forwarding",
               "result": {
-                "id": "a1782e95e117f60d9416e550fd72ff7d56ef8694aaa9e139aa372f736637bd5e",
+                "id": "<public-id>",
                 "outcome": "forwarded",
                 "path": "python/app.py",
                 "range": {
@@ -4852,14 +4852,14 @@ and lambdas with default parameters out of unnecessary-wrapper findings.
       },
       "relation": "lambda_forwarding",
       "result_type": "python_rule_fact",
-      "target_id": "c545898d1125110771b5356554b9ebdb1bd0c60619cf3adb6b109b2a47f9369d"
+      "target_id": "<public-id>"
     },
     {
       "callable_evaluation_time": "stable_at_creation",
       "completeness": "complete",
       "default_equivalent": "yes",
       "forwarded": true,
-      "id": "9819514d96beef2cbe4a27f75fb4eeb328931cf16871cc344ea29c197e5eeada",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "forwarded",
       "owner_id": null,
@@ -4879,7 +4879,7 @@ and lambdas with default parameters out of unnecessary-wrapper findings.
             {
               "op": "lambda_forwarding",
               "result": {
-                "id": "9819514d96beef2cbe4a27f75fb4eeb328931cf16871cc344ea29c197e5eeada",
+                "id": "<public-id>",
                 "outcome": "forwarded",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -4903,7 +4903,7 @@ and lambdas with default parameters out of unnecessary-wrapper findings.
       },
       "relation": "lambda_forwarding",
       "result_type": "python_rule_fact",
-      "target_id": "ad62196126533ebe80c02c4238285b85da0a416c10a9b144d81207165915d0e9"
+      "target_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -5263,7 +5263,7 @@ field to equal `false`; an absent value means the import context was unavailable
     {
       "coverage": "complete",
       "fact_kind": "hierarchy",
-      "id": "982246ff570854572acfb76529c73b00cef6db33336f8a0406a51dda8121c706",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "complete",
       "path": "python/public-vocabulary.py",
@@ -5292,7 +5292,7 @@ field to equal `false`; an absent value means the import context was unavailable
               "op": "class_hierarchy",
               "result": {
                 "fact_kind": "hierarchy",
-                "id": "982246ff570854572acfb76529c73b00cef6db33336f8a0406a51dda8121c706",
+                "id": "<public-id>",
                 "outcome": "complete",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -5302,7 +5302,7 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_line": 38
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9"
+                "root_id": "<public-id>"
               }
             }
           ]
@@ -5324,8 +5324,8 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "class Child(Parent):",
         "start_line": 38
       },
-      "root_declaration_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9",
-      "root_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9"
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -5351,7 +5351,7 @@ field to equal `false`; an absent value means the import context was unavailable
       "base_spelling": "Parent",
       "coverage": "complete",
       "fact_kind": "base",
-      "id": "3992dd4199c80e39d7240779de3f0f150f9bff91196ed1bed94a41daabf0ca3c",
+      "id": "<public-id>",
       "language": "python",
       "ordinal": 0,
       "outcome": "resolved",
@@ -5381,7 +5381,7 @@ field to equal `false`; an absent value means the import context was unavailable
               "op": "class_bases",
               "result": {
                 "fact_kind": "base",
-                "id": "3992dd4199c80e39d7240779de3f0f150f9bff91196ed1bed94a41daabf0ca3c",
+                "id": "<public-id>",
                 "outcome": "resolved",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -5391,7 +5391,7 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_line": 38
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9"
+                "root_id": "<public-id>"
               }
             }
           ]
@@ -5413,8 +5413,8 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "class Child(Parent):",
         "start_line": 38
       },
-      "root_declaration_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9",
-      "root_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9",
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>",
       "target": {
         "end_line": 36,
         "fq_name": "python.public-vocabulary.Parent",
@@ -5424,7 +5424,7 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "class Parent:",
         "start_line": 34
       },
-      "target_id": "64b7200500166a9a58338f2ee036837896bfc8b6f13906f8e7d7fac210051b81"
+      "target_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -5456,9 +5456,9 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "class Child(Parent):",
         "start_line": 38
       },
-      "declaration_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9",
+      "declaration_id": "<public-id>",
       "fact_kind": "mro",
-      "id": "8223c8f755d8662c94bfc5492f63a7abdbdfe1dbb6240016bb1a6c1e193920e1",
+      "id": "<public-id>",
       "language": "python",
       "mro_rank": 0,
       "ordinal": 0,
@@ -5489,7 +5489,7 @@ field to equal `false`; an absent value means the import context was unavailable
               "op": "class_mro",
               "result": {
                 "fact_kind": "mro",
-                "id": "8223c8f755d8662c94bfc5492f63a7abdbdfe1dbb6240016bb1a6c1e193920e1",
+                "id": "<public-id>",
                 "outcome": "complete",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -5499,7 +5499,7 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_line": 38
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9"
+                "root_id": "<public-id>"
               }
             }
           ]
@@ -5521,8 +5521,8 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "class Child(Parent):",
         "start_line": 38
       },
-      "root_declaration_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9",
-      "root_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9"
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>"
     },
     {
       "coverage": "complete",
@@ -5535,9 +5535,9 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "class Parent:",
         "start_line": 34
       },
-      "declaration_id": "64b7200500166a9a58338f2ee036837896bfc8b6f13906f8e7d7fac210051b81",
+      "declaration_id": "<public-id>",
       "fact_kind": "mro",
-      "id": "a431c4776a01d06c17a8190e567aa53137840a9c3553c164c36b722f6d384f88",
+      "id": "<public-id>",
       "language": "python",
       "mro_rank": 1,
       "ordinal": 1,
@@ -5568,7 +5568,7 @@ field to equal `false`; an absent value means the import context was unavailable
               "op": "class_mro",
               "result": {
                 "fact_kind": "mro",
-                "id": "a431c4776a01d06c17a8190e567aa53137840a9c3553c164c36b722f6d384f88",
+                "id": "<public-id>",
                 "outcome": "complete",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -5578,7 +5578,7 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_line": 38
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9"
+                "root_id": "<public-id>"
               }
             }
           ]
@@ -5600,8 +5600,8 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "class Child(Parent):",
         "start_line": 38
       },
-      "root_declaration_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9",
-      "root_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9"
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -5639,9 +5639,9 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "(self)",
         "start_line": 39
       },
-      "declaration_id": "8bf41cd6290eb226a89dd7efbd302a4e535411446bc38a9f4eadd03ed5f27e88",
+      "declaration_id": "<public-id>",
       "fact_kind": "member",
-      "id": "cd0d1f6cde758936887390dc1f99688f2bd746b9cad10edd94186a4f08e1d2d6",
+      "id": "<public-id>",
       "language": "python",
       "member_name": "describe",
       "mro_rank": 0,
@@ -5656,7 +5656,7 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "class Child(Parent):",
         "start_line": 38
       },
-      "owner_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9",
+      "owner_id": "<public-id>",
       "path": "python/public-vocabulary.py",
       "provenance": [
         {
@@ -5683,7 +5683,7 @@ field to equal `false`; an absent value means the import context was unavailable
               "op": "mro_members",
               "result": {
                 "fact_kind": "member",
-                "id": "cd0d1f6cde758936887390dc1f99688f2bd746b9cad10edd94186a4f08e1d2d6",
+                "id": "<public-id>",
                 "outcome": "selected",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -5693,7 +5693,7 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_line": 38
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9"
+                "root_id": "<public-id>"
               }
             }
           ]
@@ -5715,8 +5715,8 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "class Child(Parent):",
         "start_line": 38
       },
-      "root_declaration_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9",
-      "root_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9"
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -5748,9 +5748,9 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "(self)",
         "start_line": 35
       },
-      "declaration_id": "f2b5c21a65e24435922f1c892956acbadc5e86d9bc7439608e86a4778e07383a",
+      "declaration_id": "<public-id>",
       "fact_kind": "override",
-      "id": "bfd273de4b81f475a368dd0ab13669724cfb3e4ab0c343d05e1abb5f115713ba",
+      "id": "<public-id>",
       "language": "python",
       "member_name": "describe",
       "outcome": "no_override",
@@ -5763,7 +5763,7 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "class Parent:",
         "start_line": 34
       },
-      "owner_id": "64b7200500166a9a58338f2ee036837896bfc8b6f13906f8e7d7fac210051b81",
+      "owner_id": "<public-id>",
       "path": "python/public-vocabulary.py",
       "provenance": [
         {
@@ -5790,7 +5790,7 @@ field to equal `false`; an absent value means the import context was unavailable
               "op": "python_overrides",
               "result": {
                 "fact_kind": "override",
-                "id": "bfd273de4b81f475a368dd0ab13669724cfb3e4ab0c343d05e1abb5f115713ba",
+                "id": "<public-id>",
                 "outcome": "no_override",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -5800,7 +5800,7 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_line": 35
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "f2b5c21a65e24435922f1c892956acbadc5e86d9bc7439608e86a4778e07383a"
+                "root_id": "<public-id>"
               }
             }
           ]
@@ -5822,8 +5822,8 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "(self)",
         "start_line": 35
       },
-      "root_declaration_id": "f2b5c21a65e24435922f1c892956acbadc5e86d9bc7439608e86a4778e07383a",
-      "root_id": "f2b5c21a65e24435922f1c892956acbadc5e86d9bc7439608e86a4778e07383a"
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>"
     },
     {
       "coverage": "complete",
@@ -5836,9 +5836,9 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "(self)",
         "start_line": 39
       },
-      "declaration_id": "8bf41cd6290eb226a89dd7efbd302a4e535411446bc38a9f4eadd03ed5f27e88",
+      "declaration_id": "<public-id>",
       "fact_kind": "override",
-      "id": "a5174125441759829f097453e910510a3c83eb0abc7c0bf2897c1a3c06de045d",
+      "id": "<public-id>",
       "language": "python",
       "member_name": "describe",
       "mro_rank": 1,
@@ -5852,7 +5852,7 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "class Child(Parent):",
         "start_line": 38
       },
-      "owner_id": "4eed335041fddf582844dd582e567637d0f4d8045c0bc0b850028e4f9ffd01a9",
+      "owner_id": "<public-id>",
       "path": "python/public-vocabulary.py",
       "provenance": [
         {
@@ -5879,7 +5879,7 @@ field to equal `false`; an absent value means the import context was unavailable
               "op": "python_overrides",
               "result": {
                 "fact_kind": "override",
-                "id": "a5174125441759829f097453e910510a3c83eb0abc7c0bf2897c1a3c06de045d",
+                "id": "<public-id>",
                 "outcome": "overrides",
                 "path": "python/public-vocabulary.py",
                 "range": {
@@ -5889,7 +5889,7 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_line": 39
                 },
                 "result_type": "python_hierarchy_fact",
-                "root_id": "8bf41cd6290eb226a89dd7efbd302a4e535411446bc38a9f4eadd03ed5f27e88"
+                "root_id": "<public-id>"
               }
             }
           ]
@@ -5911,8 +5911,8 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "(self)",
         "start_line": 39
       },
-      "root_declaration_id": "8bf41cd6290eb226a89dd7efbd302a4e535411446bc38a9f4eadd03ed5f27e88",
-      "root_id": "8bf41cd6290eb226a89dd7efbd302a4e535411446bc38a9f4eadd03ed5f27e88",
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>",
       "target": {
         "end_line": 36,
         "fq_name": "python.public-vocabulary.Parent.describe",
@@ -5922,7 +5922,7 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "(self)",
         "start_line": 35
       },
-      "target_id": "f2b5c21a65e24435922f1c892956acbadc5e86d9bc7439608e86a4778e07383a",
+      "target_id": "<public-id>",
       "target_owner": {
         "end_line": 36,
         "fq_name": "python.public-vocabulary.Parent",
@@ -5932,7 +5932,7 @@ field to equal `false`; an absent value means the import context was unavailable
         "signature": "class Parent:",
         "start_line": 34
       },
-      "target_owner_id": "64b7200500166a9a58338f2ee036837896bfc8b6f13906f8e7d7fac210051b81"
+      "target_owner_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -5956,11 +5956,11 @@ field to equal `false`; an absent value means the import context was unavailable
 {
   "results": [
     {
-      "ast_id": "b25d44fc764045ce0d595cfd96133462fe535ea9f23fa3094dc58c26812bf705",
+      "ast_id": "<public-id>",
       "class": "reference",
       "enclosing_symbol": "python.public-vocabulary.shapes",
       "end_byte": 164,
-      "id": "557423df99cfcbdf51f921b15ff2487aa3447168bbee0153415036118cc3bacf",
+      "id": "<public-id>",
       "language": "python",
       "namespace": "value",
       "path": "python/public-vocabulary.py",
@@ -5987,11 +5987,11 @@ field to equal `false`; an absent value means the import context was unavailable
       }
     },
     {
-      "ast_id": "185f2b7cd3d4b474f8975fc9bd844792a811c8f6d77ebbc2c290f3ac3847416c",
+      "ast_id": "<public-id>",
       "class": "reference",
       "enclosing_symbol": "python.public-vocabulary.shapes",
       "end_byte": 192,
-      "id": "7d2f40d47f3104eaaf42bb66077590f80d761daef7cff35e3152ec4533c12f38",
+      "id": "<public-id>",
       "language": "python",
       "namespace": "value",
       "path": "python/public-vocabulary.py",
@@ -6018,11 +6018,11 @@ field to equal `false`; an absent value means the import context was unavailable
       }
     },
     {
-      "ast_id": "0df960175dd2ca8ab9a05415c683cbdf487d3154aad2ebe90aef82f00fc60e93",
+      "ast_id": "<public-id>",
       "class": "reference",
       "enclosing_symbol": "python.public-vocabulary.shapes",
       "end_byte": 214,
-      "id": "f9168beb8d13f9f9982b0a5f566019d12252b34e72d99a10b6f9e1f86a521ff6",
+      "id": "<public-id>",
       "language": "python",
       "namespace": "value",
       "path": "python/public-vocabulary.py",
@@ -6049,11 +6049,11 @@ field to equal `false`; an absent value means the import context was unavailable
       }
     },
     {
-      "ast_id": "9fd73ff692c3fa0320b568687ff69d18642f7e70c79b386e20c3384b2366fc93",
+      "ast_id": "<public-id>",
       "class": "reference",
       "enclosing_symbol": "python.public-vocabulary.shapes",
       "end_byte": 243,
-      "id": "6af463e9b4358ffe50c75dd540bbfe797b0e40bcf848c085b9aa1153c21fb477",
+      "id": "<public-id>",
       "language": "python",
       "namespace": "value",
       "path": "python/public-vocabulary.py",
@@ -6080,11 +6080,11 @@ field to equal `false`; an absent value means the import context was unavailable
       }
     },
     {
-      "ast_id": "e5a1dd8ca3dcdad01278e1af522852b99eb9cf581b2f35f9acb498adbd715fa2",
+      "ast_id": "<public-id>",
       "class": "reference",
       "enclosing_symbol": "python.public-vocabulary.shapes",
       "end_byte": 264,
-      "id": "13bd82d59794e34b6208097ab72a7ae9a02f6e513e21dc060ba0cadb0bb3b30e",
+      "id": "<public-id>",
       "language": "python",
       "namespace": "value",
       "path": "python/public-vocabulary.py",
@@ -6111,11 +6111,11 @@ field to equal `false`; an absent value means the import context was unavailable
       }
     },
     {
-      "ast_id": "4df7c1b1bfeec5f50d4c36321ee5b9cb09715df8157c996d17134b7bed64934b",
+      "ast_id": "<public-id>",
       "class": "reference",
       "enclosing_symbol": "python.public-vocabulary.maybe",
       "end_byte": 333,
-      "id": "80e9b857eb8dcb3cad4919c73b952cdf373afe4beae4f893706e52c7a221bc1b",
+      "id": "<public-id>",
       "language": "python",
       "namespace": "value",
       "path": "python/public-vocabulary.py",
@@ -6142,11 +6142,11 @@ field to equal `false`; an absent value means the import context was unavailable
       }
     },
     {
-      "ast_id": "565d1652ca41ea173d0c267a34dd807ff57b58442de39ce5aa8c1b6905604050",
+      "ast_id": "<public-id>",
       "class": "reference",
       "enclosing_symbol": "python.public-vocabulary.maybe",
       "end_byte": 355,
-      "id": "81ac9a14287dcc70b969e269ad56c9c72eb04aa537fd6362a3ca487254d4ef88",
+      "id": "<public-id>",
       "language": "python",
       "namespace": "value",
       "path": "python/public-vocabulary.py",
@@ -6173,11 +6173,11 @@ field to equal `false`; an absent value means the import context was unavailable
       }
     },
     {
-      "ast_id": "4164ed0b9215cffa48c3dd2212569f1ea959ea87411383a5f13d8bccdc9b5375",
+      "ast_id": "<public-id>",
       "class": "reference",
       "enclosing_symbol": "python.public-vocabulary.target",
       "end_byte": 489,
-      "id": "a93b57824f11ae9a15470c048c77d90fb76e808ba792d30352c488cd3d674844",
+      "id": "<public-id>",
       "language": "python",
       "namespace": "value",
       "path": "python/public-vocabulary.py",
@@ -6204,11 +6204,11 @@ field to equal `false`; an absent value means the import context was unavailable
       }
     },
     {
-      "ast_id": "a3fd93b25025eb812c6fd3102b7353131733317d63ea605577c23d98a848879b",
+      "ast_id": "<public-id>",
       "class": "reference",
       "enclosing_symbol": "python.public-vocabulary.consume",
       "end_byte": 573,
-      "id": "928ebfba93035743cc0da481ff0ecbbc054c6cffcfbb9534c05e28601fe87700",
+      "id": "<public-id>",
       "language": "python",
       "namespace": "value",
       "path": "python/public-vocabulary.py",
@@ -6318,7 +6318,7 @@ def nested_loop(items, children):
       "definition_order": 0,
       "first_definition": true,
       "has_read": true,
-      "id": "cdcc27697f309f7cc3047ada85005cddd10b62613a3899494b09f6b6b561577a",
+      "id": "<public-id>",
       "in_main_guard": false,
       "is_abstract": false,
       "is_builtin": false,
@@ -6331,7 +6331,7 @@ def nested_loop(items, children):
       "name": "shared",
       "optimizing_parameter": false,
       "outcome": "definition",
-      "owner_id": "5df709695362ab2ea6c82ee21a85b191de4eb92792284a3f1fd506abe57188ec",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6345,7 +6345,7 @@ def nested_loop(items, children):
       "result_type": "python_rule_fact",
       "scope_kind": "module",
       "self_assignment": false,
-      "variable_id": "5df709695362ab2ea6c82ee21a85b191de4eb92792284a3f1fd506abe57188ec"
+      "variable_id": "<public-id>"
     },
     {
       "annotated_assignment": false,
@@ -6356,7 +6356,7 @@ def nested_loop(items, children):
       "definition_order": 1,
       "first_definition": false,
       "has_read": true,
-      "id": "71b7abf7c067a57b2a21b368d4b9db7d594d4b7a3d994d10334fcefd5a1c8fc1",
+      "id": "<public-id>",
       "in_main_guard": false,
       "is_abstract": false,
       "is_builtin": false,
@@ -6369,7 +6369,7 @@ def nested_loop(items, children):
       "name": "shared",
       "optimizing_parameter": false,
       "outcome": "definition",
-      "owner_id": "5df709695362ab2ea6c82ee21a85b191de4eb92792284a3f1fd506abe57188ec",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6383,7 +6383,7 @@ def nested_loop(items, children):
       "result_type": "python_rule_fact",
       "scope_kind": "module",
       "self_assignment": false,
-      "variable_id": "5df709695362ab2ea6c82ee21a85b191de4eb92792284a3f1fd506abe57188ec"
+      "variable_id": "<public-id>"
     },
     {
       "annotated_assignment": false,
@@ -6394,7 +6394,7 @@ def nested_loop(items, children):
       "definition_order": 0,
       "first_definition": true,
       "has_read": true,
-      "id": "461562db5f4e869b285dc56c41e6cb75a03a707d3ab735657a3b8e327f471cad",
+      "id": "<public-id>",
       "in_main_guard": false,
       "is_abstract": false,
       "is_builtin": false,
@@ -6407,7 +6407,7 @@ def nested_loop(items, children):
       "name": "item",
       "optimizing_parameter": false,
       "outcome": "definition",
-      "owner_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6421,7 +6421,7 @@ def nested_loop(items, children):
       "result_type": "python_rule_fact",
       "scope_kind": "function",
       "self_assignment": false,
-      "variable_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32"
+      "variable_id": "<public-id>"
     },
     {
       "annotated_assignment": false,
@@ -6432,7 +6432,7 @@ def nested_loop(items, children):
       "definition_order": 1,
       "first_definition": false,
       "has_read": true,
-      "id": "f55081b01a8d769355cb6a091abb2f19cae170ff9980680f5c8e01d01f506653",
+      "id": "<public-id>",
       "in_main_guard": false,
       "is_abstract": false,
       "is_builtin": false,
@@ -6447,7 +6447,7 @@ def nested_loop(items, children):
       "name": "item",
       "optimizing_parameter": false,
       "outcome": "definition",
-      "owner_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6461,7 +6461,7 @@ def nested_loop(items, children):
       "result_type": "python_rule_fact",
       "scope_kind": "function",
       "self_assignment": false,
-      "variable_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32"
+      "variable_id": "<public-id>"
     },
     {
       "annotated_assignment": false,
@@ -6472,7 +6472,7 @@ def nested_loop(items, children):
       "definition_order": 2,
       "first_definition": false,
       "has_read": true,
-      "id": "95f6cd6f856cb060caba188c79f5e34c710eead2d42e222a67592dfd1a860545",
+      "id": "<public-id>",
       "in_main_guard": false,
       "is_abstract": false,
       "is_builtin": false,
@@ -6485,7 +6485,7 @@ def nested_loop(items, children):
       "name": "item",
       "optimizing_parameter": false,
       "outcome": "definition",
-      "owner_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6499,7 +6499,7 @@ def nested_loop(items, children):
       "result_type": "python_rule_fact",
       "scope_kind": "function",
       "self_assignment": false,
-      "variable_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32"
+      "variable_id": "<public-id>"
     },
     {
       "annotated_assignment": false,
@@ -6510,7 +6510,7 @@ def nested_loop(items, children):
       "definition_order": 3,
       "first_definition": false,
       "has_read": true,
-      "id": "646be582688bf5fea2b04621b536e8ab9cbfc64745b9d1eed70f96aebf73dad2",
+      "id": "<public-id>",
       "in_main_guard": false,
       "is_abstract": false,
       "is_builtin": false,
@@ -6523,7 +6523,7 @@ def nested_loop(items, children):
       "name": "item",
       "optimizing_parameter": false,
       "outcome": "definition",
-      "owner_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6537,7 +6537,7 @@ def nested_loop(items, children):
       "result_type": "python_rule_fact",
       "scope_kind": "function",
       "self_assignment": false,
-      "variable_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32"
+      "variable_id": "<public-id>"
     },
     {
       "annotated_assignment": false,
@@ -6548,7 +6548,7 @@ def nested_loop(items, children):
       "definition_order": 0,
       "first_definition": true,
       "has_read": true,
-      "id": "551d8c541188ea2bdbff2458cfbabcf7f35d5fd384a864c90dd80e0477cecd08",
+      "id": "<public-id>",
       "in_main_guard": false,
       "is_abstract": false,
       "is_builtin": false,
@@ -6561,7 +6561,7 @@ def nested_loop(items, children):
       "name": "shared",
       "optimizing_parameter": false,
       "outcome": "definition",
-      "owner_id": "f615ddc243f41a4313be89fc72e4aa0c06f41c4923a78ac0df7c142a3f1fa60b",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6575,7 +6575,7 @@ def nested_loop(items, children):
       "result_type": "python_rule_fact",
       "scope_kind": "function",
       "self_assignment": false,
-      "variable_id": "f615ddc243f41a4313be89fc72e4aa0c06f41c4923a78ac0df7c142a3f1fa60b"
+      "variable_id": "<public-id>"
     },
     {
       "annotated_assignment": false,
@@ -6586,7 +6586,7 @@ def nested_loop(items, children):
       "definition_order": 0,
       "first_definition": true,
       "has_read": false,
-      "id": "81dbf74ee33cea081f44aee33f452a664613cea80f8a8dda82152a8fd53d1e88",
+      "id": "<public-id>",
       "in_main_guard": false,
       "is_abstract": false,
       "is_builtin": false,
@@ -6599,7 +6599,7 @@ def nested_loop(items, children):
       "name": "item",
       "optimizing_parameter": false,
       "outcome": "definition",
-      "owner_id": "88895e058b234f75f588b7a20aa882659e5b58e7a164bbc4a64ea707264597cc",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6613,7 +6613,7 @@ def nested_loop(items, children):
       "result_type": "python_rule_fact",
       "scope_kind": "function",
       "self_assignment": false,
-      "variable_id": "88895e058b234f75f588b7a20aa882659e5b58e7a164bbc4a64ea707264597cc"
+      "variable_id": "<public-id>"
     },
     {
       "annotated_assignment": false,
@@ -6624,7 +6624,7 @@ def nested_loop(items, children):
       "definition_order": 0,
       "first_definition": true,
       "has_read": true,
-      "id": "21d1bafeae563731c258656ae765b08d8e628823cc27d21ded55ac9d52f73e40",
+      "id": "<public-id>",
       "in_main_guard": false,
       "is_abstract": false,
       "is_builtin": false,
@@ -6637,7 +6637,7 @@ def nested_loop(items, children):
       "name": "item",
       "optimizing_parameter": false,
       "outcome": "definition",
-      "owner_id": "1bdd69213ff0ea1e10ba336ffd0e2b082c830d6538d877e4925689b66d3653c5",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6651,7 +6651,7 @@ def nested_loop(items, children):
       "result_type": "python_rule_fact",
       "scope_kind": "comprehension",
       "self_assignment": false,
-      "variable_id": "1bdd69213ff0ea1e10ba336ffd0e2b082c830d6538d877e4925689b66d3653c5"
+      "variable_id": "<public-id>"
     },
     {
       "annotated_assignment": false,
@@ -6662,7 +6662,7 @@ def nested_loop(items, children):
       "definition_order": 0,
       "first_definition": true,
       "has_read": true,
-      "id": "4c7d3b36610af42227c3de41a9241d645edaa913103f0e788add770d6768ca06",
+      "id": "<public-id>",
       "in_main_guard": false,
       "is_abstract": false,
       "is_builtin": false,
@@ -6677,7 +6677,7 @@ def nested_loop(items, children):
       "name": "item",
       "optimizing_parameter": false,
       "outcome": "definition",
-      "owner_id": "98ac45064344faa935501eb507c7b884654c6633d76e38fbfbd3d560ef87b9aa",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6691,7 +6691,7 @@ def nested_loop(items, children):
       "result_type": "python_rule_fact",
       "scope_kind": "function",
       "self_assignment": false,
-      "variable_id": "98ac45064344faa935501eb507c7b884654c6633d76e38fbfbd3d560ef87b9aa"
+      "variable_id": "<public-id>"
     },
     {
       "annotated_assignment": false,
@@ -6702,7 +6702,7 @@ def nested_loop(items, children):
       "definition_order": 1,
       "first_definition": false,
       "has_read": true,
-      "id": "b937f8a99da5a84c396a51f662d18d470c3bfdbfa100d8b02cd123271f21ff94",
+      "id": "<public-id>",
       "in_main_guard": false,
       "is_abstract": false,
       "is_builtin": false,
@@ -6717,7 +6717,7 @@ def nested_loop(items, children):
       "name": "item",
       "optimizing_parameter": false,
       "outcome": "definition",
-      "owner_id": "98ac45064344faa935501eb507c7b884654c6633d76e38fbfbd3d560ef87b9aa",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6731,7 +6731,7 @@ def nested_loop(items, children):
       "result_type": "python_rule_fact",
       "scope_kind": "function",
       "self_assignment": false,
-      "variable_id": "98ac45064344faa935501eb507c7b884654c6633d76e38fbfbd3d560ef87b9aa"
+      "variable_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -6791,14 +6791,14 @@ def nested_loop(items, children):
     {
       "access_kind": "write",
       "completeness": "complete",
-      "id": "c7bddc2907f7fe9fa58cf573254726ba51513320c3daa1134fc9a4e02370f0b7",
+      "id": "<public-id>",
       "is_global": false,
       "is_nonlocal": true,
       "language": "python",
       "name": "item",
       "nested_scope": true,
       "outcome": "use",
-      "owner_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6810,19 +6810,19 @@ def nested_loop(items, children):
       "relation": "lexical_variable_use",
       "result_type": "python_rule_fact",
       "scope_kind": "function",
-      "variable_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32"
+      "variable_id": "<public-id>"
     },
     {
       "access_kind": "read",
       "completeness": "complete",
-      "id": "e1431734401858db1d0fde4b14f90a69a5d14607cb3a7f0242f0b861a0eab127",
+      "id": "<public-id>",
       "is_global": false,
       "is_nonlocal": true,
       "language": "python",
       "name": "item",
       "nested_scope": true,
       "outcome": "use",
-      "owner_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6834,19 +6834,19 @@ def nested_loop(items, children):
       "relation": "lexical_variable_use",
       "result_type": "python_rule_fact",
       "scope_kind": "function",
-      "variable_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32"
+      "variable_id": "<public-id>"
     },
     {
       "access_kind": "read",
       "completeness": "complete",
-      "id": "110250c6c28c1431ba43a5e5b72297cfc500a1c091388315f183fb54760d5f0c",
+      "id": "<public-id>",
       "is_global": false,
       "is_nonlocal": true,
       "language": "python",
       "name": "item",
       "nested_scope": true,
       "outcome": "use",
-      "owner_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6858,7 +6858,7 @@ def nested_loop(items, children):
       "relation": "lexical_variable_use",
       "result_type": "python_rule_fact",
       "scope_kind": "function",
-      "variable_id": "dad31f3c3700c051124059ddad4aefa3613f3722ecf73b2ca9304094ab125a32"
+      "variable_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -6914,7 +6914,7 @@ outside a `__main__` guard.
       "definition_order": 0,
       "first_definition": true,
       "has_read": true,
-      "id": "d83af9df2531e61d05e32762e588f26d6d5ee58be7e940c09523d89e66c94d2f",
+      "id": "<public-id>",
       "in_main_guard": false,
       "is_builtin": false,
       "is_global": false,
@@ -6923,7 +6923,7 @@ outside a `__main__` guard.
       "name": "shared",
       "optimizing_parameter": false,
       "outcome": "peer",
-      "owner_id": "f615ddc243f41a4313be89fc72e4aa0c06f41c4923a78ac0df7c142a3f1fa60b",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -6941,8 +6941,8 @@ outside a `__main__` guard.
       "result_type": "python_rule_fact",
       "scope_kind": "function",
       "self_assignment": false,
-      "target_id": "5df709695362ab2ea6c82ee21a85b191de4eb92792284a3f1fd506abe57188ec",
-      "variable_id": "f615ddc243f41a4313be89fc72e4aa0c06f41c4923a78ac0df7c142a3f1fa60b"
+      "target_id": "<public-id>",
+      "variable_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -6988,13 +6988,13 @@ the inner loop, where its target may have replaced the outer value.
   "results": [
     {
       "completeness": "complete",
-      "id": "7d849995b0088cdfa42375b116383337a38417ccf250c425d0720ef706554e48",
+      "id": "<public-id>",
       "language": "python",
       "name": "item",
       "nested_loop_has_outer_use": true,
       "nested_loop_reused": true,
       "outcome": "loop_pair",
-      "owner_id": "98ac45064344faa935501eb507c7b884654c6633d76e38fbfbd3d560ef87b9aa",
+      "owner_id": "<public-id>",
       "path": "python/lexical-variables.py",
       "proof": "proven",
       "range": {
@@ -7006,8 +7006,8 @@ the inner loop, where its target may have replaced the outer value.
       "relation": "nested_loop_same_variable",
       "result_type": "python_rule_fact",
       "scope_kind": "function",
-      "target_id": "c05e7c00f750b3727784664c92fe89abbc55b46d42ba4387c8ff99d87f274bbe",
-      "variable_id": "98ac45064344faa935501eb507c7b884654c6633d76e38fbfbd3d560ef87b9aa"
+      "target_id": "<public-id>",
+      "variable_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -7067,7 +7067,7 @@ def unfinished():
   "results": [
     {
       "completeness": "complete",
-      "id": "dd3baf447104c67f9eadb883db88188c0851c25e8b1d4fd213c9a433255a0fa4",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "issue",
       "owner_id": null,
@@ -7086,7 +7086,7 @@ def unfinished():
             {
               "op": "python_format_issues",
               "result": {
-                "id": "dd3baf447104c67f9eadb883db88188c0851c25e8b1d4fd213c9a433255a0fa4",
+                "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/format.py",
                 "range": {
@@ -7113,7 +7113,7 @@ def unfinished():
     },
     {
       "completeness": "complete",
-      "id": "492e21fd1ab2f953144f996cf90901ab52358269b3c3ffba28d4257f85924702",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "no_issue",
       "owner_id": null,
@@ -7132,7 +7132,7 @@ def unfinished():
             {
               "op": "python_format_issues",
               "result": {
-                "id": "492e21fd1ab2f953144f996cf90901ab52358269b3c3ffba28d4257f85924702",
+                "id": "<public-id>",
                 "outcome": "no_issue",
                 "path": "python/format.py",
                 "range": {
@@ -7159,7 +7159,7 @@ def unfinished():
     },
     {
       "completeness": "complete",
-      "id": "e5d5a18f825595afaeb837000b427f46b9d49abc7376c6c2e21bdd443d364725",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "no_issue",
       "owner_id": null,
@@ -7178,7 +7178,7 @@ def unfinished():
             {
               "op": "python_format_issues",
               "result": {
-                "id": "e5d5a18f825595afaeb837000b427f46b9d49abc7376c6c2e21bdd443d364725",
+                "id": "<public-id>",
                 "outcome": "no_issue",
                 "path": "python/format.py",
                 "range": {
@@ -7205,7 +7205,7 @@ def unfinished():
     },
     {
       "completeness": "complete",
-      "id": "86e62533de296ca57fe6a9443dd4df0184ca8ebc2ca95f49718879fb76f17edf",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "no_issue",
       "owner_id": null,
@@ -7224,7 +7224,7 @@ def unfinished():
             {
               "op": "python_format_issues",
               "result": {
-                "id": "86e62533de296ca57fe6a9443dd4df0184ca8ebc2ca95f49718879fb76f17edf",
+                "id": "<public-id>",
                 "outcome": "no_issue",
                 "path": "python/format.py",
                 "range": {
@@ -7251,7 +7251,7 @@ def unfinished():
     },
     {
       "completeness": "complete",
-      "id": "3d143360e9d6c1b54f4325d3d949cfadbee402287c4ea6c0473f7ce3e44c2034",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "no_issue",
       "owner_id": null,
@@ -7270,7 +7270,7 @@ def unfinished():
             {
               "op": "python_format_issues",
               "result": {
-                "id": "3d143360e9d6c1b54f4325d3d949cfadbee402287c4ea6c0473f7ce3e44c2034",
+                "id": "<public-id>",
                 "outcome": "no_issue",
                 "path": "python/format.py",
                 "range": {
@@ -7318,7 +7318,7 @@ def unfinished():
   "results": [
     {
       "completeness": "complete",
-      "id": "cc21b8dd956ec0dbe64a1a0613781bd33729cdd2605110976d52a8dc25bd38dd",
+      "id": "<public-id>",
       "language": "python",
       "operand_kind": "literal",
       "outcome": "illegal",
@@ -7338,7 +7338,7 @@ def unfinished():
             {
               "op": "python_raise_legality",
               "result": {
-                "id": "cc21b8dd956ec0dbe64a1a0613781bd33729cdd2605110976d52a8dc25bd38dd",
+                "id": "<public-id>",
                 "outcome": "illegal",
                 "path": "python/raise-legality.py",
                 "range": {
@@ -7390,11 +7390,11 @@ def unfinished():
       "completeness": "complete",
       "exception_class": "builtins.ValueError",
       "expected_exception": "LookupError or TypeError",
-      "id": "bb0db25c9d27e2c0cb7c00e62a8fd6cbde48e61779e00d6b7f5ef206eed5c08b",
+      "id": "<public-id>",
       "language": "python",
       "operand_kind": "exception_instance",
       "outcome": "unexpected",
-      "owner_id": "a5ac33b7096a781cfb0426aa1a53fed5ca2cd44827807d9fe3655a0cba4fbd5c",
+      "owner_id": "<public-id>",
       "path": "python/special-method-raise.py",
       "proof": "proven",
       "provenance": [
@@ -7410,7 +7410,7 @@ def unfinished():
             {
               "op": "python_special_method_raise",
               "result": {
-                "id": "bb0db25c9d27e2c0cb7c00e62a8fd6cbde48e61779e00d6b7f5ef206eed5c08b",
+                "id": "<public-id>",
                 "outcome": "unexpected",
                 "path": "python/special-method-raise.py",
                 "range": {
@@ -7464,7 +7464,7 @@ def unfinished():
     {
       "call_callee": true,
       "completeness": "complete",
-      "id": "b635848a471834fa9807c6d7b0de493665bebd92a720809469d80dd0e20a0296",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "builtin",
       "owner_id": null,
@@ -7511,7 +7511,7 @@ selects the callee at column 1 and excludes the same-named argument at column 7.
   "results": [
     {
       "completeness": "complete",
-      "id": "ae9dedf69de69e1f9c75e5f3b3120a9eebfff0c90cd3d8322ec3755180016a1e",
+      "id": "<public-id>",
       "language": "python",
       "outcome": "builtin",
       "owner_id": null,
@@ -7530,7 +7530,7 @@ selects the callee at column 1 and excludes the same-named argument at column 7.
             {
               "op": "python_raise_not_implemented",
               "result": {
-                "id": "ae9dedf69de69e1f9c75e5f3b3120a9eebfff0c90cd3d8322ec3755180016a1e",
+                "id": "<public-id>",
                 "outcome": "builtin",
                 "path": "python/not-implemented.py",
                 "range": {

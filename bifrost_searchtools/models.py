@@ -9,7 +9,13 @@ CodeQueryExecutionMode = Literal["results", "explain", "profile"]
 MostRelevantFilesRankingModeValue = Literal[
     "cascade", "history_imports", "usage_graph", "usage_graph_exact"
 ]
-MostRelevantFilesIncompleteReasonValue = Literal["cancelled", "time_budget"]
+MostRelevantFilesIncompleteReasonValue = Literal[
+    "cancelled",
+    "time_budget",
+    "usage_graph_incomplete",
+    "history_unavailable",
+    "usage_graph_incomplete_and_history_unavailable",
+]
 SymbolSourcesIncompleteReasonValue = Literal["cancelled"]
 DefinitionLookupIncompleteReasonValue = Literal[
     "cancelled",
@@ -8213,7 +8219,7 @@ class MostRelevantFilesResult:
     def render_text(self) -> str:
         if self.rendered_text is not None:
             return self.rendered_text
-        if not self.files and not self.not_found and not self.duplicates:
+        if self.complete and not self.files and not self.not_found and not self.duplicates:
             return "No related files found."
 
         lines = [f"{file.path} [{file.test}]" for file in self.files]
@@ -8225,13 +8231,18 @@ class MostRelevantFilesResult:
             reason = {
                 "time_budget": "the usage-graph ranking exceeded its time budget",
                 "cancelled": "the usage-graph ranking was cancelled",
+                "usage_graph_incomplete": "the usage graph was incomplete",
+                "history_unavailable": "commit history was unavailable",
+                "usage_graph_incomplete_and_history_unavailable": (
+                    "the usage graph was incomplete and commit history was unavailable"
+                ),
             }.get(self.incomplete_reason, "the requested ranking did not complete")
-            lines.extend(
-                [
-                    "",
-                    f"Incomplete: {reason}; returned deterministic history/import ranking instead.",
-                ]
+            ranking = (
+                "returned deterministic history/import ranking instead"
+                if self.ranking_mode_used == "history_imports"
+                else f"returned partial {self.ranking_mode_used} ranking"
             )
+            lines.extend(["", f"Incomplete: {reason}; {ranking}."])
         return "\n".join(lines)
 
 

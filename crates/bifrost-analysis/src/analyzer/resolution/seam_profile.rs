@@ -129,6 +129,7 @@ macro_rules! seam_methods {
 }
 
 seam_methods! {
+    IdentityContentDigest => "identity_content_digest", "BatchResolutionFragmentSource";
     SelectionAuthority => "selection_authority", "BatchResolutionFragmentSource";
     AdmitsReverseReference => "admits_reverse_reference", "BatchResolutionFragmentSource";
     ScopeReverseInventoryCompletion => "scope_reverse_inventory_completion", "BatchResolutionFragmentSource";
@@ -166,6 +167,7 @@ seam_methods! {
     SelectionHasJavaSemantics => "selection_has_java_semantics", "SelectedTypedFactSource";
     LookupNamespace => "lookup_namespace", "SelectedTypedFactSource";
     SelectionHasJvmSemantics => "selection_has_jvm_semantics", "SelectedTypedFactSource";
+    ExternalCallableResultTypeIdentities => "external_callable_result_type_identities", "SelectedTypedFactSource";
     FragmentTypeQualifiersSearchCompanionMembers => "fragment_type_qualifiers_search_companion_members", "SelectedTypedFactSource";
     IntrinsicReverseIndexUsesSharedTypeNames => "intrinsic_reverse_index_uses_shared_type_names", "SelectedTypedFactSource";
     JavaAccessEndpoints => "java_access_endpoints", "SelectedTypedFactSource";
@@ -937,6 +939,22 @@ impl<T: ?Sized> BatchResolutionFragmentSource for SeamProfiled<'_, T>
 where
     T: BatchResolutionFragmentSource,
 {
+    fn identity_content_digest(
+        &self,
+        key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        record_call(SeamMethod::IdentityContentDigest, 1);
+        let outcome = self.inner.identity_content_digest(key, cancellation);
+        if let Ok(digest) = &outcome {
+            record_rows(
+                SeamMethod::IdentityContentDigest,
+                usize::from(digest.is_some()),
+            );
+        }
+        outcome
+    }
+
     /// Counted like every other method of the seam, with the caveat that this
     /// one issues no source read: its calls say how often a caller asked which
     /// selection is answering, and its rows say how often one could be named.
@@ -1433,6 +1451,24 @@ where
     fn selection_has_jvm_semantics(&self) -> bool {
         record_call(SeamMethod::SelectionHasJvmSemantics, 0);
         self.inner.selection_has_jvm_semantics()
+    }
+
+    fn external_callable_result_type_identities(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(SemanticId, SemanticId)>>> {
+        record_call(
+            SeamMethod::ExternalCallableResultTypeIdentities,
+            definitions.len(),
+        );
+        let outcome = self
+            .inner
+            .external_callable_result_type_identities(definitions, cancellation);
+        if let Ok(Some(rows)) = &outcome {
+            record_rows(SeamMethod::ExternalCallableResultTypeIdentities, rows.len());
+        }
+        outcome
     }
 
     fn fragment_type_qualifiers_search_companion_members(
@@ -1961,8 +1997,8 @@ mod tests {
             declared_methods(&typed_crlf, "SelectedTypedFactSource"),
             typed
         );
-        assert_eq!(batch.len(), 29, "BatchResolutionFragmentSource: {batch:?}");
-        assert_eq!(typed.len(), 71, "SelectedTypedFactSource: {typed:?}");
+        assert_eq!(batch.len(), 30, "BatchResolutionFragmentSource: {batch:?}");
+        assert_eq!(typed.len(), 72, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = SeamMethod::ALL
             .iter()
@@ -1981,7 +2017,7 @@ mod tests {
             declared, forwarded,
             "the reader seam and SeamProfiled disagree; declared {declared:?}, forwarded {forwarded:?}"
         );
-        assert_eq!(METHOD_COUNT, 100);
+        assert_eq!(METHOD_COUNT, 102);
     }
 
     /// The instrument is off unless the variable names a file, and nothing in

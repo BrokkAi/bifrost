@@ -81,6 +81,8 @@ fn classify_go_reverse_path_evidence_miss(
     })
 }
 
+// Admit source members before confirming candidates or their completeness.
+// A go member stays in scope even when mounted in an augmented test variant.
 pub(crate) const GO_REVERSE_CANDIDATE_SITES_SQL: &str = r#"
 WITH RECURSIVE target_package(package_id, tool_import_path, package_name) AS (
   SELECT package.package_id, package.tool_import_path, package.package_name
@@ -118,6 +120,7 @@ WITH RECURSIVE target_package(package_id, tool_import_path, package_name) AS (
   JOIN temp.selected_resolution_mounts AS mounted
     ON mounted.file_version_id=members.file_version_id
   WHERE mounted.storage_language='go'
+    AND (?5=1 OR members.source_role NOT IN ('test','xtest'))
   UNION
   SELECT placed.mount_ordinal, members.source_role, package.package_id, 1,
          CASE WHEN package.for_test<>'' AND members.source_role='go'
@@ -137,6 +140,7 @@ WITH RECURSIVE target_package(package_id, tool_import_path, package_name) AS (
   JOIN temp.selected_resolution_mounts AS mounted
     ON mounted.mount_ordinal=placed.mount_ordinal
   WHERE mounted.storage_language='go'
+    AND (?5=1 OR members.source_role NOT IN ('test','xtest'))
 )
 SELECT mounted.mount_ordinal, mounted.persisted_relative_path,
        candidate.source_role, mounted.blob_id, candidate.package_id,
@@ -731,7 +735,9 @@ SELECT NOT EXISTS(
          JOIN main.resolution_unit_summary_imports AS imported
            ON imported.summary_id=live.summary_id AND imported.kind='dot'
           AND imported.state='unresolved'
-         JOIN main.source_imports AS source_import
+         -- Retained headers change cardinality estimates. Bound summary imports
+         -- must drive the keyed source-import lookup, never a table-wide scan.
+         CROSS JOIN main.source_imports AS source_import
            ON source_import.blob_id=imported.blob_id
           AND source_import.import_id=imported.import_id AND source_import.alias='.'
          JOIN target_units AS target ON target.tool_import_path=gap.subject
@@ -2070,13 +2076,20 @@ impl SelectedResolutionOperation<'_, '_> {
                         file_version,
                         identity,
                         target_exported,
+                        include_tests,
                     )
                     .expect("explain populated Go reverse candidate query");
                 });
             }
             let mut statement = connection.prepare_cached(GO_REVERSE_CANDIDATE_SITES_SQL)?;
             for row in statement.query_map(
-                params![context_id, file_version, identity, target_exported],
+                params![
+                    context_id,
+                    file_version,
+                    identity,
+                    target_exported,
+                    include_tests
+                ],
                 |row| {
                     Ok((
                         row.get::<_, u32>(0)?,
@@ -2317,6 +2330,29 @@ impl SelectedResolutionOperation<'_, '_> {
                 == ResolutionSiteKind::MemberReference
                 || metadata.callable_receiver_origin().is_some();
             let mut targets = evidence.local_definitions().to_vec();
+            // Selector roots may bind to imports supplied by the selected Go
+            // context. File-local paths alone cannot prove that they refer to
+            // a package declaration; confirm their binding before using exports.
+            if metadata.go_package_qualifier() && targets.is_empty() {
+                let has_import_binding: bool = connection
+                    .prepare_cached(
+                        "SELECT EXISTS(SELECT 1 FROM main.resolution_go_package_imports
+                         WHERE blob_id=?1 AND kind='named')",
+                    )?
+                    .query_row([candidate.blob_id], |row| row.get(0))?;
+                if has_import_binding {
+                    record_go_reverse_fallback(GoReverseFallbackCause::QualifiedImportMissing);
+                    forward_candidate_count += 1;
+                    forward_groups
+                        .entry((
+                            candidate.locator.relative_path().to_owned(),
+                            candidate.source_role.clone(),
+                        ))
+                        .or_default()
+                        .push(candidate);
+                    continue;
+                }
+            }
             let reaches_package_scope =
                 metadata.unqualified() && evidence.reaches_package_root_scope();
             let reaches_root_or_package_scope = evidence.reaches_root() || reaches_package_scope;
@@ -2591,7 +2627,43 @@ impl SelectedResolutionOperation<'_, '_> {
                                 *reference,
                                 "forward resolution preserves requested Go candidate order"
                             );
-                            answers.push((candidate.clone(), answer.answer().clone()));
+                            let answer = answer.answer();
+                            if answer
+                                .site_metadata()
+                                .is_some_and(|site| site.go_package_qualifier())
+                            {
+                                let binding_keys = answer
+                                    .binding()
+                                    .targets()
+                                    .iter()
+                                    .filter(|target| {
+                                        target.ordinal() == Some(candidate.mount_ordinal)
+                                    })
+                                    .map(|target| {
+                                        target.local_key().expect("local import binding has a key")
+                                    })
+                                    .collect::<Vec<_>>();
+                                let imported_root: bool = connection
+                                    .prepare_cached(
+                                        "SELECT EXISTS(
+                                       SELECT 1 FROM json_each(?2) AS target
+                                       JOIN main.resolution_go_package_imports AS binder
+                                         ON binder.blob_id=?1 AND binder.definition_key=target.value
+                                       WHERE binder.kind='named')",
+                                    )?
+                                    .query_row(
+                                        params![
+                                            candidate.blob_id,
+                                            serde_json::to_string(&binding_keys)
+                                                .expect("Go import binding keys serialize")
+                                        ],
+                                        |row| row.get(0),
+                                    )?;
+                                if imported_root {
+                                    continue;
+                                }
+                            }
+                            answers.push((candidate.clone(), answer.clone()));
                         }
                     }
                     let completion = answers.iter().fold(
@@ -2765,13 +2837,20 @@ pub(crate) fn explain_go_reverse_candidate_plan(
     file_version: i64,
     identity: i64,
     target_exported: bool,
+    include_tests: bool,
 ) -> rusqlite::Result<Vec<String>> {
     let mut statement = connection.prepare(&format!(
         "EXPLAIN QUERY PLAN {GO_REVERSE_CANDIDATE_SITES_SQL}"
     ))?;
     statement
         .query_map(
-            params![context_id, file_version, identity, target_exported],
+            params![
+                context_id,
+                file_version,
+                identity,
+                target_exported,
+                include_tests
+            ],
             |row| row.get(3),
         )?
         .collect()

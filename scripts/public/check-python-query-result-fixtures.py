@@ -21,7 +21,99 @@ def _assert_result_item_rejected(row: dict, description: str) -> None:
         _decode_result_item(row)
     except models._generated_query_models.DecoderError:
         return
-    raise AssertionError(f"Python accepted invalid decorated-parameter {description}")
+    raise AssertionError(f"Python accepted invalid result item {description}")
+
+
+EXPECTED_EXTERNAL_CALLEE_KEY = {
+    "language": "java",
+    "owner": "com.acme.AcmeHttpClient",
+    "member": "send",
+    "has_receiver": True,
+    "parameter_count": 1,
+}
+
+
+def _check_external_callee_key_contract(raw_by_type: dict[str, dict], decoded: object) -> None:
+    dispatch = raw_by_type["dispatch_target"]
+    effect = raw_by_type["procedure_effect"]
+    hops = effect.get("witness_hops")
+    if not isinstance(hops, list) or len(hops) != 1:
+        raise AssertionError("the fixture procedure effect did not retain one witness hop")
+    witness = hops[0]
+
+    if dispatch.get("external_callee_key") != EXPECTED_EXTERNAL_CALLEE_KEY:
+        raise AssertionError("the dispatch target lost its typed external callee key")
+    if witness.get("external_callee_key") != EXPECTED_EXTERNAL_CALLEE_KEY:
+        raise AssertionError("the procedure-effect witness lost its typed external callee key")
+    if dispatch["external_callee_key"] != witness["external_callee_key"]:
+        raise AssertionError("dispatch and witness external callee keys differ")
+    generated = models._generated_query_models
+    decoded_dispatch = next(
+        result
+        for result in decoded.results
+        if isinstance(result, generated.CodeQueryDispatchTarget)
+    )
+    decoded_effect = next(
+        result
+        for result in decoded.results
+        if isinstance(result, generated.CodeQueryProcedureEffect)
+    )
+    if (
+        decoded_dispatch.external_callee_key is None
+        or not decoded_effect.witness_hops
+        or decoded_effect.witness_hops[0].external_callee_key is None
+        or decoded_dispatch.external_callee_key
+        != decoded_effect.witness_hops[0].external_callee_key
+    ):
+        raise AssertionError("decoded dispatch and witness external callee keys differ")
+    if witness["target_id"] != dispatch["target_id"]:
+        raise AssertionError("the witness did not retain the dispatch target identity")
+    if witness["callee_procedure_id"] == dispatch["target_id"]:
+        raise AssertionError("graph procedure and dispatch identities were conflated")
+    if witness["dispatch_complete"] is not False:
+        raise AssertionError("the unresolved witness dispatch was upgraded to complete")
+    if witness["proof"] != "unproven" or dispatch["proof"] != "unproven":
+        raise AssertionError("the external key changed unproven dispatch evidence")
+    if dispatch["completeness"] != "partial" or dispatch["dispatch"] != "may_dispatch":
+        raise AssertionError("the external key changed partial dispatch evidence")
+
+    dispatch_without_key = dict(dispatch)
+    dispatch_without_key.pop("external_callee_key")
+    decoded_dispatch_without_key = _decode_result_item(dispatch_without_key)
+    if decoded_dispatch_without_key.external_callee_key is not None:
+        raise AssertionError("an absent dispatch external key did not decode as absent")
+
+    dispatch_with_null_key = dict(dispatch)
+    dispatch_with_null_key["external_callee_key"] = None
+    decoded_dispatch_with_null_key = _decode_result_item(dispatch_with_null_key)
+    if decoded_dispatch_with_null_key.external_callee_key is not None:
+        raise AssertionError("a null dispatch external key did not decode as absent")
+
+    effect_without_key = dict(effect)
+    effect_without_key["witness_hops"] = [dict(witness)]
+    effect_without_key["witness_hops"][0].pop("external_callee_key")
+    decoded_effect_without_key = _decode_result_item(effect_without_key)
+    if decoded_effect_without_key.witness_hops[0].external_callee_key is not None:
+        raise AssertionError("an absent witness external key did not decode as absent")
+
+    effect_with_null_key = dict(effect)
+    effect_with_null_key["witness_hops"] = [dict(witness)]
+    effect_with_null_key["witness_hops"][0]["external_callee_key"] = None
+    decoded_effect_with_null_key = _decode_result_item(effect_with_null_key)
+    if decoded_effect_with_null_key.witness_hops[0].external_callee_key is not None:
+        raise AssertionError("a null witness external key did not decode as absent")
+
+    malformed_dispatch = dict(dispatch)
+    malformed_dispatch["external_callee_key"] = dict(EXPECTED_EXTERNAL_CALLEE_KEY)
+    malformed_dispatch["external_callee_key"]["parameter_count"] = "one"
+    _assert_result_item_rejected(malformed_dispatch, "nested external key primitive")
+
+    malformed_witness = dict(witness)
+    malformed_witness["external_callee_key"] = dict(EXPECTED_EXTERNAL_CALLEE_KEY)
+    del malformed_witness["external_callee_key"]["owner"]
+    malformed_effect = dict(effect)
+    malformed_effect["witness_hops"] = [malformed_witness]
+    _assert_result_item_rejected(malformed_effect, "nested external key required field")
 
 
 def _check_decorated_parameter_contract(decorated_raw: dict, decorated: object) -> None:
@@ -77,6 +169,7 @@ def main() -> None:
     decoded = models.CodeQueryResult.from_dict(document)
 
     raw_by_type = {row["result_type"]: row for row in document["results"]}
+    _check_external_callee_key_contract(raw_by_type, decoded)
     expected_types = set(models._CODE_QUERY_RESULT_ITEM_TYPES)
     if set(raw_by_type) != expected_types:
         raise AssertionError(

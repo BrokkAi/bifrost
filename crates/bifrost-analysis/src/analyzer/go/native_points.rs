@@ -2,7 +2,6 @@
 
 use super::GoAnalyzer;
 use crate::CancellationToken;
-#[cfg(test)]
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::languages::BoundedReceiverQuery;
 use crate::analyzer::native_points::{
@@ -29,9 +28,7 @@ use crate::analyzer::usages::get_definition::{
     DefinitionLookupStatus, ExactExternalCallProof, ResolvedReferenceSite,
 };
 use crate::analyzer::usages::get_type::TypeLookupOutcome;
-#[cfg(test)]
 use crate::analyzer::usages::get_type::{TypeLookupDiagnostic, TypeLookupStatus, TypeLookupType};
-#[cfg(test)]
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::hash::HashMap;
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
@@ -64,58 +61,50 @@ fn external_identity_from_proof(
     ))
 }
 
+/// A model-owned declaration proof, separate from a value type and from the
+/// durable JVM inventory's overload coordinates.
+struct GoOverlayDefinitionProjection {
+    direct_target: GoOverlayDirectTarget,
+}
+
+struct GoOverlayDirectTarget {
+    provider_digest: String,
+    canonical_symbol: String,
+}
+
 #[derive(Clone)]
 struct GoPointFileContext {
     context: GoPreparedImportContext,
     selected_imports: Vec<GoSelectedExternalImport>,
 }
 
-/// A type query on an interface method name is a declaration-site query: the
-/// producer has no reference there, so the answer is the interface that owns
-/// the method.
-#[cfg(test)]
+/// Read a declaration-site method's owner from indexed declaration identity and
+/// metadata, rather than inferring ownership from surrounding source syntax.
 fn go_interface_method_owner_type(
     query: BoundedReceiverQuery<'_>,
     go: &GoAnalyzer,
 ) -> Option<TypeLookupOutcome> {
-    let root = query.tree?.root_node();
-    let selected =
-        smallest_named_node_covering(root, query.site.focus_start_byte, query.site.focus_end_byte)?;
-    let mut method = selected;
-    while method.kind() != "method_elem" {
-        method = method.parent()?;
-    }
-    let method_name = method.child_by_field_name("name")?;
-    if selected.start_byte() < method_name.start_byte()
-        || selected.end_byte() > method_name.end_byte()
-    {
-        return None;
-    }
-    let interface = method.parent()?;
-    if interface.kind() != "interface_type" {
-        return None;
-    }
-    let type_spec = interface.parent()?;
-    if type_spec.kind() != "type_spec" {
-        return None;
-    }
-    let type_name = type_spec.child_by_field_name("name")?;
-    let owner_text = query
-        .source
-        .get(type_name.start_byte()..type_name.end_byte())?;
-    let member_name = query
-        .source
-        .get(method_name.start_byte()..method_name.end_byte())?
-        .to_owned();
     let mut owners = go
         .declarations(query.file)
         .into_iter()
-        .filter(|unit| unit.is_class() && unit.terminal_name() == owner_text)
+        .filter(|unit| {
+            unit.is_function()
+                && unit.owner_is_type_scope()
+                && unit.terminal_name() == query.site.text
+        })
         .filter(|unit| {
             go.ranges(unit).iter().any(|range| {
-                range.start_byte <= type_spec.start_byte() && range.end_byte >= type_spec.end_byte()
+                range.start_byte == query.site.focus_start_byte
+                    && query.site.focus_end_byte <= range.end_byte
             })
         })
+        .filter(|method| {
+            go.signature_metadata(method).iter().any(|metadata| {
+                metadata.dispatch_extensibility()
+                    == Some(crate::analyzer::DispatchExtensibility::Open)
+            })
+        })
+        .filter_map(|method| go.parent_of(&method))
         .collect::<Vec<_>>();
     owners.sort();
     owners.dedup();
@@ -134,13 +123,14 @@ fn go_interface_method_owner_type(
             kind: "go_interface_method_owner".into(),
             message: "selected Go interface method belongs to this interface type".into(),
         }],
-        target_kind: TypeLookupTargetKind::MemberOwner { member_name },
+        target_kind: TypeLookupTargetKind::MemberOwner {
+            member_name: query.site.text.clone(),
+        },
     })
 }
 
 /// The producer has no answer for this site. That is a structured miss, not a
 /// failure of the store, so it is incomplete evidence rather than unavailable.
-#[cfg(test)]
 fn incomplete_go_type(
     site: &ResolvedReferenceSite,
     kind: &'static str,
@@ -487,12 +477,18 @@ fn go_point_call_callee_reference(
         return None;
     }
     let initializer = go_point_local_initializer_for_identifier(expression, usage, source)??;
-    let mut callee = match initializer.kind() {
-        "call_expression" => initializer.child_by_field_name("function")?,
+    go_point_call_expression_callee_reference(initializer)
+}
+
+fn go_point_call_expression_callee_reference(
+    call: tree_sitter::Node<'_>,
+) -> Option<(usize, usize)> {
+    let mut callee = match call.kind() {
+        "call_expression" => call.child_by_field_name("function")?,
         // tree-sitter-go can represent a generic function invocation with
         // arguments as a type-conversion node. The keyed call-obligation read
         // below distinguishes it from a real conversion.
-        "type_conversion_expression" => initializer.child_by_field_name("type")?,
+        "type_conversion_expression" => call.child_by_field_name("type")?,
         _ => return None,
     };
     loop {
@@ -500,6 +496,8 @@ fn go_point_call_callee_reference(
             "identifier" | "type_identifier" | "field_identifier" => {
                 return Some((callee.start_byte(), callee.end_byte()));
             }
+            "selector_expression" => callee.child_by_field_name("field")?,
+            "qualified_type" => callee.child_by_field_name("name")?,
             "generic_type" | "type_instantiation_expression" | "parenthesized_expression" => callee
                 .child_by_field_name("type")
                 .or_else(|| callee.named_child(0))?,
@@ -716,7 +714,7 @@ fn go_point_selector_is_package_member_lookup(
     true
 }
 
-fn attach_go_package_incomplete(outcome: &mut DefinitionLookupOutcome) {
+fn attach_go_package_incomplete(outcome: &mut DefinitionLookupOutcome, package: &str) {
     if outcome
         .diagnostics
         .iter()
@@ -726,9 +724,9 @@ fn attach_go_package_incomplete(outcome: &mut DefinitionLookupOutcome) {
     }
     outcome.diagnostics.push(DefinitionLookupDiagnostic {
         kind: "go-package-incomplete".into(),
-        message:
-            "a saved sibling has a Go build constraint, so selected package members may be absent"
-                .into(),
+        message: format!(
+            "package {package:?} has unselected source input, so selected package members may be absent"
+        ),
         claim: None,
     });
 }
@@ -916,6 +914,14 @@ pub(crate) enum GoNativePointRequestOpen<'a> {
 }
 
 impl<'a> GoNativePointRequest<'a> {
+    pub(crate) fn begin_receiver_query(&mut self, file: &crate::analyzer::ProjectFile) {
+        if let Some(cache) = self
+            .forward_candidate_artifacts
+            .get_mut(&crate::path_utils::rel_path_string(file))
+        {
+            cache.reset_owner_expansions();
+        }
+    }
     pub(crate) fn open(
         go: &'a GoAnalyzer,
         overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
@@ -952,7 +958,9 @@ impl<'a> GoNativePointRequest<'a> {
             return Ok(GoNativePointRequestOpen::Cancelled);
         }
         let operation = match open_native_point_operation(&go.inner, cancellation)? {
-            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+            SelectedResolutionOperationOpenOutcome::Ready(operation) => {
+                (*operation).with_go_model_authority(overlay.clone())
+            }
             SelectedResolutionOperationOpenOutcome::Unavailable(reason) => {
                 return Ok(GoNativePointRequestOpen::Unavailable {
                     kind: "native_unavailable",
@@ -1289,18 +1297,9 @@ impl<'a> GoNativePointRequest<'a> {
         else {
             return Ok(None);
         };
-        let mut selected_imports =
+        let selected_imports =
             self.operation
                 .go_selected_external_imports(self.context_id, path, cancellation)?;
-        let unresolved_imports =
-            self.operation
-                .go_selected_unresolved_imports(self.context_id, path, cancellation)?;
-        append_model_backed_external_imports(
-            unresolved_imports,
-            self.overlay.as_deref(),
-            cancellation,
-            &mut selected_imports,
-        );
         if cancellation.is_cancelled() {
             return Ok(None);
         }
@@ -1367,11 +1366,61 @@ impl<'a> GoNativePointRequest<'a> {
             .is_none()
             .then(|| crate::analyzer::usages::get_definition::parse_go_tree(query.source))
             .flatten();
+        // A whole call asks for its allocation/invocation result, rather than
+        // the callable binding at its function token. Use the structured callee
+        // to locate the persisted obligation and demand its exact result slot.
+        let call_callee = query.tree.or(parsed_tree.as_ref()).and_then(|tree| {
+            let selected = smallest_named_node_covering(
+                tree.root_node(),
+                query.site.focus_start_byte,
+                query.site.focus_end_byte,
+            )?;
+            (selected.start_byte() == query.site.focus_start_byte
+                && selected.end_byte() == query.site.focus_end_byte)
+                .then(|| go_point_call_expression_callee_reference(selected))
+                .flatten()
+        });
+        let call_result = if let Some((start, end)) = call_callee {
+            let read = (|| {
+                let Some(reference) =
+                    self.operation
+                        .go_point_call_reference_at(&path, start, end, &cancellation)?
+                else {
+                    return Ok(None);
+                };
+                self.operation
+                    .go_point_callable_result_slot(&path, reference, &cancellation)
+            })();
+            match read {
+                Ok(slot) => slot,
+                Err(error) => {
+                    return BoundedResolution::Complete {
+                        value: unavailable_type(
+                            query.site,
+                            "native_store_error",
+                            error.to_string(),
+                        ),
+                        work: ReceiverAnalysisWork::default(),
+                    };
+                }
+            }
+        } else {
+            None
+        };
+        let mut selected_site = query.site.clone();
+        if let Some((start, end)) = call_callee.filter(|_| call_result.is_some()) {
+            selected_site.focus_start_byte = start;
+            selected_site.focus_end_byte = end;
+        }
+        let selected_query = BoundedReceiverQuery {
+            site: &selected_site,
+            ..query
+        };
         let receiver_overlay = if let Some(tree) = query.tree.or(parsed_tree.as_ref()) {
             match self.point_receiver_slot_type_overlay(
                 &path,
                 &file_context,
-                query,
+                selected_query,
                 tree,
                 &cancellation,
             ) {
@@ -1393,8 +1442,8 @@ impl<'a> GoNativePointRequest<'a> {
         let generic_callee = query.tree.or(parsed_tree.as_ref()).is_some_and(|tree| {
             go_generic_instantiation_callee_reference_at(
                 tree,
-                query.site.focus_start_byte,
-                query.site.focus_end_byte,
+                selected_site.focus_start_byte,
+                selected_site.focus_end_byte,
             )
         });
         let artifacts = self
@@ -1405,16 +1454,16 @@ impl<'a> GoNativePointRequest<'a> {
             SelectedSemanticLocator::for_reference_range_in_namespace(
                 "go",
                 path,
-                query.site.focus_start_byte,
-                query.site.focus_end_byte,
+                selected_site.focus_start_byte,
+                selected_site.focus_end_byte,
                 ResolutionNamespace::TypeOrValue,
             )
         } else {
             SelectedSemanticLocator::for_reference_range(
                 "go",
                 path,
-                query.site.focus_start_byte,
-                query.site.focus_end_byte,
+                selected_site.focus_start_byte,
+                selected_site.focus_end_byte,
             )
         };
         let mut metrics = SelectedResolutionContextMetrics;
@@ -1427,6 +1476,7 @@ impl<'a> GoNativePointRequest<'a> {
             .operation
             .resolve_native_reference_types_bounded_for_go_request(
                 file_context.context,
+                call_result,
                 receiver_overlay,
                 &locator,
                 query.budget,
@@ -1449,18 +1499,34 @@ impl<'a> GoNativePointRequest<'a> {
                 match value {
                     SelectedResolutionOperationOutcome::Native(
                         SelectedResolutionLocated::Found(answer),
-                    ) => match answer.types {
+                    ) => match answer.value_types {
                         crate::analyzer::store::resolution_operation::SelectedNativeTypes::Cancelled => {
                             BoundedResolution::Cancelled { work }
                         }
-                        // A reference that names a type has no value type to report. The
-                        // incumbent answers it as no_type, so the native answer does too.
+                        // Type positions have no value type. The type child of a
+                        // composite literal instead selects the literal expression.
                         _ if answer.answer.site_metadata().is_some_and(|metadata| {
                             metadata.site_kind()
                                 == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::TypeReference
                         }) => {
                             BoundedResolution::Complete {
-                                value: go_type_name_site_outcome(query.site),
+                                value: if query.tree.or(parsed_tree.as_ref()).is_some_and(|tree| {
+                                    let Some(selected) = smallest_named_node_covering(
+                                        tree.root_node(),
+                                        query.site.focus_start_byte,
+                                        query.site.focus_end_byte,
+                                    ) else {
+                                        return false;
+                                    };
+                                    selected.parent().is_some_and(|parent| {
+                                        parent.kind() == "composite_literal"
+                                            && parent.child_by_field_name("type") == Some(selected)
+                                    })
+                                }) {
+                                    adapt_type_answer(query.site, crate::analyzer::Language::Go, answer)
+                                } else {
+                                    go_type_name_site_outcome(query.site)
+                                },
                                 work,
                             }
                         }
@@ -1469,27 +1535,34 @@ impl<'a> GoNativePointRequest<'a> {
                             work,
                         },
                     },
-                    #[cfg(test)]
                     SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing) => {
                         let value = go_interface_method_owner_type(query, self.go).unwrap_or_else(|| {
-                            incomplete_go_type(
-                                query.site,
-                                "native_missing",
-                                "selected native Go type answer is absent".into(),
-                            )
+                            let type_parameter_declaration = query.tree.or(parsed_tree.as_ref()).is_some_and(|tree| {
+                                let Some(selected) = smallest_named_node_covering(
+                                    tree.root_node(), query.site.focus_start_byte, query.site.focus_end_byte,
+                                ) else {
+                                    return false;
+                                };
+                                selected.parent().is_some_and(|parent| {
+                                    parent.kind() == "type_parameter_declaration"
+                                        && {
+                                            let mut cursor = parent.walk();
+                                            parent.children_by_field_name("name", &mut cursor)
+                                                .any(|name| name == selected)
+                                        }
+                                })
+                            });
+                            if type_parameter_declaration {
+                                go_type_name_site_outcome(query.site)
+                            } else {
+                                incomplete_go_type(
+                                    query.site,
+                                    "native_missing",
+                                    "selected native Go type answer is absent".into(),
+                                )
+                            }
                         });
                         BoundedResolution::Complete { value, work }
-                    }
-                    #[cfg(not(test))]
-                    SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing) => {
-                        BoundedResolution::Complete {
-                            value: unavailable_type(
-                                query.site,
-                                "native_missing",
-                                "selected native Go type answer is absent".into(),
-                            ),
-                            work,
-                        }
                     }
                     SelectedResolutionOperationOutcome::Unavailable(reason) => BoundedResolution::Complete {
                         value: unavailable_type(query.site, "native_unavailable", format!("{reason:?}")),
@@ -1759,6 +1832,190 @@ impl<'a> GoNativePointRequest<'a> {
         (result, selected_imports)
     }
 
+    /// Use selected native binding for the base, then model owner/member
+    /// postings for the selected path. Local shadows and workspace packages
+    /// cannot enter this external declaration authority.
+    fn overlay_definition_projection(
+        &mut self,
+        query: BoundedReceiverQuery<'_>,
+        tree: &tree_sitter::Tree,
+    ) -> crate::analyzer::store::Result<BoundedResolution<Option<GoOverlayDefinitionProjection>>>
+    {
+        let empty = || BoundedResolution::Complete {
+            value: None,
+            work: ReceiverAnalysisWork::default(),
+        };
+        let Some(overlay) = self.overlay.clone() else {
+            return Ok(empty());
+        };
+        let path = crate::path_utils::rel_path_string(query.file);
+        let Some(prepared) = self.files.get(&path).cloned() else {
+            return Ok(empty());
+        };
+        if prepared.context.demand.modeled_imports.is_empty()
+            || !self
+                .go
+                .inner
+                .source_matches_selected_native_content(query.file, query.source)
+        {
+            return Ok(empty());
+        }
+        let Some(selector) = brokk_bifrost_go::graph::reference::go_selector_descriptor(
+            tree.root_node(),
+            query.site,
+        ) else {
+            return Ok(empty());
+        };
+        if selector
+            .members
+            .iter()
+            .take(selector.focus_segment)
+            .next()
+            .is_none()
+            || !matches!(selector.base.kind(), "identifier" | "package_identifier")
+        {
+            return Ok(empty());
+        }
+        let cancellation = query.cancellation.cloned().unwrap_or_default();
+        let locator = SelectedSemanticLocator::for_reference_range(
+            "go",
+            path.clone(),
+            selector.base.start_byte(),
+            selector.base.end_byte(),
+        );
+        let mut metrics = SelectedResolutionContextMetrics;
+        let base = self
+            .operation
+            .resolve_native_reference_units_bounded_for_go_request(
+                prepared.context.clone(),
+                None,
+                &locator,
+                query.budget,
+                &cancellation,
+                &mut metrics,
+                self.forward_candidate_artifacts.entry(path).or_default(),
+                &mut self.point_metrics,
+            )?;
+        let (value, work) = match base {
+            BoundedResolution::Complete { value, work } => (value, work),
+            BoundedResolution::Exceeded { limit, work } => {
+                return Ok(BoundedResolution::Exceeded { limit, work });
+            }
+            BoundedResolution::Cancelled { work } => {
+                return Ok(BoundedResolution::Cancelled { work });
+            }
+        };
+        let direct_target = (|| {
+            let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
+                answer,
+            )) = value
+            else {
+                return None;
+            };
+            if answer.answer.binding().completion()
+                != &crate::analyzer::resolution::ResolutionCompletion::Complete
+            {
+                return None;
+            }
+            let [definition] = answer.answer.binding().targets() else {
+                return None;
+            };
+            let ordinal = crate::analyzer::resolution::SelectedResolutionMountOrdinal::new(
+                definition.ordinal()?,
+            );
+            let provider = prepared
+                .context
+                .demand
+                .modeled_imports
+                .get(&(ordinal, *definition))?;
+            let GoExternalPackageProvenance::SemanticModel { pack_digest, .. } =
+                &provider.provenance
+            else {
+                unreachable!("a modeled import carries model authority")
+            };
+            Some((provider.import_path.clone(), pack_digest.clone()))
+        })();
+        let Some((import_path, provider_digest)) = direct_target else {
+            return Ok(BoundedResolution::Complete { value: None, work });
+        };
+        let session =
+            crate::analyzer::usages::get_definition::resolution_session::ResolutionSession::bounded(
+                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
+                    max_scope_nodes: query
+                        .budget
+                        .max_scope_nodes
+                        .saturating_sub(work.scope_nodes),
+                    max_summary_expansions: query
+                        .budget
+                        .max_summary_expansions
+                        .saturating_sub(work.summary_expansions),
+                    ..query.budget
+                },
+                query.cancellation,
+            );
+        let packages = super::package_identity::GoOverlayPackages::new(Some(&overlay));
+        let package = packages
+            .modeled_package_identity(&import_path)
+            .expect("a selected modeled import belongs to the captured overlay");
+        assert_eq!(
+            package.pack_digest, provider_digest,
+            "a selected Go binder keeps its captured package provider"
+        );
+        let selected = super::package_identity::go_visible_member_path(
+            &import_path,
+            selector
+                .members
+                .iter()
+                .take(selector.focus_segment)
+                .map(|node| {
+                    node.utf8_text(query.source.as_bytes())
+                        .expect("selected Go member is source text")
+                }),
+            |package, member| {
+                packages
+                    .visible_member(package, member)
+                    .map(|symbol| symbol.qualified_name.clone())
+            },
+            |name| {
+                packages
+                    .visible_symbol(name)
+                    .filter(|symbol| symbol.qualified_name == name)
+                    .map(|symbol| symbol.qualified_name.clone())
+            },
+            || session.scope_step(),
+        )
+        .and_then(|selected| {
+            let symbol = packages.visible_symbol(&selected.symbol_name)?;
+            // Promoted members keep the embedded declaration's provider,
+            // which can differ from the importing package's provider.
+            Some(GoOverlayDefinitionProjection {
+                direct_target: GoOverlayDirectTarget {
+                    provider_digest: symbol.provenance.pack_digest.clone(),
+                    canonical_symbol: selected.reference_name,
+                },
+            })
+        });
+        Ok(match session.finish(selected) {
+            BoundedResolution::Complete {
+                value,
+                work: overlay_work,
+            } => BoundedResolution::Complete {
+                value,
+                work: go_add_resolution_work(work, overlay_work),
+            },
+            BoundedResolution::Exceeded {
+                limit,
+                work: overlay_work,
+            } => BoundedResolution::Exceeded {
+                limit,
+                work: go_add_resolution_work(work, overlay_work),
+            },
+            BoundedResolution::Cancelled { work: overlay_work } => BoundedResolution::Cancelled {
+                work: go_add_resolution_work(work, overlay_work),
+            },
+        })
+    }
+
     pub(crate) fn resolve_definition_with_evidence(
         &mut self,
         query: BoundedReceiverQuery<'_>,
@@ -1770,6 +2027,59 @@ impl<'a> GoNativePointRequest<'a> {
             .then(|| crate::analyzer::usages::get_definition::parse_go_tree(query.source))
             .flatten();
         let mut sibling_query_error = None;
+        if let Some(tree) = query.tree.or(parsed_tree.as_ref())
+            && let BoundedResolution::Complete { work, .. } = &native
+        {
+            let prior_work = *work;
+            let remaining = BoundedReceiverQuery {
+                budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
+                    max_scope_nodes: query.budget.max_scope_nodes.saturating_sub(prior_work.scope_nodes),
+                    max_summary_expansions: query.budget.max_summary_expansions.saturating_sub(prior_work.summary_expansions),
+                    ..query.budget
+                },
+                ..query
+            };
+            match self.overlay_definition_projection(remaining, tree) {
+                Ok(BoundedResolution::Complete { value, work }) => {
+                    if let BoundedResolution::Complete {
+                        value: (outcome, answer),
+                        work: total,
+                    } = &mut native
+                    {
+                        *total = go_add_resolution_work(prior_work, work);
+                        if let Some(projection) = value {
+                            assert!(
+                                !projection.direct_target.provider_digest.is_empty(),
+                                "model target has provider authority"
+                            );
+                            let mut reference = query.site.clone();
+                            reference.text = projection.direct_target.canonical_symbol;
+                            *outcome = DefinitionLookupOutcome {
+                                modeled_definitions: Vec::new(),
+                                status: DefinitionLookupStatus::NoDefinition,
+                                reference: Some(reference),
+                                definitions: Vec::new(),
+                                lexical_definition: None,
+                                diagnostics: Vec::new(),
+                            };
+                            *answer = None;
+                        }
+                    }
+                }
+                Ok(BoundedResolution::Exceeded { limit, work }) => {
+                    native = BoundedResolution::Exceeded {
+                        limit,
+                        work: go_add_resolution_work(prior_work, work),
+                    }
+                }
+                Ok(BoundedResolution::Cancelled { work }) => {
+                    native = BoundedResolution::Cancelled {
+                        work: go_add_resolution_work(prior_work, work),
+                    }
+                }
+                Err(error) => sibling_query_error = Some(error),
+            }
+        }
         if let Some(tree) = query.tree.or(parsed_tree.as_ref())
             && let BoundedResolution::Complete {
                 value: (value, _), ..
@@ -1785,13 +2095,13 @@ impl<'a> GoNativePointRequest<'a> {
                 .context
                 .demand
                 .context_id;
-            match self.operation.go_point_has_build_constrained_sibling(
+            match self.operation.go_point_package_with_unselected_source(
                 context_id,
                 &path,
                 &query.cancellation.cloned().unwrap_or_default(),
             ) {
-                Ok(true) => attach_go_package_incomplete(value),
-                Ok(false) => {}
+                Ok(Some(package)) => attach_go_package_incomplete(value, &package),
+                Ok(None) => {}
                 Err(error) => sibling_query_error = Some(error),
             }
         }
@@ -1853,6 +2163,9 @@ fn go_add_resolution_work(
     first.summary_expansions = first
         .summary_expansions
         .saturating_add(second.summary_expansions);
+    first.resolution_rounds = first
+        .resolution_rounds
+        .saturating_add(second.resolution_rounds);
     first.scope_nodes = first.scope_nodes.saturating_add(second.scope_nodes);
     first
 }
@@ -2041,7 +2354,7 @@ fn finish_go_definition_resolution(
 ) -> BoundedResolution<GoNativeDefinitionResolution> {
     match native {
         BoundedResolution::Complete {
-            value: (mut outcome, _native_answer),
+            value: (mut outcome, native_answer),
             work,
         } => {
             if query.cancellation.is_some_and(|token| token.is_cancelled()) {
@@ -2066,6 +2379,23 @@ fn finish_go_definition_resolution(
                             | "native_definition_projection_unavailable"
                     )
                 });
+            let native_unindexed_frontier = native_answer.as_ref().is_some_and(|answer| {
+                answer
+                    .projected_frontiers()
+                    .iter()
+                    .any(|state| !state.unindexed_external().is_empty())
+            }) && outcome.status
+                == DefinitionLookupStatus::UnresolvableImportBoundary;
+            if native_unindexed_frontier && !go.workspace_package_inventory_complete() {
+                // A presumed name cannot prove that an unplaced or overlaid
+                // workspace package is external to this request.
+                outcome.status = DefinitionLookupStatus::Incomplete;
+                outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                    claim: None,
+                    kind: "go-package-incomplete".into(),
+                    message: "the request's workspace package inventory cannot prove an external provider".into(),
+                });
+            }
             let external_candidate_status = matches!(
                 outcome.status,
                 DefinitionLookupStatus::Resolved
@@ -2116,6 +2446,7 @@ fn finish_go_definition_resolution(
                             brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
                                 max_scope_nodes: query.budget.max_scope_nodes.saturating_sub(work.scope_nodes),
                                 max_summary_expansions: query.budget.max_summary_expansions.saturating_sub(work.summary_expansions),
+                                max_resolution_rounds: query.budget.max_resolution_rounds.saturating_sub(work.resolution_rounds),
                                 ..query.budget
                             },
                             query.cancellation,
@@ -2206,7 +2537,8 @@ fn finish_go_definition_resolution(
                             .as_ref()
                             .map_or(application, ExactExternalCallProof::call_application);
                         external_callee_identity = identity;
-                    } else if let Some((external_outcome, proof)) =
+                    } else if !native_unindexed_frontier
+                        && let Some((external_outcome, proof)) =
                         crate::analyzer::usages::get_definition::go_native_external_receiver_call_resolution(
                             query_with_tree,
                             &external_session,

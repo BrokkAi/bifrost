@@ -157,6 +157,22 @@ pub fn scala_supertype_lookup_nodes(declaration: Node<'_>) -> Vec<(Node<'_>, Nod
         .collect()
 }
 
+/// Parser-owned bounds from a Scala self-type constraint. The first named
+/// child is the self binder; the remaining named child is its optional type
+/// annotation, whose compound roots each contribute an inherited member edge.
+pub(crate) fn scala_self_type_lookup_nodes(self_type: Node<'_>) -> Vec<(Node<'_>, Node<'_>)> {
+    assert_eq!(self_type.kind(), "self_type");
+    let mut parents = Vec::new();
+    let mut cursor = self_type.walk();
+    for child in self_type.named_children(&mut cursor).skip(1) {
+        collect_parent_type_roots(child, &mut parents);
+    }
+    parents
+        .into_iter()
+        .filter_map(|parent| supertype_lookup_node(parent).map(|lookup| (parent, lookup)))
+        .collect()
+}
+
 pub fn scala_type_lookup_segments(node: Node<'_>, source: &str) -> Vec<String> {
     scala_type_lookup_segments_with(
         node,

@@ -66,7 +66,11 @@ use std::sync::Arc;
 // value-semantics result computed while that reader refused the declaration
 // must not be reused. That covers results written before the lookahead row
 // stopped a capped store answer from being read as a refusal.
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v34";
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v35";
 
 /// Procedure-local source roles for both C and C++. The two dialects share
 /// tree-sitter syntax for the control constructs covered by B2 and B3; their

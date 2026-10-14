@@ -49,7 +49,11 @@ use brokk_bifrost_python::syntax::{
 };
 use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v42";
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v44";
 
 const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
 const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";
@@ -270,6 +274,9 @@ struct PythonModuleImportCandidate {
 struct PythonBuiltinProofs {
     range: bool,
     exception: bool,
+    base_exception: bool,
+    name_error: bool,
+    unbound_local_error: bool,
     object: bool,
     str: bool,
     isinstance: bool,
@@ -537,6 +544,9 @@ fn enumerate_procedures<'tree>(
     let builtin_proofs = PythonBuiltinProofs {
         range: unshadowed("range"),
         exception: unshadowed("Exception"),
+        base_exception: unshadowed("BaseException"),
+        name_error: unshadowed("NameError"),
+        unbound_local_error: unshadowed("UnboundLocalError"),
         object: unshadowed("object"),
         str: unshadowed("str"),
         isinstance: unshadowed("isinstance"),
@@ -1122,6 +1132,8 @@ struct LoweringContext<'tree, 'targets> {
     known_binding_escapes_after: HashMap<Box<str>, usize>,
     proven_instance_fields: &'targets HashMap<Box<str>, HashSet<Box<str>>>,
     catch_binders: HashMap<ProgramPointId, ValueId>,
+    unbound_local_handlers: HashMap<ProgramPointId, ProgramPointId>,
+    local_exception_dispatchers: HashSet<ProgramPointId>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, ValueId>,
     comprehension_bindings: HashMap<usize, ComprehensionBindings<'tree>>,
@@ -1226,6 +1238,8 @@ fn lower_procedure<'tree, 'targets>(
         known_binding_escapes_after: HashMap::default(),
         proven_instance_fields,
         catch_binders: HashMap::default(),
+        unbound_local_handlers: HashMap::default(),
+        local_exception_dispatchers: HashSet::default(),
         parameters: HashMap::default(),
         locals: HashMap::default(),
         comprehension_bindings: HashMap::default(),
@@ -4090,14 +4104,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "match_statement" => self.match_statement(builder, node, entry, next, scope, stack),
             "assert_statement" => self.assert_statement(builder, node, entry, next, scope, stack),
             "delete_statement" => {
-                self.session.record_gap(
-                    builder,
-                    entry,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::ExceptionalControlFlow,
-                    SemanticGapKind::Unsupported,
-                    "attribute, item, and name deletion failures are not lowered",
-                )?;
                 let mut pending = runtime_expression_children(node);
                 pending.reverse();
                 let mut previous = entry;
@@ -4122,6 +4128,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         )?;
                         return self.tuple_mutation_failure(builder, terminal, scope, stack);
                     }
+                    if !matches!(target.kind(), "identifier" | "keyword_identifier") {
+                        self.session.record_gap(
+                            builder,
+                            terminal,
+                            SemanticGapSubject::Point,
+                            SemanticCapability::ExceptionalControlFlow,
+                            SemanticGapKind::Unsupported,
+                            "attribute and item deletion failures are not lowered",
+                        )?;
+                    }
                     self.schedule_expressions(
                         builder,
                         previous,
@@ -4130,6 +4146,34 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope,
                         stack,
                     )?;
+                    let scoped_target =
+                        if matches!(target.kind(), "identifier" | "keyword_identifier") {
+                            node_text(self.prepared.source(), target)
+                                .map(|name| self.scoped_binding_value(builder, target, name))
+                                .transpose()?
+                                .flatten()
+                        } else {
+                            None
+                        };
+                    if let Some((binding, _)) = scoped_target {
+                        self.append_effect(
+                            builder,
+                            terminal,
+                            SemanticEffect::ValueUse {
+                                kind: ValueUseKind::Unbind,
+                                value: binding,
+                            },
+                        )?;
+                    } else if matches!(target.kind(), "identifier" | "keyword_identifier") {
+                        self.session.record_gap(
+                            builder,
+                            terminal,
+                            SemanticGapSubject::Point,
+                            SemanticCapability::ExceptionalControlFlow,
+                            SemanticGapKind::Unsupported,
+                            "deletion of a nonlocal name and its lookup failures are not lowered",
+                        )?;
+                    }
                     previous = terminal;
                 }
                 self.session.add_target_edge(builder, previous, next)
@@ -4334,6 +4378,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let result = self.expression_value(builder, node, self.expression_value_kind(node))?;
         if node.kind() == "identifier" {
             self.emit_lexical_input_flow(builder, node, entry, result)?;
+            if let Some(name) = node_text(self.prepared.source(), node)
+                && self
+                    .scoped_binding_value(builder, node, name)?
+                    .is_some_and(|(_, kind)| {
+                        matches!(
+                            kind,
+                            ValueFlowKind::Local
+                                | ValueFlowKind::Parameter
+                                | ValueFlowKind::Receiver
+                        )
+                    })
+            {
+                self.unbound_local_abort_route(builder, node, entry, scope, stack)?;
+            }
         }
         match node.kind() {
             "call" if self.proven_builtin_str_call(node) => {
@@ -6741,6 +6799,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .iter()
             .map(|clause| self.session.add_node_point(builder, *clause, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
+        let unbound_local_handler =
+            if catches.len() == 1 && self.exact_unbound_local_handler(catches[0]) {
+                Some(catch_entries[0])
+            } else {
+                None
+            };
         let catch_binding = catches.first().and_then(|clause| {
             (catches.len() == 1).then(|| self.precise_except_binding(*clause, body))?
         });
@@ -6749,6 +6813,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             cleanup_scope
         } else {
             let dispatcher = self.session.add_node_point(builder, node, Vec::new())?;
+            self.local_exception_dispatchers.insert(dispatcher);
+            if let Some(handler) = unbound_local_handler {
+                self.unbound_local_handlers.insert(dispatcher, handler);
+            }
             if !precise_single_catch {
                 // The dispatcher keeps every handler and the unmatched
                 // propagation as successors. When every clause type is a
@@ -6895,6 +6963,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             scope: try_scope,
         });
         Ok(())
+    }
+
+    fn exact_unbound_local_handler(&self, clause: Node<'tree>) -> bool {
+        if has_direct_token(clause, "*") {
+            return false;
+        }
+        let values = children_by_field_name(clause, "value");
+        let [value] = values.as_slice() else {
+            return values.is_empty();
+        };
+        if value.kind() != "identifier" {
+            return false;
+        }
+        let Some(name) = node_text(self.prepared.source(), *value) else {
+            return false;
+        };
+        let proven_builtin = match name {
+            "UnboundLocalError" => self.builtin_proofs.unbound_local_error,
+            "NameError" => self.builtin_proofs.name_error,
+            "Exception" => self.builtin_proofs.exception,
+            "BaseException" => self.builtin_proofs.base_exception,
+            _ => false,
+        };
+        proven_builtin
+            && self.bindings.name_resolution_at(name, *value)
+                == PythonLexicalNameResolution::Unbound
     }
 
     fn precise_except_binding(
@@ -7682,12 +7776,84 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "implicit abort has no matching structured continuation".into(),
             ));
         };
-        let abort = self.session.add_node_point(builder, node, Vec::new())?;
-        if let Some(binder) = self
+        self.route_implicit_abort(builder, node, operation, &route, stack)
+    }
+
+    fn unbound_local_abort_route(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        operation: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PythonLoweringError> {
+        let Some(route) =
+            builder.resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
+        else {
+            return Err(PythonLoweringError::Invalid(
+                "unbound-local abort has no matching structured continuation".into(),
+            ));
+        };
+        // An uncaught failure terminates this path. The shared initialization
+        // query removes the unbound state from normal successors, so an extra
+        // exit edge is only needed when a handler or cleanup consumes it.
+        if !self
+            .local_exception_dispatchers
+            .contains(&route.destination().target())
+            && route.cleanups().is_empty()
+        {
+            return Ok(());
+        }
+        let dispatcher = route.destination().target();
+        let local_handler = self.unbound_local_handlers.get(&dispatcher).copied();
+        // Only a clause the adapter proved matches a local-read failure binds
+        // its exception object. Every other enclosing handler selection still
+        // sees the failure and lets it unwind through its own unmatched
+        // exceptional route, but it must not gain a value-flow alternative
+        // into its binder: that would make the binder's definition ambiguous
+        // and cost every member read through it its exact access path
+        // (`exception-catch-positive`, #5131).
+        let binder = local_handler.and(self.catch_binders.get(&dispatcher).copied());
+        let routed = match local_handler {
+            Some(handler) => route.redirect(handler, ControlEdgeKind::SwitchCase),
+            None => route,
+        };
+        self.route_implicit_abort_with_binder(builder, node, operation, &routed, binder, stack)
+    }
+
+    fn route_implicit_abort(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        operation: ProgramPointId,
+        route: &CompletionRoute,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PythonLoweringError> {
+        let binder = self
             .catch_binders
             .get(&route.destination().target())
-            .copied()
-        {
+            .copied();
+        self.route_implicit_abort_with_binder(builder, node, operation, route, binder, stack)
+    }
+
+    /// Route one implicit abort through the enclosing structured completion.
+    ///
+    /// `binder`, when present, is the handler binding the failing operation's
+    /// exception object reaches on this route. The caller decides it: an
+    /// ordinary implicit abort binds whatever handler the route's destination
+    /// selects, while a local read only binds a handler proven to match its
+    /// `NameError`/`UnboundLocalError` failure.
+    fn route_implicit_abort_with_binder(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        operation: ProgramPointId,
+        route: &CompletionRoute,
+        binder: Option<ValueId>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PythonLoweringError> {
+        let abort = self.session.add_node_point(builder, node, Vec::new())?;
+        if let Some(binder) = binder {
             let thrown = self.value(builder, abort, SemanticValueKind::Exception)?;
             self.append_effect(
                 builder,
@@ -7707,7 +7873,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::Exceptional,
             },
         )?;
-        self.route(builder, abort, &route, stack)
+        self.route(builder, abort, route, stack)
     }
 
     /// Publish the two claims an unresolved attribute or subscript read makes.

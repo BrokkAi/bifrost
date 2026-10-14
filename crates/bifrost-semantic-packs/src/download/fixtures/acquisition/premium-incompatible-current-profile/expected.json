@@ -1,0 +1,41 @@
+{
+  "created_at": "<TIMESTAMP>",
+  "engine": {
+    "build_identity": "fixture-build",
+    "executable_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version": "9.9.0"
+  },
+  "failure": {
+    "class": "no-compatible-release",
+    "message": "no candidate satisfies the pack request and engine contract",
+    "retryable": false
+  },
+  "inventory": {
+    "fetched_at": "<TIMESTAMP>",
+    "fetched_online": true,
+    "index_sha256": "910f84ad506795a2097ee4239ea837e3d8d42a215f1ccf7b0d322ccec4d3cf1f"
+  },
+  "outcome_schema_version": 1,
+  "rejections": [
+    {
+      "detail": "missing capabilities {\"actual-to-formal-binding\", \"exact-call-target\", \"flow\", \"taint\"}; unsupported schema axes [(\"release.policy_bundle\", [1], []), (\"content:rules/compiled/csharp/premium.rqlp.policy_bundle\", [1], []), (\"content:rules/compiled/cpp/premium.rqlp.policy_bundle\", [1], []), (\"content:rules/compiled/go/premium.rqlp.policy_bundle\", [1], []), (\"content:rules/compiled/java/premium.rqlp.policy_bundle\", [1], []), (\"content:rules/compiled/javascript/premium.rqlp.policy_bundle\", [1], []), (\"content:rules/compiled/kotlin/premium.rqlp.policy_bundle\", [1], []), (\"content:rules/compiled/php/premium.rqlp.policy_bundle\", [1], []), (\"content:rules/compiled/python/premium.rqlp.policy_bundle\", [1], []), (\"content:rules/compiled/ruby/premium.rqlp.policy_bundle\", [1], []), (\"content:rules/compiled/rust/premium.rqlp.policy_bundle\", [1], []), (\"content:rules/compiled/scala/premium.rqlp.policy_bundle\", [1], []), (\"content:rules/compiled/swift/premium.rqlp.policy_bundle\", [1], []), (\"content:rules/compiled/typescri...",
+      "pack_id": "bifrost.premium",
+      "reason": "engine-contract",
+      "release_version": "0.3.0",
+      "tag": "v0.3.0"
+    }
+  ],
+  "request": {
+    "dependencies": [],
+    "pack_id": "bifrost.premium",
+    "repository": "https://github.com/example/private-packs",
+    "request_schema_version": 1,
+    "selection": {
+      "allowed_versions": "*",
+      "channel": "stable",
+      "mode": "preferred"
+    }
+  },
+  "selection": null,
+  "status": "failed"
+}

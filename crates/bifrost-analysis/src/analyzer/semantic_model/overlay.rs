@@ -90,6 +90,29 @@ pub enum SemanticModelSymbolKind {
     Event,
 }
 
+impl SemanticModelSymbolKind {
+    /// Whether this kind is a type declaration, the only shape a hierarchy
+    /// edge can cross to. Members and values never are, so a pack that
+    /// publishes a constant beside a same-named class cannot answer a base
+    /// clause with the constant.
+    fn is_type_declaration(self) -> bool {
+        matches!(
+            self,
+            Self::Class
+                | Self::Annotation
+                | Self::Delegate
+                | Self::Interface
+                | Self::Trait
+                | Self::Struct
+                | Self::Union
+                | Self::Enum
+                | Self::Record
+                | Self::Module
+                | Self::TypeAlias
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticModelRange {
     pub start_byte: usize,
@@ -639,6 +662,35 @@ pub struct SemanticModelAncestry<'a> {
 struct ResolvedEdgeTarget<'a> {
     records: Vec<&'a SemanticModelSymbol>,
     defect: Option<SemanticModelEdgeDefect>,
+}
+
+/// What declaration kinds a hierarchy edge may name.
+///
+/// The edge label alone does not fix the target's kind, because each producer
+/// spends the label vocabulary its own way: the JVM external packs record every
+/// supertype as `extends`, whether it names a class, an interface or a trait,
+/// and Rust records a trait implementation as `implements`, naming a trait.
+/// A pack that records a supertype by name does not record its kind at all, so
+/// [`HierarchyTargetShape::Type`] admits every type declaration and still
+/// rejects a same-named method, field or constant, which is what keeps a value
+/// from answering a class base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HierarchyTargetShape {
+    /// One specific declaration kind, where the caller knows it. Java
+    /// `implements` always names an interface, so the widening walk asks for
+    /// that kind and not merely for a type.
+    Kind(SemanticModelSymbolKind),
+    /// Any type declaration.
+    Type,
+}
+
+impl HierarchyTargetShape {
+    fn admits(self, record: &SemanticModelSymbol) -> bool {
+        match self {
+            Self::Kind(kind) => record.kind == kind,
+            Self::Type => record.kind.is_type_declaration(),
+        }
+    }
 }
 
 /// A reason one owner's inherited surface may not be all of it.
@@ -2266,7 +2318,21 @@ impl SemanticModelOverlay {
             .iter()
             .any(|relation| relation.provenance.ambiguous);
         for relation in hierarchy {
-            let resolved = self.resolve_edge_target(&relation.to, &symbol.language);
+            let target = self.ancestry_target_name(symbol, &relation.to);
+            // Declaration IDs are not module-relative names.
+            let target = if self.symbols_with_id(&relation.to).records.is_empty() {
+                target.as_ref()
+            } else {
+                &relation.to
+            };
+            // The label does not name the target's kind. A pack records a
+            // supertype by name, and each producer labels its own way: the JVM
+            // external packs call a trait or interface supertype `extends`, and
+            // Rust calls a trait implementation `implements`. The target is a
+            // type either way, so ask for that and let the language's own kind
+            // decide the rest.
+            let resolved =
+                self.resolve_edge_target(target, &symbol.language, HierarchyTargetShape::Type);
             conflict |= resolved.defect == Some(SemanticModelEdgeDefect::Ambiguous);
             if let Some(defect) = resolved.defect {
                 defects.push(SemanticModelUnresolvedEdge {
@@ -2285,7 +2351,8 @@ impl SemanticModelOverlay {
             && let Some(root_name) =
                 universal_root_name(symbol).filter(|root| *root != symbol.qualified_name)
         {
-            let resolved = self.resolve_edge_target(root_name, &symbol.language);
+            let resolved =
+                self.resolve_edge_target(root_name, &symbol.language, HierarchyTargetShape::Type);
             conflict |= resolved.defect == Some(SemanticModelEdgeDefect::Ambiguous);
             if let Some(defect) = resolved.defect {
                 defects.push(SemanticModelUnresolvedEdge {
@@ -2311,6 +2378,44 @@ impl SemanticModelOverlay {
         }
     }
 
+    /// Same-qualified-name class records describe one class. Prefer a complete
+    /// surface, then the smallest ID, as in external class identity (#4942).
+    pub(crate) fn class_representative<'a>(
+        &self,
+        records: impl IntoIterator<Item = &'a SemanticModelSymbol>,
+    ) -> Option<&'a SemanticModelSymbol> {
+        records.into_iter().min_by_key(|record| {
+            (
+                record.provenance.completeness != SemanticModelCompleteness::Complete,
+                &record.id,
+            )
+        })
+    }
+
+    /// Qualify a bare hierarchy-edge target through the declaring language's
+    /// own rule. A legacy Python pack records `class Child(Base)` as `Base`,
+    /// which means the `Base` in the declaring class's own module; every other
+    /// language's producer records a target that is already complete.
+    pub(crate) fn ancestry_target_name<'a>(
+        &self,
+        class: &SemanticModelSymbol,
+        target: &'a str,
+    ) -> std::borrow::Cow<'a, str> {
+        let qualified = Language::from_config_label(&class.language)
+            .and_then(crate::analyzer::languages::language_support)
+            .and_then(|support| {
+                support.qualified_hierarchy_target(
+                    class.locator_path.as_deref(),
+                    &class.qualified_name,
+                    target,
+                )
+            });
+        match qualified {
+            Some(qualified) => std::borrow::Cow::Owned(qualified),
+            None => target.into(),
+        }
+    }
+
     /// Resolve one hierarchy edge target to the declarations it names, and say
     /// whether that resolution is clean enough to carry a proof.
     ///
@@ -2329,8 +2434,16 @@ impl SemanticModelOverlay {
     /// qualified name does (#2958). Aliases also carry bare export spellings,
     /// which another language's pack can hold by coincidence, so an alias match
     /// counts only for the language that spelled the edge.
-    fn resolve_edge_target(&self, target: &str, language: &str) -> ResolvedEdgeTarget<'_> {
-        let by_id = self.symbols_with_id(target);
+    fn resolve_edge_target(
+        &self,
+        target: &str,
+        language: &str,
+        shape: HierarchyTargetShape,
+    ) -> ResolvedEdgeTarget<'_> {
+        let mut by_id = self.symbols_with_id(target);
+        by_id.records.retain(|record| {
+            shape.admits(record) && record.owner_id.is_none() && record.language == language
+        });
         if !by_id.records.is_empty() {
             return ResolvedEdgeTarget {
                 defect: (by_id.disposition == SemanticModelOverlayDisposition::Conflict)
@@ -2338,7 +2451,10 @@ impl SemanticModelOverlay {
                 records: by_id.records,
             };
         }
-        let by_name = self.symbols_named(target);
+        let mut by_name = self.symbols_named(target);
+        by_name.records.retain(|record| {
+            shape.admits(record) && record.owner_id.is_none() && record.language == language
+        });
         if by_name.records.is_empty() {
             return ResolvedEdgeTarget {
                 records: Vec::new(),
@@ -2355,6 +2471,29 @@ impl SemanticModelOverlay {
                         && record.aliases.iter().any(|alias| alias == target))
             })
             .collect::<Vec<_>>();
+        // Same-qualified-name class records describe one class (#4942), so a
+        // class base that several packs publish resolves to one representative
+        // instead of reading as ambiguous. The rule is about the group being
+        // class records, not about the edge's shape, because the generic pack
+        // path asks for any type and cannot say "class" on the caller's behalf.
+        if !exact.is_empty()
+            && exact
+                .iter()
+                .all(|record| record.kind == SemanticModelSymbolKind::Class)
+            && exact.iter().all(|record| {
+                !record.provenance.ambiguous
+                    && record.qualified_name == exact[0].qualified_name
+                    && record.language == language
+            })
+        {
+            return ResolvedEdgeTarget {
+                records: vec![
+                    self.class_representative(exact)
+                        .expect("exact class group is nonempty"),
+                ],
+                defect: None,
+            };
+        }
         match exact.as_slice() {
             [] => ResolvedEdgeTarget {
                 records: by_name.records,
@@ -8713,7 +8852,7 @@ pub(crate) mod tests {
 
     #[test]
     fn go_modeled_package_identity_uses_exact_declared_name_and_pack_provenance() {
-        use crate::analyzer::go::package_identity::GoOverlayPackages;
+        use crate::analyzer::languages::{ModeledExternalPackageIdentity, language_support};
 
         let mut package = class("example.com/acme/codec", "go");
         package.kind = SemanticModelSymbolKind::Module;
@@ -8722,26 +8861,54 @@ pub(crate) mod tests {
         package.provenance.pack_digest = "a1b2".to_owned();
         package.provenance.record_id = "package:codec".to_owned();
         let symbol_id = package.id.clone();
-        let overlay = overlay(vec![package], Vec::new());
+        let selected_overlay = overlay(vec![package.clone()], Vec::new());
+        let go_support = language_support(Language::Go).expect("Go support is registered");
+        let rejects = |package| {
+            go_support
+                .modeled_external_package_identity(
+                    &overlay(vec![package], Vec::new()),
+                    "example.com/acme/codec",
+                )
+                .is_none()
+        };
 
         assert_eq!(
-            GoOverlayPackages::new(Some(&overlay))
-                .modeled_package_identity("example.com/acme/codec"),
-            Some(
-                crate::analyzer::go::package_identity::GoModeledPackageIdentity {
-                    package_name: "wire".to_owned(),
-                    symbol_id,
-                    pack_id: "go.api.codec".to_owned(),
-                    pack_digest: "a1b2".to_owned(),
-                    record_id: "package:codec".to_owned(),
-                }
-            )
+            go_support
+                .modeled_external_package_identity(&selected_overlay, "example.com/acme/codec"),
+            Some(ModeledExternalPackageIdentity {
+                package_name: "wire".to_owned(),
+                symbol_id,
+                pack_id: "go.api.codec".to_owned(),
+                pack_digest: "a1b2".to_owned(),
+                record_id: "package:codec".to_owned(),
+            })
         );
         assert!(
-            GoOverlayPackages::new(Some(&overlay))
-                .modeled_package_identity("example.com/acme/other")
+            go_support
+                .modeled_external_package_identity(&selected_overlay, "example.com/acme/other")
                 .is_none(),
             "a different import path has no package authority"
+        );
+
+        let mut private_package = package.clone();
+        private_package.visibility = Visibility::Private;
+        assert!(
+            rejects(private_package),
+            "private package records do not authorize imports"
+        );
+
+        let mut other_language_package = package.clone();
+        other_language_package.language = "rust".to_owned();
+        assert!(
+            rejects(other_language_package),
+            "a package record owned by another language is not Go import authority"
+        );
+
+        let mut ambiguous_package = package;
+        ambiguous_package.provenance.ambiguous = true;
+        assert!(
+            rejects(ambiguous_package),
+            "ambiguous package provenance does not authorize imports"
         );
     }
 

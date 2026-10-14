@@ -440,6 +440,36 @@ impl SpliceMount for ResolutionCompletion {
     }
 }
 
+impl SpliceMount for super::model::WitnessStep {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        match self {
+            Self::Node(node) => Self::Node(translation.node(*node)),
+            Self::Candidate { semantic, outcome } => Self::Candidate {
+                semantic: translation.semantic(*semantic),
+                outcome: *outcome,
+            },
+            Self::Boundary { semantic, status } => Self::Boundary {
+                semantic: translation.semantic(*semantic),
+                status: *status,
+            },
+        }
+    }
+}
+
+impl SpliceMount for super::model::ResolutionWitness {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self::new(
+            translation.semantic(self.reference()),
+            translation.semantic(self.target()),
+            self.steps()
+                .iter()
+                .map(|step| step.splice(translation))
+                .collect::<Vec<_>>(),
+            self.completion().splice(translation),
+        )
+    }
+}
+
 impl SpliceMount for PartialPath {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         remount_path(self, translation, uncancelled())
@@ -1001,6 +1031,21 @@ where
     S: std::ops::Deref,
     S::Target: BatchResolutionFragmentSource,
 {
+    fn identity_content_digest(
+        &self,
+        key: super::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        use super::ResolutionIdentityDigestKey as Key;
+        let key = match key {
+            Key::Semantic(value) => Key::Semantic(self.argument(&value)),
+            Key::Node(value) => Key::Node(self.argument(&value)),
+            Key::Path(value) => Key::Path(self.argument(&value)),
+            Key::Fragment(value) => Key::Fragment(self.argument(&value)),
+        };
+        self.inner.identity_content_digest(key, cancellation)
+    }
+
     /// The authority names a selection, not an identity, so there is nothing
     /// for this decorator to rebase: the inner source's answer is this one.
     fn selection_authority(&self) -> Option<super::batch::SeedReadAuthority> {
@@ -1322,6 +1367,24 @@ where
             .inner
             .callable_parameter_for_label(self.argument(&callable), label, cancellation)?
             .map(|parameter| self.result(&parameter)))
+    }
+
+    fn external_callable_result_type_identities(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(SemanticId, SemanticId)>>> {
+        let arguments = self.arguments(definitions);
+        Ok(self
+            .inner
+            .external_callable_result_type_identities(&arguments, cancellation)?
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(definition, identity)| {
+                        (self.result(&definition), self.result(&identity))
+                    })
+                    .collect()
+            }))
     }
 
     fn rust_crate_access(
@@ -1974,10 +2037,10 @@ mod tests {
             declared_methods(&typed_crlf, "SelectedTypedFactSource"),
             typed
         );
-        assert_eq!(batch.len(), 29, "BatchResolutionFragmentSource: {batch:?}");
+        assert_eq!(batch.len(), 30, "BatchResolutionFragmentSource: {batch:?}");
         // The descriptor-only projection is forwarded independently of the
         // seed reader; the source-derived membership check below proves both.
-        assert_eq!(typed.len(), 71, "SelectedTypedFactSource: {typed:?}");
+        assert_eq!(typed.len(), 72, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = forwarded_methods(include_str!("mounted.rs"))
             .into_iter()

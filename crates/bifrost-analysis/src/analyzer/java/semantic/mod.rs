@@ -24,6 +24,10 @@ use crate::analyzer::{JavaAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
 
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
 const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v31";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);

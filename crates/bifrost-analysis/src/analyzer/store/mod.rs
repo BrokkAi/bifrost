@@ -192,7 +192,6 @@ pub(crate) fn declaration_name<'a>(
 }
 
 const PREPARED_WRITE_IMMEDIATE_RETRIES: usize = 2;
-const STALE_GENERATION_RECLAIM_ROWS: usize = 10_000;
 /// How many stored bytes one row of a bounded query may materialize, and how
 /// many the whole answer may.
 ///
@@ -495,6 +494,12 @@ const NORMALIZED_PATH_SYMBOL_FQN_SQL: &str =
     ORDER BY rel_path, exact_fqn";
 const REVISIONED_WORKSPACE_VIEWS_SQL: &str = include_str!("revisioned_workspace_views.sql");
 
+/// Rebuild selection-owned Rust rows for either reader pool after its input write.
+fn fill_selected_rust_units(conn: &Connection) -> Result<()> {
+    conn.execute_batch(include_str!("rust_selected_units_fill.sql"))?;
+    Ok(())
+}
+
 /// Structural publication verification, before source/native families seal:
 /// base membership plus a re-count against the counts `blob_meta` recorded.
 ///
@@ -694,7 +699,7 @@ pub struct AnalyzerStore {
     /// the in-memory fallback that reads through it. Only the holder of the
     /// writer connection's guard ever reads or writes this, and it takes both
     /// guards together (see [`ReaderConn::Writer`]).
-    writer_selection: Mutex<Option<WorkspaceSnapshots>>,
+    writer_selection: Arc<Mutex<Option<AppliedWorkspaceSelection>>>,
     #[cfg(test)]
     crate_statement_counter: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
     writer_resolution_selection: Mutex<Option<resolution_selection::RetainedResolutionSelection>>,
@@ -821,13 +826,40 @@ impl ReaderPoolState {
     }
 }
 
+/// The fixed-size SQLite freshness witnesses shared by both reader pools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkspaceSelectionStamp {
+    main_data_version: i64,
+    main_schema_version: i64,
+    temp_schema_version: i64,
+}
+
+fn workspace_selection_stamp(conn: &Connection) -> Result<WorkspaceSelectionStamp> {
+    Ok(WorkspaceSelectionStamp {
+        main_data_version: conn
+            .prepare_cached("PRAGMA main.data_version")?
+            .query_row([], |row| row.get(0))?,
+        main_schema_version: conn
+            .prepare_cached("PRAGMA main.schema_version")?
+            .query_row([], |row| row.get(0))?,
+        temp_schema_version: conn
+            .prepare_cached("PRAGMA temp.schema_version")?
+            .query_row([], |row| row.get(0))?,
+    })
+}
+
+struct AppliedWorkspaceSelection {
+    snapshots: WorkspaceSnapshots,
+    stamp: WorkspaceSelectionStamp,
+}
+
 /// A reader connection together with the workspace selection its temp schema
 /// currently holds.
 ///
 /// `temp.selected_workspace_revisions` and the revisioned views over it are
 /// temp objects, so they live exactly as long as the connection does.
 /// Remembering what is in them lets a checkout that wants the selection the
-/// connection already holds run no statement at all. Every relational batch
+/// connection already holds check freshness without rebuilding rows. Every relational batch
 /// used to probe `temp.sqlite_schema`, delete the selection table and
 /// re-insert one row per snapshot, and a reader that had just been opened
 /// re-parsed the 539-line view script on top of that (#2883).
@@ -836,7 +868,7 @@ struct SelectedReader {
     /// `None` until the revisioned views have been created on this connection;
     /// afterwards, the selection materialized in
     /// `temp.selected_workspace_revisions`.
-    selection: Option<WorkspaceSnapshots>,
+    selection: Option<AppliedWorkspaceSelection>,
     resolution_selection: Option<resolution_selection::RetainedResolutionSelection>,
     /// The pool's [`ReaderPoolState::statistics_epoch`] when this connection
     /// was opened.
@@ -1122,7 +1154,7 @@ enum ReaderConn<'a> {
     /// pool entry, and is held for as long as the connection guard is.
     Writer {
         conn: std::sync::MutexGuard<'a, Connection>,
-        selection: std::sync::MutexGuard<'a, Option<WorkspaceSnapshots>>,
+        selection: std::sync::MutexGuard<'a, Option<AppliedWorkspaceSelection>>,
         resolution_selection:
             std::sync::MutexGuard<'a, Option<resolution_selection::RetainedResolutionSelection>>,
     },
@@ -1140,7 +1172,9 @@ impl ReaderGuard<'_> {
     /// This connection and the selection its temp schema holds, borrowed
     /// together so a selection can be compared, applied, and recorded without
     /// releasing the connection.
-    fn connection_and_selection(&mut self) -> (&Connection, &mut Option<WorkspaceSnapshots>) {
+    fn connection_and_selection(
+        &mut self,
+    ) -> (&Connection, &mut Option<AppliedWorkspaceSelection>) {
         match &mut self.inner {
             ReaderConn::Pooled { reader, .. } => {
                 let reader = reader.as_mut().expect("reader guard already returned");
@@ -1354,7 +1388,9 @@ impl Drop for ReaderGuard<'_> {
                     pool.abandon_checkout();
                 } else {
                     if had_cleanup {
-                        reader.selection = Some(WorkspaceSnapshots::default());
+                        if let Some(selection) = &mut reader.selection {
+                            selection.snapshots.clear();
+                        }
                         reader.resolution_selection = None;
                     }
                     pool.checkin(reader);
@@ -1366,7 +1402,9 @@ impl Drop for ReaderGuard<'_> {
                 ..
             } => {
                 if had_cleanup {
-                    **selection = Some(WorkspaceSnapshots::default());
+                    if let Some(selection) = selection.as_mut() {
+                        selection.snapshots.clear();
+                    }
                     **resolution_selection = None;
                 }
                 assert!(
@@ -1533,7 +1571,7 @@ fn canonical_language_label(label: &str) -> Option<Language> {
 fn live_class_set_owner_blob_id(
     conn: &Connection,
     blob_oid: &str,
-    language: &str,
+    storage_language_key: &crate::analyzer::semantic::StorageLanguageKey,
 ) -> Result<Option<i64>> {
     conn.query_row(
         &format!(
@@ -1542,7 +1580,7 @@ fn live_class_set_owner_blob_id(
              WHERE blobs.blob_oid=?1 AND blobs.lang=?2
                AND {PARSED_BLOB_COMPLETE_CONDITION}"
         ),
-        params![blob_oid, language],
+        params![blob_oid, storage_language_key.as_str()],
         |row| row.get(0),
     )
     .optional()
@@ -2625,7 +2663,7 @@ impl AnalyzerStore {
         let package_files = package_files.to_vec();
         let package_edges = package_edges.to_vec();
         let anchors = anchors.to_vec();
-        self.conn.execute(move |conn| {
+        self.execute_selection_publication(move |conn| {
             let lang = lang.as_str();
             let files = files.as_slice();
             let path_symbols = path_symbols.as_slice();
@@ -2684,7 +2722,6 @@ impl AnalyzerStore {
                 }
             }
             tx.commit()?;
-            let _ = reclaim_stale_generations_conn(conn, STALE_GENERATION_RECLAIM_ROWS);
             Ok(snapshot)
         })
     }
@@ -2841,7 +2878,7 @@ impl AnalyzerStore {
         let package_files = package_files.to_vec();
         let package_edges = package_edges.to_vec();
         let anchors = anchors.to_vec();
-        self.conn.execute(move |conn| {
+        self.execute_selection_publication(move |conn| {
             let storage_langs = storage_langs.as_slice();
             let workspace_id_text = workspace_id.as_str();
             let generations = &generations;
@@ -2935,7 +2972,6 @@ impl AnalyzerStore {
                 snapshots.insert(lang.clone(), snapshot);
             }
             tx.commit()?;
-            let _ = reclaim_stale_generations_conn(conn, STALE_GENERATION_RECLAIM_ROWS);
             Ok(snapshots)
         })
     }
@@ -3069,7 +3105,7 @@ impl AnalyzerStore {
             readers: ReaderPool::new(reader_source.clone()),
             active_readers: ReaderPool::new(reader_source.clone()),
             streaming_readers: ReaderPool::new(reader_source),
-            writer_selection: Mutex::new(None),
+            writer_selection: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             crate_statement_counter: Mutex::new(None),
             writer_resolution_selection: Mutex::new(None),
@@ -3114,7 +3150,7 @@ impl AnalyzerStore {
             readers: ReaderPool::new(Some(reader_source.clone())),
             active_readers: ReaderPool::new(Some(reader_source.clone())),
             streaming_readers: ReaderPool::new(Some(reader_source)),
-            writer_selection: Mutex::new(None),
+            writer_selection: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             crate_statement_counter: Mutex::new(None),
             writer_resolution_selection: Mutex::new(None),
@@ -3358,11 +3394,29 @@ impl AnalyzerStore {
         Ok(conn)
     }
 
+    /// A publication job may commit before returning an error. Invalidate the
+    /// writer fallback while its connection is still held, even in that case:
+    /// SQLite data_version excludes commits made by the connection itself.
+    fn execute_selection_publication<T, F>(&self, job: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> T + Send + 'static,
+    {
+        let selection = Arc::clone(&self.writer_selection);
+        self.conn.execute(move |conn| {
+            let outcome = job(conn);
+            *selection
+                .lock()
+                .expect("analyzer store writer selection poisoned") = None;
+            outcome
+        })
+    }
+
     /// Materialize `snapshots` in `guard`'s temp schema, unless that is already
     /// what the connection holds.
     ///
     /// The revisioned views are created once per connection and the selection
-    /// rows are rewritten only when the selection actually changes, so a run of
+    /// rows are rewritten only when snapshots or publication freshness change, so a run of
     /// batches against one workspace generation costs one view script and one
     /// selection write however many batches it contains (#2883).
     fn select_workspace_snapshots(
@@ -3396,10 +3450,14 @@ impl AnalyzerStore {
     fn apply_workspace_selection(
         &self,
         conn: &Connection,
-        selection: &mut Option<WorkspaceSnapshots>,
+        selection: &mut Option<AppliedWorkspaceSelection>,
         snapshots: &WorkspaceSnapshots,
     ) -> Result<()> {
-        if selection.as_ref() == Some(snapshots) {
+        let stamp = workspace_selection_stamp(conn)?;
+        if selection
+            .as_ref()
+            .is_some_and(|selection| selection.snapshots == *snapshots && selection.stamp == stamp)
+        {
             return Ok(());
         }
         if selection.is_none() {
@@ -3407,13 +3465,14 @@ impl AnalyzerStore {
             self.workspace_selection_counters
                 .view_creations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            conn.execute_batch(REVISIONED_WORKSPACE_VIEWS_SQL)?;
+            ensure_revisioned_workspace_views(conn)?;
         }
         #[cfg(test)]
         self.workspace_selection_counters
             .selection_writes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tx = conn.unchecked_transaction()?;
+        tx.execute_batch("DELETE FROM temp.selected_rust_unit_closure; DELETE FROM temp.selected_rust_unit_summaries;")?;
         tx.prepare_cached("DELETE FROM temp.selected_workspace_revisions")?
             .execute([])?;
         {
@@ -3431,8 +3490,15 @@ impl AnalyzerStore {
                 ])?;
             }
         }
+        fill_selected_rust_units(&tx)?;
+        // Read while this transaction still pins the publication used by the
+        // fill. An external commit after it ends must differ on next checkout.
+        let stamp = workspace_selection_stamp(&tx)?;
         tx.commit()?;
-        *selection = Some(snapshots.clone());
+        *selection = Some(AppliedWorkspaceSelection {
+            snapshots: snapshots.clone(),
+            stamp,
+        });
         Ok(())
     }
 
@@ -3635,8 +3701,7 @@ impl AnalyzerStore {
         }
         drop(conn);
         let entries = entries.to_vec();
-        self.conn
-            .execute(move |conn| ensure_language_epochs_tx(conn, &entries))
+        self.execute_selection_publication(move |conn| ensure_language_epochs_tx(conn, &entries))
     }
 
     /// Sum persisted analyzer payload bytes for complete blobs in the active
@@ -6449,8 +6514,9 @@ impl AnalyzerStore {
     }
 
     pub(crate) fn reclaim_stale_generations(&self, max_logical_rows: usize) -> Result<usize> {
-        self.conn
-            .execute(move |conn| reclaim_stale_generations_conn(conn, max_logical_rows))
+        self.execute_selection_publication(move |conn| {
+            reclaim_stale_generations_conn(conn, max_logical_rows)
+        })
     }
 
     /// Drop every workspace projection row belonging to `workspace_id`.
@@ -6460,15 +6526,16 @@ impl AnalyzerStore {
     /// mount its files (`workspace_heads`, `workspace_revisions`, and the
     /// `workspace_file_versions` tree that cascades from a revision) describe a
     /// path that no longer exists once the request ends. The parsed blob facts
-    /// the same build published stay, because those are keyed by content and
-    /// are exactly what the next consumer of this cache reuses.
+    /// and unit summaries the same build published stay, because those are
+    /// keyed by content and are exactly what the next consumer of this cache
+    /// reuses. Periodic GC reclaims summaries that remain unbound.
     ///
     /// Returns the number of `workspace_revisions` rows removed; the file
     /// versions and their package, edge, anchor and path-symbol rows follow
     /// through `ON DELETE CASCADE`.
     pub(crate) fn delete_workspace_projection(&self, workspace_id: &WorkspaceId) -> Result<usize> {
         let workspace_id = workspace_id.as_str().to_string();
-        self.conn.execute(move |conn| {
+        self.execute_selection_publication(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
                 "DELETE FROM workspace_import_graphs WHERE workspace_id = ?1",
@@ -6490,8 +6557,6 @@ impl AnalyzerStore {
                 unit_summaries::DELETE_WORKSPACE_VERSIONS_SQL,
                 params![workspace_id],
             )?;
-            tx.execute(unit_summaries::DELETE_UNBOUND_SUMMARIES_SQL, [])?;
-            tx.execute(rust_crates::DELETE_UNBOUND_TOPOLOGIES_SQL, [])?;
             let revisions = tx.execute(
                 "DELETE FROM workspace_revisions WHERE workspace_id = ?1",
                 params![workspace_id],
@@ -17952,9 +18017,7 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
 
     let remaining = max_logical_rows.saturating_sub(reclaimed);
     if remaining > 0 {
-        if tx.execute(unit_summaries::DELETE_STALE_GENERATION_VERSIONS_SQL, [])? > 0 {
-            tx.execute(unit_summaries::DELETE_UNBOUND_SUMMARIES_SQL, [])?;
-        }
+        tx.execute(unit_summaries::DELETE_STALE_GENERATION_VERSIONS_SQL, [])?;
         tx.execute(
             "DELETE FROM workspace_heads
              WHERE generation <> COALESCE(
@@ -17977,6 +18040,11 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
             [usize_to_i64(remaining)?],
         )?);
     }
+    // Foreground projection withdrawal and publication retain content-addressed
+    // summaries for the next build. Sweep even when no stale versions existed
+    // or stale blobs exhausted this pass's logical-row budget.
+    tx.execute(unit_summaries::DELETE_UNBOUND_SUMMARIES_SQL, [])?;
+    tx.execute(rust_crates::DELETE_UNBOUND_TOPOLOGIES_SQL, [])?;
     tx.commit()?;
     Ok(reclaimed)
 }
@@ -21026,6 +21094,23 @@ mod tests {
         git2::Repository::init(&workspace_root).unwrap();
         std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o555)).unwrap();
 
+        // POSIX mode bits do not constrain uid 0 (nor a process holding
+        // CAP_DAC_OVERRIDE): the 0o555 injection cannot deny the write, the
+        // store opens, and the assertion below would then fail for a reason
+        // that is not the product's (issue #5090). Probe for a write denial the
+        // way `cache_db::cache_write_denial` does, and assert the actionable
+        // message only where the mode bits actually deny this process. CI runs
+        // as the non-root `runner` user, which they do constrain.
+        if tempfile::NamedTempFile::new_in(&workspace_root).is_ok() {
+            std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            eprintln!(
+                "skipping unwritable_workspace_root_reports_the_ways_out: this process \
+                 bypasses the injected 0o555 write denial (issue #5090)"
+            );
+            return;
+        }
+
         let opened = AnalyzerStore::open_for_workspace(&workspace_root);
         let error = match opened {
             Ok(_) => panic!("an unwritable workspace root must not open a persisted store"),
@@ -21842,7 +21927,7 @@ fn main() {}
 
     /// Cost pin for #2883. `temp.selected_workspace_revisions` and the views
     /// over it belong to one connection, so a checkout that asks for the
-    /// selection that connection already holds must run nothing: no view
+    /// selection that connection already holds must only check freshness: no view
     /// script, no selection rewrite. A different selection is a real change and
     /// is written once.
     #[brokk_bifrost_test_macros::hardwon(
@@ -21877,7 +21962,7 @@ fn main() {}
         assert_eq!(
             store.workspace_selection_counts_for_test(),
             (1, 1),
-            "the same selection on the connection that already holds it must run no statement"
+            "the same selection and freshness must reuse the existing temporary rows"
         );
 
         drop(store.read_conn_for_workspace(&selection(2)).unwrap());
@@ -21905,7 +21990,7 @@ fn main() {}
         drop(reader);
 
         let mut reader = store.read_conn_for_workspace(&selection(2)).unwrap();
-        reader.cleanup_before_checkin("DELETE FROM temp.selected_workspace_revisions");
+        reader.cleanup_before_checkin("DELETE FROM temp.selected_rust_unit_closure; DELETE FROM temp.selected_rust_unit_summaries; DELETE FROM temp.selected_workspace_revisions;");
         drop(reader);
         let reader = store.read_conn_for_workspace(&selection(2)).unwrap();
         assert_eq!(
@@ -24982,8 +25067,7 @@ fn main() {}
         assert_prior_parsed_blob_invalidated(&TypescriptAdapter, state.as_ref(), &prior_epoch);
     }
 
-    #[test]
-    fn tsx_ampersand_repair_invalidates_prior_dialect_blobs() {
+    fn assert_ts_tsx_bump_invalidates_prior_dialect_blobs(bump_token: &str) {
         fn check<A: LanguageAdapter>(adapter: &A, prior_epoch: &str, file: &ProjectFile) {
             let state = parse_state(adapter, file);
             let oid = oid_for(state.source.as_bytes());
@@ -25019,18 +25103,17 @@ fn main() {}
             }
         }
 
-        let temp = tempfile::TempDir::new().unwrap();
-        for (extension, language) in [
-            ("js", epoch::TestEpochLanguage::JavaScript),
-            ("ts", epoch::TestEpochLanguage::TypeScript),
+        let fixture = crate::inline_project::InlineTestProject::new()
+            .file("view.js", "export const view = 1;")
+            .file("view.ts", "export const view = 1;")
+            .build();
+        for (path, language) in [
+            ("view.js", epoch::TestEpochLanguage::JavaScript),
+            ("view.ts", epoch::TestEpochLanguage::TypeScript),
         ] {
-            let file = write_file(
-                temp.path(),
-                &format!("view.{extension}"),
-                "export const view = 1;",
-            );
-            let prior = epoch::epoch_before_bump(language, "tsx-literal-ampersands-0.23.5");
-            if extension == "js" {
+            let file = fixture.file(path);
+            let prior = epoch::epoch_before_bump(language, bump_token);
+            if path.ends_with(".js") {
                 check(
                     &crate::analyzer::javascript::JavascriptAdapter,
                     &prior,
@@ -25040,6 +25123,19 @@ fn main() {}
                 check(&TypescriptAdapter, &prior, &file);
             }
         }
+    }
+
+    #[test]
+    fn tsx_ampersand_repair_invalidates_prior_dialect_blobs() {
+        assert_ts_tsx_bump_invalidates_prior_dialect_blobs("tsx-literal-ampersands-0.23.5");
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4479: raw NUL grammar repairs must invalidate cached JS/TSX parser blobs"
+    )]
+    #[test]
+    fn ts_tsx_raw_nul_content_invalidates_prior_dialect_blobs() {
+        assert_ts_tsx_bump_invalidates_prior_dialect_blobs("ts-tsx-raw-nul-content-0.23.6-4479");
     }
 
     /// #3451: Python now records callable modifier metadata, and it recorded

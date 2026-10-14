@@ -774,6 +774,8 @@ pub struct ResolutionCallableParameterFact {
 pub struct ResolutionCallableParameterListFact {
     pub callable: ResolutionSiteId,
     pub list_ordinal: u32,
+    /// Whether this list is supplied contextually unless source provides it.
+    pub contextual: bool,
 }
 
 /// A source parameter's label and default availability. These semantics are
@@ -1024,6 +1026,9 @@ labelled_enum! {
         /// declares (JLS 4.3.2: methods only) can seal member-type and field
         /// walks across this edge even while the route is unindexed.
         ImplicitSuperclass => "implicit_superclass",
+        /// A Scala self-type constraint used for member inheritance inside its
+        /// owning template, but not as a nominal subtype relation.
+        SelfType => "self_type",
     }
 }
 
@@ -1651,6 +1656,20 @@ pub fn source_owned_package_references(
 }
 
 impl FileResolutionFacts {
+    /// Record one positional type parameter owned by a generic declaration.
+    pub fn add_generic_formal(
+        &mut self,
+        owner: ResolutionSiteId,
+        ordinal: u32,
+        parameter: ResolutionSiteId,
+    ) {
+        self.generic_formals.push(ResolutionGenericFormalFact {
+            owner,
+            ordinal,
+            parameter,
+        });
+    }
+
     /// Append one site and assign its dense file-local ID.
     pub fn add_site(
         &mut self,
@@ -2245,6 +2264,7 @@ mod tests {
             .push(ResolutionCallableParameterListFact {
                 callable: declaration,
                 list_ordinal: 0,
+                contextual: false,
             });
         facts
             .extension_receivers

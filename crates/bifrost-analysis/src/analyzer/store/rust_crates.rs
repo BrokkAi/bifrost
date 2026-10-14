@@ -38,7 +38,7 @@ pub(super) const MODULE_WALK_SQL: &str = include_str!("rust_crate_module_walk.sq
 pub(super) const ITEM_MACRO_DECISIONS_SQL: &str =
     include_str!("rust_crate_item_macro_decisions.sql");
 
-pub(super) const DELETE_UNBOUND_TOPOLOGIES_SQL: &str = SQL_RUST_CRATE_TOPOLOGIES_1;
+pub(super) use brokk_bifrost_core::cache_gc::DELETE_UNBOUND_TOPOLOGIES_SQL;
 
 #[path = "rust_crate_derivation.rs"]
 mod derivation;
@@ -127,6 +127,11 @@ struct DerivedCrate {
 /// `from_revision` is the head revision the crate rows were current for
 /// before the change; the pass advances the reconciliation marker only from
 /// there.
+///
+/// A reached crate that no Cargo target places is a detached crate, and only
+/// the detached pass derives those. The scoped pass carries every crate it did
+/// not reach forward, so it re-derives a reached detached crate from the file
+/// the change named instead of dropping the summary the crate already had.
 enum CrateReconcileScope {
     Everything,
     Reached {
@@ -628,8 +633,8 @@ impl AnalyzerStore {
         // key. Seeding them here is what lets the version-closing pass below
         // stay exactly as the from-scratch pass leaves it, and what lets a
         // derived crate fold an undisturbed dependency's surface.
-        let (previous, mut reached, mut unreached, from_revision) = match scope {
-            CrateReconcileScope::Everything => (HashMap::new(), None, Vec::new(), None),
+        let (previous, mut reached, mut unreached, from_revision, reached_detached) = match scope {
+            CrateReconcileScope::Everything => (HashMap::new(), None, Vec::new(), None, None),
             CrateReconcileScope::Reached {
                 crates: mut keys,
                 from_revision,
@@ -642,8 +647,20 @@ impl AnalyzerStore {
                     keys.extend(cycles[cycle].iter().copied());
                 }
                 let previous = self.live_rust_crate_topologies(&snapshots, snapshot)?;
+                // A reached crate the Cargo targets do not prepare is one no
+                // Cargo target places: a detached crate. It is not derived by
+                // the wave loop below, so its file is handed to the detached
+                // pass. Carrying it forward instead would keep the topology the
+                // change invalidated, and closing its version row would drop
+                // the file from every summary reader.
+                let prepared: HashSet<CrateKey> = crates.iter().map(|item| item.key).collect();
+                let mut detached = Vec::new();
                 for (key, derived) in &previous {
-                    if !keys.contains(key) {
+                    if keys.contains(key) {
+                        if !prepared.contains(key) {
+                            detached.push(derived.topology_id);
+                        }
+                    } else {
                         complete.insert(*key, *derived);
                     }
                 }
@@ -651,7 +668,13 @@ impl AnalyzerStore {
                     .into_iter()
                     .partition(|item| keys.contains(&item.key));
                 crates = wanted;
-                (previous, Some(keys), rest, Some(from_revision))
+                (
+                    previous,
+                    Some(keys),
+                    rest,
+                    Some(from_revision),
+                    Some(detached),
+                )
             }
         };
         while !crates.is_empty() {
@@ -769,36 +792,65 @@ impl AnalyzerStore {
         }
         drop(waves_timing);
         let detached_timing = crate::profiling::scope("rust_crates.reconcile.detached");
-        // A detached crate is one file no Cargo target placed. A scoped pass
-        // only runs when the crate rows placed every changed path, so no file
-        // can have joined or left the detached set and the seeded rows above
-        // already carry it. The from-scratch pass recomputes it.
-        let detached_paths = if reached.is_some() {
-            Vec::new()
-        } else {
-            let conn = self.read_conn_for_workspace(&snapshots)?;
-            #[cfg(test)]
-            let _trace =
-                StatementTrace::new(&conn, self.crate_statement_counter.lock().unwrap().clone());
-            let mut reached = HashSet::new();
-            for item in complete.values() {
-                let mut statement = conn.prepare(SQL_RUST_CRATE_MODULES_5)?;
-                for path in
-                    statement.query_map([item.topology_id], |row| row.get::<_, String>(0))?
-                {
-                    reached.insert(path?);
+        // A detached crate is one file no Cargo target placed. The from-scratch
+        // pass recomputes the whole detached set. A scoped pass carries every
+        // crate it did not reach forward, so the only detached crates it can
+        // have lost are the reached ones its Cargo targets did not prepare;
+        // those are re-derived from the files their topology placed, minus any
+        // path a prepared crate of this same pass already covers.
+        let detached_paths: Vec<String> = match reached_detached {
+            None => {
+                let conn = self.read_conn_for_workspace(&snapshots)?;
+                #[cfg(test)]
+                let _trace = StatementTrace::new(
+                    &conn,
+                    self.crate_statement_counter.lock().unwrap().clone(),
+                );
+                let mut reached = HashSet::new();
+                for item in complete.values() {
+                    let mut statement = conn.prepare(SQL_RUST_CRATE_MODULES_5)?;
+                    for path in
+                        statement.query_map([item.topology_id], |row| row.get::<_, String>(0))?
+                    {
+                        reached.insert(path?);
+                    }
                 }
+                paths
+                    .into_iter()
+                    .filter(|(path, _)| !reached.contains(path))
+                    .map(|(path, _)| path)
+                    .collect()
             }
-            paths
-                .into_iter()
-                .filter(|(path, _)| !reached.contains(path))
-                .collect::<Vec<_>>()
+            Some(topology_ids) if topology_ids.is_empty() => Vec::new(),
+            Some(topology_ids) => {
+                let conn = self.read_conn_for_workspace(&snapshots)?;
+                let mut placed = HashSet::new();
+                for item in complete.values() {
+                    let mut statement = conn.prepare(SQL_RUST_CRATE_MODULES_5)?;
+                    for path in
+                        statement.query_map([item.topology_id], |row| row.get::<_, String>(0))?
+                    {
+                        placed.insert(path?);
+                    }
+                }
+                let mut candidates = Vec::new();
+                for topology_id in topology_ids {
+                    let mut statement = conn.prepare(SQL_RUST_CRATE_MODULES_5)?;
+                    for path in statement.query_map([topology_id], |row| row.get::<_, String>(0))? {
+                        candidates.push(path?);
+                    }
+                }
+                candidates.sort();
+                candidates.dedup();
+                candidates.retain(|path| !placed.contains(path));
+                candidates
+            }
         };
         // Detached crates have no workspace dependencies. Previously derived
         // topologies cannot be referenced here and must not be rescanned for
         // every detached file.
         let detached_dependencies = HashMap::new();
-        for (path, _) in detached_paths {
+        for path in detached_paths {
             let root_path = PathBuf::from(&path);
             // No Cargo workspace owns the file, so the configuration of a
             // build started beside it applies.
@@ -835,7 +887,7 @@ impl AnalyzerStore {
         let keys: HashSet<Vec<u8>> = complete.keys().map(|key| key.to_vec()).collect();
         #[cfg(test)]
         let counter = self.crate_statement_counter.lock().unwrap().clone();
-        self.conn.execute(move |conn| -> Result<()> {
+        self.execute_selection_publication(move |conn| -> Result<()> {
             let tx = conn.transaction()?;
             #[cfg(test)]
             let trace = StatementTrace::new(&tx, counter);
@@ -1216,7 +1268,7 @@ impl AnalyzerStore {
         let epoch = epoch.to_string();
         #[cfg(test)]
         let counter = self.crate_statement_counter.lock().unwrap().clone();
-        self.conn.execute(move |conn| -> Result<DerivedCrate> {
+        self.execute_selection_publication(move |conn| -> Result<DerivedCrate> {
             let _timing = crate::profiling::scope_with(|| {
                 format!(
                     "rust_crates.publication name={} kind={}",
@@ -1586,17 +1638,6 @@ impl Drop for StatementTrace<'_> {
     }
 }
 
-// A topology is bound by a crate version row or by a Rust summary version row
-// (`rust_resolution_unit_summary_versions.topology_id` has no cascade), so the
-// sweep must spare both. Callers withdraw the summary versions first, so a
-// topology released by the same workspace or epoch is collected in that pass.
-pub(super) const SQL_RUST_CRATE_TOPOLOGIES_1: &str =
-    "DELETE FROM rust_crate_topologies WHERE NOT EXISTS (
-         SELECT 1 FROM rust_crate_versions AS versions
-         WHERE versions.topology_id = rust_crate_topologies.topology_id)
-       AND NOT EXISTS (
-         SELECT 1 FROM rust_resolution_unit_summary_versions AS summary_versions
-         WHERE summary_versions.topology_id = rust_crate_topologies.topology_id)";
 pub(super) const SQL_WORKSPACE_FILE_VERSIONS_2: &str = "SELECT versions.file_version_id, versions.rel_path, versions.blob_oid, sources.source_bytes
                  FROM workspace_file_versions AS versions
                  LEFT JOIN workspace_input_sources AS sources ON sources.content_oid = versions.blob_oid
@@ -1711,7 +1752,7 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
         ("rust_crate_insert_naming", INSERT_NAMING_SQL, 4),
         (
             "rust_crate_reconcile_sql_rust_crate_topologies_1",
-            SQL_RUST_CRATE_TOPOLOGIES_1,
+            DELETE_UNBOUND_TOPOLOGIES_SQL,
             0,
         ),
         (
@@ -2418,6 +2459,25 @@ mod tests {
                 "{path}: with a cycle, the from-scratch pass must find nothing the scoped pass missed"
             );
         }
+
+        // The same oracle for a detached file. No Cargo target places it, so
+        // only the from-scratch pass derives its crate; a scoped pass that
+        // removed the reached crate from the set it carries forward would
+        // close its live version row, and every summary reader would lose the
+        // file until the next full pass.
+        let detached = fixture.file("detached.rs");
+        detached
+            .write("pub fn detached() { let body = 1; let _ = body; }")
+            .unwrap();
+        analyzer = analyzer.update(&BTreeSet::from([detached]));
+        let store = analyzer.store().unwrap();
+        let scoped = current_crate_digests(&store.read_conn().unwrap());
+        store.reconcile_rust_crates(&head(store.as_ref())).unwrap();
+        assert_eq!(
+            current_crate_digests(&store.read_conn().unwrap()),
+            scoped,
+            "detached.rs: the from-scratch pass must find nothing the scoped pass missed"
+        );
 
         // A manifest can move crate membership, so it is never scoped, and
         // neither is a path no crate places, which is what a new file looks
@@ -3353,6 +3413,7 @@ mod tests {
         conn.execute("DELETE FROM selected_workspace_revisions", [])
             .unwrap();
         conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id, lang, generation, revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
         prepare_pin_context(&conn).unwrap();
         let (id, key, cfg): (i64, Vec<u8>, String) = conn.query_row("SELECT topology_id, crate_key, json(cfg_atoms) FROM rust_crate_topologies WHERE crate_name='app' AND target_kind='lib'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
         let members = conn.prepare("SELECT container_path, blob_id, scope_ordinal, rel_path, placement, parent_container_path FROM rust_crate_containers JOIN rust_crate_container_sources USING(topology_id, container_path) WHERE topology_id=?1").unwrap().query_map([id], |row| Ok(Member { module_path:row.get(0)?, blob_id:row.get(1)?, scope:row.get(2)?, rel_path:row.get(3)?, placement:row.get(4)?, parent_path:row.get(5)? })).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
@@ -3987,6 +4048,132 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#4994: a projection drop pruned content-addressed summaries the next build re-derived"
+    )]
+    fn projection_drop_retains_summaries_for_rebinding_until_gc() {
+        use crate::analyzer::WorkspaceAnalyzer;
+
+        let project = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname=\"retained\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub struct Export;\npub fn make() -> Export { Export }\n",
+            )
+            .with_git()
+            .build();
+        let build = || {
+            WorkspaceAnalyzer::build_scoped_persisted(
+                project.project_dyn(),
+                AnalyzerConfig::default(),
+            )
+            .unwrap()
+        };
+        let first = build();
+        let db_path = first.persisted_store_path().unwrap();
+        let summaries = |store: &AnalyzerStore| -> Vec<(i64, Vec<u8>)> {
+            store.read_conn().unwrap()
+                .prepare("SELECT summary_id, summary_digest FROM resolution_unit_summaries ORDER BY summary_id")
+                .unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        let original = summaries(first.store().unwrap().as_ref());
+        assert!(!original.is_empty());
+        drop(first); // The scoped workspace's final owner drops its projection lease.
+        let store = AnalyzerStore::open_persistent(&db_path).unwrap();
+        assert_eq!(summaries(&store), original);
+        assert_eq!(
+            store
+                .read_conn()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM resolution_unit_summary_versions",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .read_conn()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM selected_rust_unit_summaries",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "retained unbound headers are invisible to readers"
+        );
+
+        let second = build();
+        assert_eq!(
+            summaries(second.store().unwrap().as_ref()),
+            original,
+            "identical inputs must bind the retained headers without inserting new ones"
+        );
+        let conn = second.store().unwrap().read_conn().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_unit_summary_versions",
+                [],
+                |row| row.get::<_, usize>(0)
+            )
+            .unwrap(),
+            original.len()
+        );
+        drop(conn);
+        store.reclaim_stale_generations(1).unwrap();
+        assert_eq!(summaries(&store), original, "GC preserves bound summaries");
+        drop(second);
+        store.reclaim_stale_generations(1).unwrap();
+        assert!(
+            summaries(&store).is_empty(),
+            "GC sweeps orphans without stale generations"
+        );
+        assert_eq!(
+            store
+                .read_conn()
+                .unwrap()
+                .query_row("SELECT count(*) FROM rust_crate_topologies", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        // A completed scheduled collection must sweep the same orphans too;
+        // before #4994 only forced collection called stale-generation reclaim.
+        let third = build();
+        drop(third);
+        assert!(!summaries(&store).is_empty());
+        let _tuning = crate::cache_gc::set_tuning_for_test(0, 0);
+        let repository = git2::Repository::open(project.root()).unwrap();
+        let outcome =
+            crate::cache_gc::maybe_gc_for_analyzer(&store, &repository, project.root()).unwrap();
+        assert!(outcome.ran, "the periodic collection must run: {outcome:?}");
+        assert!(
+            summaries(&store).is_empty(),
+            "periodic GC must sweep retained summaries"
+        );
+        assert_eq!(
+            store
+                .read_conn()
+                .unwrap()
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn crate_rows_release_foreign_keys_on_workspace_retirement_and_epoch_rotation() {
         let project = fixture();
         let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
@@ -4003,6 +4190,19 @@ mod tests {
             super::super::WorkspaceId(id)
         };
         assert!(store.delete_workspace_projection(&workspace).unwrap() > 0);
+        assert!(
+            store
+                .read_conn()
+                .unwrap()
+                .query_row("SELECT count(*) FROM rust_crate_topologies", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap()
+                > 0,
+            "projection retirement retains reusable topologies until GC"
+        );
+        store.reclaim_stale_generations(1).unwrap();
         let conn = store.read_conn().unwrap();
         assert_eq!(
             conn.query_row("SELECT count(*) FROM rust_crate_topologies", [], |row| row
@@ -4064,6 +4264,7 @@ mod tests {
         let store = analyzer.store().unwrap();
         let conn = store.read_conn().unwrap();
         conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
         let id: i64 = conn
             .query_row(
                 "SELECT topology_id FROM rust_crate_topologies WHERE crate_name='app'",
@@ -4329,6 +4530,7 @@ mod outer {
             let store = analyzer.store().unwrap();
             let conn = store.read_conn().unwrap();
             conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+            crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
             let topology: i64 = conn
                 .query_row(
                     "SELECT topology_id FROM selected_rust_crates WHERE crate_name='inventory'",
@@ -4467,6 +4669,7 @@ mod outer {
             let store = analyzer.store().unwrap();
             let conn = store.read_conn().unwrap();
             conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+            crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
             let facade: i64 = conn
                 .query_row(
                     "SELECT topology_id FROM selected_rust_crates WHERE crate_name='facade'",
@@ -6030,6 +6233,7 @@ pub mod second;
         conn.execute("DELETE FROM selected_workspace_revisions", [])
             .unwrap();
         conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id, lang, generation, revision FROM workspace_heads WHERE lang = 'rust'", []).unwrap();
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
         for state in PlannerStatisticsState::BOTH {
             state.install(&conn);
             let plan = explain_pin(&conn, &pinned("rust_crate_module_walk"));

@@ -5,6 +5,7 @@
 //! and the eventual SQL source present the same normalized fragment contract.
 
 mod batch;
+mod canonical_identity;
 mod common_fact_lowering;
 mod completion_reasons;
 mod demand_overlay;
@@ -25,6 +26,7 @@ mod selected_context;
 pub(crate) mod test_support;
 mod typed_fact_lowering;
 mod universe;
+pub(crate) mod worker_transport;
 pub use universe::UniverseEntry;
 pub(crate) use universe::{has_table as universe_has_table, lookup as universe_lookup};
 
@@ -193,6 +195,14 @@ pub(super) fn charge_summary_step(
     )
 }
 
+pub(super) fn charge_round_step(
+    session: Option<&brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession>,
+) -> bool {
+    session.is_none_or(
+        brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::round_step,
+    )
+}
+
 pub(super) fn required_resolution_name<'a>(
     names: &HashMap<brokk_bifrost_core::analyzer::resolution_facts::ResolutionNameId, &'a str>,
     id: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNameId,
@@ -355,13 +365,19 @@ pub use batch::{
     ReferenceBatchAnswer, ReferenceLocalPathEvidence, ReferenceSeed, ReferenceSeedBatch,
     ReferenceSeedReadOutcome, ReferenceSeedReadTerminal, ResolutionBatchMetrics,
     ResolutionBatchSummary, ReverseCandidateGapExclusionPlan, ReverseCandidateGapIdentity,
-    ReverseReferenceSeedRequest, SeedReadAuthority, SeededPartialPath, SeededReferenceRequest,
+    ReverseReferenceSeedRequest, SeedReadAuthority, SeededPartialPath, SeededPathKey,
+    SeededReferenceRequest,
 };
 pub(crate) use batch::{
     ForwardCandidateArtifactCache, MAX_REVERSE_TARGETS_PER_BATCH, MAX_SOURCE_ROWS_PER_BATCH,
     ReverseCandidateGapCoverage, ReverseCandidateGapCoverageBuilder,
     ReverseCandidateGapCoverageView, ReverseCandidateGapLocation, ReverseCandidateGapRow,
     SelectedContextPathFragmentSource,
+};
+pub use canonical_identity::ResolutionIdentityDigestKey;
+pub(crate) use canonical_identity::{
+    CanonicalIdentityDescriptor, CanonicalIdentityHasher, CanonicalIdentityNumbers,
+    CanonicalIdentityPart, mounted_identity_digest, selected_identity_content_digest,
 };
 pub use common_fact_lowering::LoweredDeferredMemberOwner;
 pub(crate) use common_fact_lowering::{
@@ -376,7 +392,9 @@ pub use engine::{
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use fact_lowering::fixture_names::{
     FixtureRootImportAnchors, record as record_fixture_identity_catalog,
+    record_selected as record_fixture_selected_identity_catalog,
 };
+pub(crate) use fact_lowering::gap_reason_semantic_identity;
 pub(crate) use fact_lowering::package::{
     LoweredGoPackageImport, LoweredPackageMember, LoweredPackageReference, package_domain_semantic,
 };
@@ -420,13 +438,14 @@ pub use fact_reference_edges::{
 pub use fact_resolution::PreloadedFactResolutionService;
 pub(crate) use fact_resolution::call_applicability::{
     ArgumentFormalBinding, CallApplicabilityAdapter, CandidateAssessment, ConversionEvidence,
-    ConversionKind, MappingAssessment, PartialOrder, TypeInCallPosition, map_call_shape,
-    map_scala_call_shape,
+    ConversionKind, IntrinsicCallType, MappingAssessment, PartialOrder, TypeInCallPosition,
+    map_call_shape, map_scala_call_shape,
 };
 pub(crate) use fact_resolution::{
-    AnswerMap, CallCandidateApplicability, DemandAcyclicOutcome, DemandClosureDischarges,
-    DemandRootDiscovery, DemandRootPlan, DemandRootProvider, DemandRootUnavailableReason,
-    FactDemandResolution, FactEvaluation, InternedFactRow, StateMap,
+    AnswerMap, CallCandidateApplicability, CallTypeSubstitution, DemandAcyclicOutcome,
+    DemandClosureDischarges, DemandRootDiscovery, DemandRootPlan, DemandRootProvider,
+    DemandRootUnavailableReason, FactDemandResolution, FactEvaluation, InternedFactRow,
+    SelectedDemandState, StateMap,
 };
 pub use fact_resolution::{
     FactBatchedReferenceAnswer, FactCallableCandidateApplicability, FactCallableReceiverChannels,
@@ -473,7 +492,6 @@ pub use fact_source::{
     SelectedTypedFactSource, SelectedTypedRow, SelectedTypedRowIdentity, SelectedTypedRowKey,
     TypedFactPageVisitor, TypedFactReadOutcome, TypedFactReadTerminal, TypedFactRequest,
 };
-pub(crate) use local_identity::ResolutionRegisteredIdentities;
 pub(crate) use local_identity::SUPPLEMENTAL_LOCAL_KEY_BASE;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use local_identity::test_shared_names;
@@ -488,6 +506,7 @@ pub(crate) use local_identity::{
     SelectedStageIdentityProvenance, selected_resolution_fragment_id,
 };
 pub use local_identity::{PerRequestSharedNames, SharedNameInterner};
+pub(crate) use local_identity::{ResolutionIdentityTranslation, ResolutionRegisteredIdentities};
 pub use model::{
     BindingCandidateAdmission, BindingFragmentId, BindingNodeId, BindingNodeKind, CompletionReason,
     DerivationKey, EndpointSignature, GoDefinitionNamespaces, PartialPath, PartialPathId,
@@ -497,6 +516,7 @@ pub use model::{
     SymbolStackPattern, TypeTransferRule, TypeTransferValueTransform, TypedFrontierState,
     WitnessStep,
 };
+pub(crate) use model::{BindingOrigin, UnindexedExternalFrontier, binding_origin_rank};
 pub(crate) use model::{ResolutionCompletionAccumulator, combine_completion_with_poll};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use mounted::OperationBlind;

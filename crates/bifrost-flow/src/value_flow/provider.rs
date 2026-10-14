@@ -376,14 +376,19 @@ impl BindingsKey {
 
 /// Conservative structural byte weight of one retained snapshot verdict. The
 /// shared provenance arena is `Arc`-shared across relations, so this counts the
-/// owned relation rows without double counting the arena.
+/// owned relation rows and the entire retained arena once, including records
+/// whose projected rows were filtered out.
 fn weigh_snapshot(_key: &SnapshotKey, outcome: &Arc<MemoizedSnapshot>) -> u32 {
     let relations = outcome
         .available_value()
         .map_or(0, |snapshot| snapshot.relations().len())
         .saturating_mul(size_of::<ValueFlowRelation>());
+    let arena = outcome
+        .available_value()
+        .map_or(0, ValueFlowSnapshot::retained_arena_bytes);
     size_of::<MemoizedSnapshot>()
         .saturating_add(relations)
+        .saturating_add(arena)
         .min(u32::MAX as usize) as u32
 }
 

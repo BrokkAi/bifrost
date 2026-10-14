@@ -3045,7 +3045,7 @@ fn python_enclosing_body_callable_bounded<'tree>(
 pub(super) fn resolve_python(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
-    context: &mut DefinitionBatchContext<'_>,
+    context: &mut DefinitionBatchContext<'_, '_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,

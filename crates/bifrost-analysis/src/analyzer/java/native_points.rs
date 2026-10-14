@@ -6,20 +6,23 @@ use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::jvm::external::{JvmExternalDeclarationSource, JvmExternalMember};
 use crate::analyzer::languages::BoundedReceiverQuery;
 use crate::analyzer::native_points::{
-    NativePointContext, resolve_native_definition_bounded, resolve_native_type_bounded,
+    NativeExpressionValueTypeLookup, NativePointContext, resolve_native_definition_bounded,
+    resolve_native_expression_value_type_bounded, resolve_native_type_bounded,
     unavailable_definition, unavailable_type,
 };
 use crate::analyzer::resolve_analyzer;
 use crate::analyzer::semantic_model::{SemanticModelCallableKey, SemanticModelSymbolKind, TypeRef};
 use crate::analyzer::store::resolution_operation::{
-    JavaExternalStaticImportBoundary, JavaImportContext,
+    JavaExternalStaticImportBoundary, JavaImportContext, NativeExternalMemberTarget,
 };
 use crate::analyzer::usages::call_conversion::{CallArgumentConversionProver, ConversionUnknown};
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, CallEvidence, ClaimSubjectRole, DefinitionLookupDiagnostic,
-    DefinitionLookupOutcome, DefinitionLookupStatus, ExactExternalCallProof, UnindexedClaim,
+    DefinitionLookupOutcome, DefinitionLookupStatus, ExactExternalCallProof, ResolvedReferenceSite,
+    UnindexedClaim,
 };
 use crate::analyzer::usages::get_type::TypeLookupOutcome;
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
     AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup, Language, QueryScope,
 };
@@ -482,20 +485,27 @@ fn java_native_call_evidence(
             else {
                 return evidence;
             };
-            let external_call = if let Some(receiver) = receiver {
-                java_native_external_receiver(java, query, token, receiver).and_then(
-                    |(owner, form)| {
+            let receiver_type = receiver.map(|receiver| {
+                java_native_external_receiver(java, query, token, receiver, invocation)
+            });
+            let external_call = if receiver.is_some() {
+                match receiver_type.as_ref() {
+                    Some(JavaNativeReceiverResolution::External { owner, form }) => {
                         java_native_external_method_proof(
                             java,
                             query,
                             token,
-                            &owner,
+                            owner,
                             member_name,
                             &actual_types,
-                            form,
+                            *form,
                         )
-                    },
-                )
+                    }
+                    Some(
+                        JavaNativeReceiverResolution::Typed | JavaNativeReceiverResolution::Untyped,
+                    )
+                    | None => None,
+                }
             } else {
                 let mut matching = external_static_imports
                     .iter()
@@ -566,12 +576,11 @@ fn java_native_call_evidence(
                 } else {
                     publish_java_external_member_identity(query, outcome, &owner, &member);
                 }
-            } else if let Some(receiver) = receiver.filter(|receiver| {
-                receiver.kind() == "method_invocation"
-                    && outcome.status == DefinitionLookupStatus::Incomplete
-                    && outcome.definitions.is_empty()
-                    && outcome.lexical_definition.is_none()
-            }) && java_chained_receiver_has_no_declaration(java, query, token, receiver)
+            } else if receiver.is_some()
+                && matches!(receiver_type, Some(JavaNativeReceiverResolution::Untyped))
+                && outcome.status == DefinitionLookupStatus::Incomplete
+                && outcome.definitions.is_empty()
+                && outcome.lexical_definition.is_none()
             {
                 publish_java_unmodeled_receiver_boundary(query, outcome, member_name);
             }
@@ -579,42 +588,6 @@ fn java_native_call_evidence(
         JavaNativeCallSite::Constructor { .. } => {}
     }
     evidence
-}
-
-fn java_chained_receiver_has_no_declaration(
-    java: &JavaAnalyzer,
-    query: BoundedReceiverQuery<'_>,
-    token: crate::analyzer::QueryToken<'_>,
-    receiver: Node<'_>,
-) -> bool {
-    use crate::analyzer::usages::get_definition::java::{
-        JavaResolutionSession, JavaSourceInvocationReturn, java_external_invocation_return_type,
-        java_source_invocation_return_declaration,
-    };
-    use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
-
-    let cancellation = query.analyzer.active_query_cancellation();
-    let definitions = AnalyzerDefinitionLookup::new(query.analyzer, Language::Java);
-    let session = JavaResolutionSession::bounded(
-        &definitions,
-        ReceiverAnalysisBudget::default(),
-        cancellation.as_ref(),
-    );
-    if !matches!(
-        java_source_invocation_return_declaration(
-            query.analyzer,
-            token,
-            &session,
-            query.file,
-            query.source,
-            receiver,
-        ),
-        JavaSourceInvocationReturn::NoSourceDeclaration
-    ) {
-        return false;
-    }
-    java_external_invocation_return_type(java, token, &session, query.file, query.source, receiver)
-        .is_none()
 }
 
 fn publish_java_unmodeled_receiver_boundary(
@@ -755,13 +728,40 @@ fn java_native_external_receiver(
     query: BoundedReceiverQuery<'_>,
     token: crate::analyzer::QueryToken<'_>,
     receiver: Node<'_>,
-) -> Option<(String, JavaNativeReceiverForm)> {
-    if matches!(receiver.kind(), "this" | "super") {
+    enclosing_call: Node<'_>,
+) -> JavaNativeReceiverResolution {
+    let from_site_type =
+        java_native_external_receiver_from_site_type(java, query, token, receiver, enclosing_call);
+    if !matches!(from_site_type, JavaNativeReceiverResolution::Untyped) {
+        return from_site_type;
+    }
+    // Keep these routes for the uncovered local call-result initializer,
+    // java.lang type-qualifier, and fully qualified path shapes tracked in
+    // `.agents/plans/j6-unindexed-jvm-imports.md`.
+    if let Some(receiver) =
+        java_native_external_receiver_from_identifier(java, query, token, receiver)
+    {
+        return receiver;
+    }
+    if let Some(receiver) =
+        java_native_external_receiver_from_type_qualifier(java, query, token, receiver)
+    {
+        return receiver;
+    }
+    JavaNativeReceiverResolution::Untyped
+}
+
+fn java_native_external_receiver_from_identifier(
+    java: &JavaAnalyzer,
+    query: BoundedReceiverQuery<'_>,
+    token: crate::analyzer::QueryToken<'_>,
+    receiver: Node<'_>,
+) -> Option<JavaNativeReceiverResolution> {
+    if receiver.kind() != "identifier" {
         return None;
     }
-    if receiver.kind() == "identifier"
-        && let Some(name) = node_text_for_query(receiver, query.source)
-        && let Some(declaration) = find_nearest_declaration_from_node(receiver, name, query.source)
+    let name = node_text_for_query(receiver, query.source)?;
+    if let Some(declaration) = find_nearest_declaration_from_node(receiver, name, query.source)
         && matches!(
             declaration.kind,
             DeclarationKind::Parameter
@@ -787,14 +787,149 @@ fn java_native_external_receiver(
         let type_node = super::declared_type_node(type_declaration)?;
         let type_name = java_type_name_from_node(type_node, query.source)?;
         let owner = java_native_external_type(java, query, token, &type_name)?;
-        return Some((owner.fqn().to_owned(), JavaNativeReceiverForm::BoundValue));
+        return Some(JavaNativeReceiverResolution::External {
+            owner: owner.fqn().to_owned(),
+            form: JavaNativeReceiverForm::BoundValue,
+        });
+    }
+    let owner = java_native_external_type(java, query, token, name)?;
+    Some(JavaNativeReceiverResolution::External {
+        owner: owner.fqn().to_owned(),
+        form: JavaNativeReceiverForm::TypeQualifier,
+    })
+}
+
+fn java_native_external_receiver_from_type_qualifier(
+    java: &JavaAnalyzer,
+    query: BoundedReceiverQuery<'_>,
+    token: crate::analyzer::QueryToken<'_>,
+    receiver: Node<'_>,
+) -> Option<JavaNativeReceiverResolution> {
+    if matches!(
+        receiver.kind(),
+        "method_invocation" | "object_creation_expression" | "this" | "super"
+    ) {
+        return None;
     }
     let spelling = node_text_for_query(receiver, query.source)?;
     let owner = java_native_external_type(java, query, token, spelling)?;
-    Some((
-        owner.fqn().to_owned(),
-        JavaNativeReceiverForm::TypeQualifier,
-    ))
+    Some(JavaNativeReceiverResolution::External {
+        owner: owner.fqn().to_owned(),
+        form: JavaNativeReceiverForm::TypeQualifier,
+    })
+}
+
+fn java_native_external_receiver_from_site_type(
+    java: &JavaAnalyzer,
+    query: BoundedReceiverQuery<'_>,
+    token: crate::analyzer::QueryToken<'_>,
+    receiver: Node<'_>,
+    enclosing_call: Node<'_>,
+) -> JavaNativeReceiverResolution {
+    if matches!(receiver.kind(), "this" | "super") {
+        return JavaNativeReceiverResolution::Typed;
+    }
+    let Some(site_node) = java_native_receiver_type_site_node(receiver) else {
+        return JavaNativeReceiverResolution::Untyped;
+    };
+    let Some(value) = java_native_expression_value_type_at_node(query, site_node) else {
+        return JavaNativeReceiverResolution::Untyped;
+    };
+    let receiver_target_kind = value.value_types.target_kind.clone();
+    let call_target = java_native_receiver_type_site_node(enclosing_call)
+        .and_then(|site| java_native_expression_value_type_at_node(query, site))
+        .and_then(|lookup| lookup.direct_target);
+    let value = value.value_types;
+    if let Some(NativeExternalMemberTarget::Indexed(target)) = call_target.as_ref()
+        && (receiver_target_kind == TypeLookupTargetKind::TypeReference
+            || (value.types.is_empty() && matches!(receiver.kind(), "identifier" | "field_access")))
+    {
+        return JavaNativeReceiverResolution::External {
+            owner: target.owner.owner_fqn.to_string(),
+            form: JavaNativeReceiverForm::TypeQualifier,
+        };
+    }
+    if !matches!(
+        value.status,
+        crate::analyzer::usages::get_type::TypeLookupStatus::Resolved
+            | crate::analyzer::usages::get_type::TypeLookupStatus::Incomplete
+    ) || value.types.len() != 1
+    {
+        return JavaNativeReceiverResolution::Untyped;
+    }
+    let ty = &value.types[0];
+    if !ty.definitions.is_empty() {
+        return JavaNativeReceiverResolution::Typed;
+    }
+    let Some(owner) = java_native_external_type(java, query, token, &ty.fqn) else {
+        return JavaNativeReceiverResolution::Typed;
+    };
+    JavaNativeReceiverResolution::External {
+        owner: owner.fqn().to_owned(),
+        form: if receiver_target_kind == TypeLookupTargetKind::TypeReference {
+            JavaNativeReceiverForm::TypeQualifier
+        } else {
+            JavaNativeReceiverForm::BoundValue
+        },
+    }
+}
+
+fn java_native_expression_value_type_at_node(
+    query: BoundedReceiverQuery<'_>,
+    node: Node<'_>,
+) -> Option<NativeExpressionValueTypeLookup> {
+    let text = node_text_for_query(node, query.source)?;
+    let start = node.start_position();
+    let end = node.end_position();
+    let site = ResolvedReferenceSite {
+        path: query.site.path.clone(),
+        text: text.to_owned(),
+        range: crate::analyzer::Range {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            start_line: start.row + 1,
+            end_line: end.row + 1,
+        },
+        focus_start_byte: node.start_byte(),
+        focus_end_byte: node.end_byte(),
+    };
+    let type_query = BoundedReceiverQuery {
+        analyzer: query.analyzer,
+        file: query.file,
+        source: query.source,
+        tree: query.tree,
+        site: &site,
+        budget: query.budget,
+        cancellation: query.cancellation,
+    };
+    match resolve_java_expression_value_type_bounded(type_query, || {}) {
+        BoundedResolution::Complete { value, .. } => Some(value),
+        BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => None,
+    }
+}
+
+fn java_native_receiver_type_site_node(mut receiver: Node<'_>) -> Option<Node<'_>> {
+    while receiver.kind() == "parenthesized_expression" {
+        receiver = receiver.named_child(0)?;
+    }
+    match receiver.kind() {
+        "identifier" | "type_identifier" | "scoped_type_identifier" => Some(receiver),
+        "method_invocation" => receiver.child_by_field_name("name"),
+        "field_access" => receiver.child_by_field_name("field"),
+        "object_creation_expression" => receiver
+            .child_by_field_name("type")
+            .and_then(java_constructor_type_terminal),
+        _ => None,
+    }
+}
+
+enum JavaNativeReceiverResolution {
+    External {
+        owner: String,
+        form: JavaNativeReceiverForm,
+    },
+    Typed,
+    Untyped,
 }
 
 fn java_native_external_type(
@@ -1339,6 +1474,26 @@ pub(crate) fn resolve_java_type_bounded(
         };
     };
     resolve_native_type_bounded(&java.inner, query, prepare_context, after_open)
+}
+
+fn resolve_java_expression_value_type_bounded(
+    query: BoundedReceiverQuery<'_>,
+    after_open: impl FnOnce(),
+) -> BoundedResolution<NativeExpressionValueTypeLookup> {
+    let Some(java) = resolve_analyzer::<JavaAnalyzer>(query.analyzer) else {
+        return BoundedResolution::Complete {
+            value: NativeExpressionValueTypeLookup {
+                value_types: unavailable_type(
+                    query.site,
+                    "native_analyzer_unavailable",
+                    "Java analyzer is unavailable".into(),
+                ),
+                direct_target: None,
+            },
+            work: ReceiverAnalysisWork::default(),
+        };
+    };
+    resolve_native_expression_value_type_bounded(&java.inner, query, prepare_context, after_open)
 }
 
 fn prepare_context(

@@ -106,15 +106,15 @@ target_name_closure(host,name,namespace) AS (
     )
   UNION
   SELECT names.host,imported.bound_name,names.namespace
-  FROM target_hosts AS host
+  FROM target_name_closure AS names
+  CROSS JOIN target_hosts AS host
+    ON host.host=names.host
   CROSS JOIN source_imports AS unresolved
     ON unresolved.blob_id=host.blob_id
    AND unresolved.identifier IS NULL
   CROSS JOIN rust_import_targets AS imported INDEXED BY idx_rust_import_targets_unresolved_source_alias
     ON imported.blob_id=unresolved.blob_id
    AND imported.source_import_id=unresolved.import_id
-  CROSS JOIN target_name_closure AS names
-    ON names.host=host.host
   WHERE imported.bound_name IS NOT NULL
     AND imported.bound_name<>names.name
     AND NOT EXISTS (

@@ -1013,6 +1013,7 @@ impl<'source, 'collector, 'declarations>
             .push(ResolutionCallableParameterListFact {
                 callable: site,
                 list_ordinal: 0,
+                contextual: false,
             });
         site
     }
@@ -1976,6 +1977,7 @@ impl<'source, 'collector, 'declarations>
             .push(ResolutionCallableParameterListFact {
                 callable,
                 list_ordinal: 0,
+                contextual: false,
             });
     }
 

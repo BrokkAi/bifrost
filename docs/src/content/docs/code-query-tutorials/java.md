@@ -173,8 +173,8 @@ Java receiver traversal uses shared semantic value and heap evidence together wi
         "start_line": 25
       },
       "result_type": "receiver_analysis",
-      "site_ast_id": "1e9039cd74fe438f7d1786fd58c0eb27623f441b03d53daefa2c12745dc1adff",
-      "site_id": "092f93072ecc0fa7907f049ba694926e3a98b4520a050f854ae369350878c71c",
+      "site_ast_id": "<public-id>",
+      "site_id": "<public-id>",
       "text": "client",
       "values": [
         {

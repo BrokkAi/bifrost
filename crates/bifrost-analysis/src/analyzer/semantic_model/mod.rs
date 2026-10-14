@@ -3,6 +3,7 @@
 //! Compiling a pack does not install or activate it in an analyzer. This module owns only the
 //! versioned source model, validation, canonical compilation, and defensive artifact decoding.
 
+mod activation_receipt;
 mod artifact;
 mod authoring;
 mod callable_values;
@@ -24,6 +25,15 @@ mod runtime_contracts;
 mod source;
 mod validate;
 
+pub use activation_receipt::{
+    ACTIVATION_RECEIPT_MAX_BYTES, ActivationReceipt, ActivationReceiptInvocation,
+    ActivationReceiptStage, ActivationReceiptStageStatus, ActivationReceiptSummary,
+    SnapshotBindingStatus,
+};
+pub(crate) use activation_receipt::{
+    ActivationFrame, ActivationOrigin, CandidateDecisionStatus, CandidatePhaseCoverage,
+    CandidateQuerySource, FinalSelectionStatus,
+};
 pub use artifact::{
     ArtifactEncoding, ArtifactError, CompiledAtomicOperation, CompiledClassDecoratorIdentity,
     CompiledClassDecoratorKeyword, CompiledConcurrencyEffect, CompiledCondWaiters,
@@ -103,6 +113,7 @@ macro_rules! implement_external_artifact_pack_producer {
 pub(crate) use implement_external_artifact_pack_producer;
 
 pub use python_condition::*;
+pub(crate) use runtime::acquire_active_semantic_models_with_runtime_artifacts_observed;
 pub use runtime::*;
 pub use runtime_contract_activation::*;
 pub use runtime_contracts::*;

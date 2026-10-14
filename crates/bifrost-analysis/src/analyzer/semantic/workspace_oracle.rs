@@ -82,9 +82,7 @@ pub struct WorkspaceSemanticOracle<'a> {
     hierarchy_expansion: DispatchHierarchyExpansion,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     dispatch_hints: Arc<DispatchHints>,
-    // Capture bounded, callable-scoped metadata evidence for this query.
-    // It is intentionally dropped with the provider instead of retained as a
-    // workspace-sized analyzer cache.
+    // Share bounded metadata evidence from this analyzer generation (#5112).
     python_saved_default_safety: Option<Arc<SavedDefaultArgumentSafety>>,
 }
 
@@ -163,8 +161,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             dispatch_hints: Arc::new(dispatch_hints),
             python_saved_default_safety: language_support(Language::Python)
                 .expect("Python support is registered")
-                .saved_default_argument_safety(workspace.analyzer())
-                .map(Arc::new),
+                .saved_default_argument_safety(workspace.analyzer()),
         }
     }
 

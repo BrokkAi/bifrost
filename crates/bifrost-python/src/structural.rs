@@ -5,8 +5,9 @@
 
 use brokk_bifrost_core::analyzer::common::node_source_text;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, nearest_ancestor, node_range,
+    CalleeSpineStep, attach_argument_role_with_derived_name, attach_role_with_derived_name,
+    attach_terminal_callee, field_name_in_parent, nearest_ancestor, node_range,
+    terminal_callee_leaf,
 };
 use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::edges::{
@@ -1255,6 +1256,16 @@ fn python_indirection_relation(
     }
 }
 
+/// Grammar steps for the shared call-callee spine. A value expression has no step.
+pub fn callee_spine_step(kind: &str) -> Option<CalleeSpineStep> {
+    use CalleeSpineStep::{Field, Name};
+    match kind {
+        "identifier" => Some(Name),
+        "attribute" => Some(Field("attribute")),
+        _ => None,
+    }
+}
+
 impl StructuralSpec for PythonStructuralSpec {
     fn language(&self) -> Language {
         Language::Python
@@ -1527,7 +1538,11 @@ impl StructuralSpec for PythonStructuralSpec {
                 if let Some(function) = node.child_by_field_name("function") {
                     // A call's own name is its callee's, so
                     // { "kind": "call", "name": "eval" } reads naturally.
-                    attach_terminal_callee(sink, function, expression_name_node(function));
+                    attach_terminal_callee(
+                        sink,
+                        function,
+                        terminal_callee_leaf(function, callee_spine_step),
+                    );
                     if function.kind() == "attribute"
                         && let Some(object) = function.child_by_field_name("object")
                     {

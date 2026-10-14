@@ -58,7 +58,7 @@ use brokk_bifrost_rql::structural::CodeQueryCompletion;
 
 use super::{
     BatchMerge, BoundEndpoint, CompiledTaintEndpoint, CompiledTaintPolicyPlan, PreparedTaintPlan,
-    ProductionTaintPolicyEvaluator, StoreWriteEvidenceByRead, TaintBatchError,
+    ProductionTaintPolicyEvaluator, RefusalNotice, StoreWriteEvidenceByRead, TaintBatchError,
     TaintExecutionBudget, TaintPolicyCompilation, TaintPolicyCompileError, TaintPolicyCompiler,
     compiled_payload, prepared_failure_payload, record_exhausted_lane, solve_and_project_batch,
     taint_witness_step_kind,
@@ -771,7 +771,7 @@ fn resolve_position(
 /// What keeps the compile's endpoint and region selection from being
 /// exhaustive.
 fn selection_gaps(
-    refusals: &[String],
+    refusals: &[RefusalNotice],
     incomplete_selectors: &[String],
     skipped_region_roots: usize,
 ) -> Vec<CandidateBoundary> {
@@ -784,12 +784,16 @@ fn selection_gaps(
             format!("endpoint selectors did not finish: {incomplete_selectors:?}"),
         ));
     }
-    if !refusals.is_empty() {
+    let incomplete_refusals = refusals
+        .iter()
+        .filter(|refusal| refusal.impact == super::PolicyDiagnosticImpact::RunIncomplete)
+        .collect::<Vec<_>>();
+    if !incomplete_refusals.is_empty() {
         gaps.push(CandidateBoundary::new(
             CandidateBoundaryKind::RefusedSite,
             vec![PolicyIncompleteReason::CapabilityIncomplete],
             None,
-            format!("selector rows bound no single site: {refusals:?}"),
+            format!("selector rows bound no single site: {incomplete_refusals:?}"),
         ));
     }
     if skipped_region_roots > 0 {

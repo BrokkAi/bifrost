@@ -2,8 +2,8 @@
 
 use brokk_bifrost_core::analyzer::model::AmbientUseRole;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_role_with_derived_name, attach_terminal_callee, field_name_in_parent, first_named_child,
-    is_field_of, nearest_ancestor, node_range,
+    CalleeSpineStep, attach_role_with_derived_name, attach_terminal_callee, field_name_in_parent,
+    first_named_child, is_field_of, nearest_ancestor, node_range, terminal_callee_leaf,
 };
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     linear_chain_tokens, qualified_path_chain_root, spelled_generic_arity,
@@ -307,6 +307,18 @@ fn attach_rust_role<'tree>(
     name_of: impl FnOnce(Node<'tree>) -> Option<Node<'tree>>,
 ) {
     attach_role_with_derived_name(sink, role, unwrap_attributes(target), name_of);
+}
+
+/// Grammar steps for the shared call-callee spine. A value expression has no step.
+pub fn callee_spine_step(kind: &str) -> Option<CalleeSpineStep> {
+    use CalleeSpineStep::{Field, Name};
+    match kind {
+        "identifier" | "field_identifier" | "type_identifier" => Some(Name),
+        "field_expression" => Some(Field("field")),
+        "scoped_identifier" | "scoped_type_identifier" => Some(Field("name")),
+        "generic_function" => Some(Field("function")),
+        _ => None,
+    }
 }
 
 pub fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
@@ -1021,7 +1033,11 @@ impl StructuralSpec for RustStructuralSpec {
                 if node.kind() == "macro_invocation" {
                     let source = sink.source();
                     if let Some(macro_name) = node.child_by_field_name("macro") {
-                        attach_terminal_callee(sink, macro_name, expression_name_node(macro_name));
+                        attach_terminal_callee(
+                            sink,
+                            macro_name,
+                            terminal_callee_leaf(macro_name, callee_spine_step),
+                        );
                         attach_scoped_receiver(sink, macro_name);
                     }
                     let modeled_sink = rust_modeled_sink_macro_argument_count(node, source)
@@ -1067,7 +1083,11 @@ impl StructuralSpec for RustStructuralSpec {
                         }
                     }
                 } else if let Some(function) = node.child_by_field_name("function") {
-                    attach_terminal_callee(sink, function, expression_name_node(function));
+                    attach_terminal_callee(
+                        sink,
+                        function,
+                        terminal_callee_leaf(function, callee_spine_step),
+                    );
                     attach_call_type_arguments(sink, function);
                     let target = call_function_target(function);
                     if target.kind() == "field_expression"

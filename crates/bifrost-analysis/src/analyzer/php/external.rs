@@ -1472,6 +1472,50 @@ namespace {
         );
     }
 
+    #[test]
+    #[hardwon("#5139: PHP syntax warnings retain the source-entry accounting identity")]
+    fn recoverable_stub_syntax_warning_names_its_exact_source_entry() {
+        let tree = stub_tree(&[
+            (
+                "Malformed.php",
+                "<?php\nclass Incomplete { public function broken( { }\n",
+            ),
+            ("Good.php", "<?php\nclass Good {}\n"),
+        ]);
+        let artifact_sha256 = tree.artifact.sha256().to_owned();
+        let production = PhpDeclarationStubPackProducer.produce_loaded_source_set(
+            &stub_request(),
+            &ArtifactProducerLimits::default(),
+            None,
+            &tree.artifact,
+            &tree.stubs,
+        );
+
+        assert_eq!(production.completeness, Completeness::Partial);
+        let pack = production.pack.expect("recoverable syntax keeps the pack");
+        assert_eq!(pack.completeness, Completeness::Partial);
+        let AuthoredPayload::DeclarationFacts { types, .. } = &pack.shards[0].payload else {
+            panic!("PHP stub production must publish declaration facts");
+        };
+        assert!(types.iter().any(|fact| fact.name == "Good"));
+
+        let syntax_warning = production
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "php.source.syntax")
+            .expect("recoverable syntax must remain a diagnostic");
+        assert_eq!(syntax_warning.severity, ProducerDiagnosticSeverity::Warning);
+        assert_eq!(
+            syntax_warning.source_entry.as_deref(),
+            Some("Malformed.php")
+        );
+        let expected_location = format!("php-stub+sha256:{artifact_sha256}!/Malformed.php");
+        assert_eq!(
+            syntax_warning.location.as_deref(),
+            Some(expected_location.as_str())
+        );
+    }
+
     /// The producer refuses an artifact of any other kind rather than reading
     /// it with the wrong dialect.
     #[test]

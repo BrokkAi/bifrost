@@ -4106,7 +4106,14 @@ pub(super) fn uninitialized_variable_expansions(
         return Vec::new();
     }
 
-    match derivation.binding_initialization_at_read(&procedure.handle, read.event) {
+    let read_failure_is_handled =
+        derivation.binding_read_failure_is_handled(&procedure.handle, read.event);
+    let initialization = derivation.binding_initialization_at_read(&procedure.handle, read.event);
+    if read_failure_is_handled {
+        return Vec::new();
+    }
+
+    match initialization {
         brokk_bifrost_flow::flow_state::BindingInitializationAnswer::Proven
         | brokk_bifrost_flow::flow_state::BindingInitializationAnswer::Unreachable => Vec::new(),
         brokk_bifrost_flow::flow_state::BindingInitializationAnswer::MayBeUninitialized => {

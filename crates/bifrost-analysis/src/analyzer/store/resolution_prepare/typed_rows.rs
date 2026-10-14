@@ -247,11 +247,11 @@ pub(crate) const COMPANION_RELATIONS_BY_ENCLOSING_TYPE_SQL: &str = "SELECT enclo
        AND relation.kind = 'companion' AND companion.semantic_role = 'definition'";
 
 pub(crate) const MEMBER_OWNERS_BY_DEFINITION_SQL: &str = "SELECT definition_semantic_key, owner_definition_semantic_key, \
-     owner_scope_head_node_key, member_kind, member_access, qualifier_compatibility FROM resolution_member_owner_properties \
+     owner_scope_head_node_key, member_name, member_kind, member_access, qualifier_compatibility FROM resolution_member_owner_properties \
      WHERE blob_id = ?1 AND definition_semantic_key IN (SELECT value FROM json_each(?2))";
 
 pub(crate) const MEMBER_OWNERS_BY_OWNER_SQL: &str = "SELECT definition_semantic_key, owner_definition_semantic_key, \
-     owner_scope_head_node_key, member_kind, member_access, qualifier_compatibility FROM resolution_member_owner_properties \
+     owner_scope_head_node_key, member_name, member_kind, member_access, qualifier_compatibility FROM resolution_member_owner_properties \
      INDEXED BY resolution_member_owner_properties_owner \
      WHERE blob_id = ?1 \
        AND owner_definition_semantic_key IN (SELECT value FROM json_each(?2))";
@@ -1232,6 +1232,11 @@ pub(super) fn prepare_typed_rows(
         }
         body.push(PathBodyToken::Close);
         body.push(PathBodyToken::Open);
+        for list in signature.contextual_parameter_lists() {
+            body.push(PathBodyToken::Int(i64::from(*list)));
+        }
+        body.push(PathBodyToken::Close);
+        body.push(PathBodyToken::Open);
         for applicability in signature.parameter_applicability() {
             body.push(PathBodyToken::Open);
             body.push(PathBodyToken::Int(i64::from(applicability.ordinal())));
@@ -1788,6 +1793,7 @@ pub(crate) fn decode_member_owner_fields(
     definition: SemanticId,
     owner_definition: SemanticId,
     owner_scope_head: BindingNodeId,
+    member_name: &str,
     kind: &str,
     access: &str,
     compatibility: &str,
@@ -1796,6 +1802,7 @@ pub(crate) fn decode_member_owner_fields(
         definition,
         owner_definition,
         owner_scope_head,
+        member_name,
         member_kind_from_label(kind),
         member_access_from_label(access),
         member_qualifier_compatibility_from_label(compatibility),
@@ -2092,7 +2099,7 @@ pub(crate) fn decode_callable_signature_body(
     let parsed = parse_body(body);
     let cells = array(&parsed, "callable signature body");
     assert!(
-        (7..=11).contains(&cells.len()),
+        (7..=12).contains(&cells.len()),
         "callable signature body has a known shape"
     );
     let parameters = array(&cells[1], "callable signature parameters")
@@ -2180,7 +2187,7 @@ pub(crate) fn decode_callable_signature_body(
     .with_receiver(receiver)
     .with_result_type_parameter(result_type_parameter)
     .with_result_owner_type_parameter(result_owner_type_parameter);
-    if cells.len() < 11 {
+    if cells.len() < 12 {
         return signature;
     }
     let parameter_lists = array(&cells[8], "callable parameter lists")
@@ -2190,7 +2197,14 @@ pub(crate) fn decode_callable_signature_body(
                 .expect("a stored parameter list ordinal fits u32")
         })
         .collect::<Vec<_>>();
-    let parameter_applicability = array(&cells[9], "callable parameter applicability")
+    let contextual_parameter_lists = array(&cells[9], "contextual callable parameter lists")
+        .iter()
+        .map(|list| {
+            u32::try_from(integer(list, "contextual callable parameter list ordinal"))
+                .expect("a stored contextual parameter list ordinal fits u32")
+        })
+        .collect::<Vec<_>>();
+    let parameter_applicability = array(&cells[10], "callable parameter applicability")
         .iter()
         .map(|row| {
             let fields = array(row, "callable parameter applicability row");
@@ -2212,9 +2226,11 @@ pub(crate) fn decode_callable_signature_body(
             )
         })
         .collect::<Vec<_>>();
-    let extension_receiver = (!cells[10].is_null())
-        .then(|| context.semantic(integer(&cells[10], "callable extension receiver slot")));
-    signature.with_applicability_shape(parameter_lists, parameter_applicability, extension_receiver)
+    let extension_receiver = (!cells[11].is_null())
+        .then(|| context.semantic(integer(&cells[11], "callable extension receiver slot")));
+    signature
+        .with_applicability_shape(parameter_lists, parameter_applicability, extension_receiver)
+        .with_contextual_parameter_lists(contextual_parameter_lists)
 }
 
 /// The Rust-side mapping for the member vocabularies the reused tier 1 tables

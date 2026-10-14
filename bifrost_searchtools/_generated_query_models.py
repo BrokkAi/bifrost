@@ -1393,6 +1393,7 @@ class CodeQueryDispatchTarget:
     completeness: str
     coverage: str
     dispatch: str
+    external_callee_key: CodeQueryExternalCalleeKey | None
     id: str
     ordinal: int
     path: str
@@ -1506,6 +1507,19 @@ class CodeQueryExpressionSite:
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryExpressionSite:
         return _decode_code_query_expression_site(data, 'CodeQueryExpressionSite')
+
+
+@dataclass(frozen=True)
+class CodeQueryExternalCalleeKey:
+    has_receiver: bool
+    language: str
+    member: str
+    owner: str
+    parameter_count: int
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryExternalCalleeKey:
+        return _decode_code_query_external_callee_key(data, 'CodeQueryExternalCalleeKey')
 
 
 @dataclass(frozen=True)
@@ -2527,6 +2541,7 @@ class CodeQueryProcedureEffect:
     witness_available: bool
     witness_chain: str | None
     witness_effect_site_id: str | None
+    witness_hops: list[CodeQueryProcedureEffectWitness]
     witness_site_id: str | None
     witness_steps: int
     witness_truncated: bool
@@ -2536,6 +2551,25 @@ class CodeQueryProcedureEffect:
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryProcedureEffect:
         return _decode_code_query_procedure_effect(data, 'CodeQueryProcedureEffect')
+
+
+@dataclass(frozen=True)
+class CodeQueryProcedureEffectWitness:
+    callee_procedure_id: str
+    caller_procedure_id: str
+    certainty: str
+    dispatch_complete: bool
+    execution_timing: str
+    external_callee_key: CodeQueryExternalCalleeKey | None
+    proof: str
+    site_ast_id: str
+    site_coverage: str
+    site_id: str
+    target_id: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryProcedureEffectWitness:
+        return _decode_code_query_procedure_effect_witness(data, 'CodeQueryProcedureEffectWitness')
 
 
 @dataclass(frozen=True)
@@ -9200,6 +9234,7 @@ def _decode_code_query_dispatch_target(value: Any, prefix: str = 'CodeQueryDispa
         'completeness',
         'coverage',
         'dispatch',
+        'external_callee_key',
         'id',
         'ordinal',
         'path',
@@ -9239,6 +9274,10 @@ def _decode_code_query_dispatch_target(value: Any, prefix: str = 'CodeQueryDispa
     completeness_value = _decode_string(value['completeness'], f"{prefix}.completeness")
     coverage_value = _decode_string(value['coverage'], f"{prefix}.coverage")
     dispatch_value = _decode_string(value['dispatch'], f"{prefix}.dispatch")
+    if 'external_callee_key' in value:
+        external_callee_key_value = _decode_defs_code_query_result_item_union_52_properties_external_callee_key(value['external_callee_key'], f"{prefix}.external_callee_key")
+    else:
+        external_callee_key_value = None
     id_value = _decode_string(value['id'], f"{prefix}.id")
     ordinal_value = _decode_defs_code_query_result_item_union_52_properties_ordinal(value['ordinal'], f"{prefix}.ordinal")
     path_value = _decode_string(value['path'], f"{prefix}.path")
@@ -9271,6 +9310,7 @@ def _decode_code_query_dispatch_target(value: Any, prefix: str = 'CodeQueryDispa
         completeness=completeness_value,
         coverage=coverage_value,
         dispatch=dispatch_value,
+        external_callee_key=external_callee_key_value,
         id=id_value,
         ordinal=ordinal_value,
         path=path_value,
@@ -9597,6 +9637,43 @@ def _decode_code_query_expression_site(value: Any, prefix: str = 'CodeQueryExpre
         text=text_value,
         provenance=provenance_value,
         provenance_truncated=provenance_truncated_value,
+    )
+
+def _decode_code_query_external_callee_key(value: Any, prefix: str = 'CodeQueryExternalCalleeKey') -> CodeQueryExternalCalleeKey:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'has_receiver',
+        'language',
+        'member',
+        'owner',
+        'parameter_count',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'has_receiver',
+        'language',
+        'member',
+        'owner',
+        'parameter_count',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    has_receiver_value = _decode_boolean(value['has_receiver'], f"{prefix}.has_receiver")
+    language_value = _decode_string(value['language'], f"{prefix}.language")
+    member_value = _decode_string(value['member'], f"{prefix}.member")
+    owner_value = _decode_string(value['owner'], f"{prefix}.owner")
+    parameter_count_value = _decode_defs_code_query_external_callee_key_properties_parameter_count(value['parameter_count'], f"{prefix}.parameter_count")
+    return CodeQueryExternalCalleeKey(
+        has_receiver=has_receiver_value,
+        language=language_value,
+        member=member_value,
+        owner=owner_value,
+        parameter_count=parameter_count_value,
     )
 
 def _decode_code_query_failure_handler_state(value: Any, prefix: str = 'CodeQueryFailureHandlerState') -> CodeQueryFailureHandlerState:
@@ -13035,6 +13112,7 @@ def _decode_code_query_procedure_effect(value: Any, prefix: str = 'CodeQueryProc
         'witness_available',
         'witness_chain',
         'witness_effect_site_id',
+        'witness_hops',
         'witness_site_id',
         'witness_steps',
         'witness_truncated',
@@ -13122,6 +13200,10 @@ def _decode_code_query_procedure_effect(value: Any, prefix: str = 'CodeQueryProc
         witness_effect_site_id_value = _decode_defs_code_query_result_item_union_42_properties_witness_effect_site_id(value['witness_effect_site_id'], f"{prefix}.witness_effect_site_id")
     else:
         witness_effect_site_id_value = None
+    if 'witness_hops' in value:
+        witness_hops_value = _decode_defs_code_query_result_item_union_42_properties_witness_hops(value['witness_hops'], f"{prefix}.witness_hops")
+    else:
+        witness_hops_value = _decode_defs_code_query_result_item_union_42_properties_witness_hops([], f"{prefix}.witness_hops")
     if 'witness_site_id' in value:
         witness_site_id_value = _decode_defs_code_query_result_item_union_42_properties_witness_site_id(value['witness_site_id'], f"{prefix}.witness_site_id")
     else:
@@ -13160,11 +13242,75 @@ def _decode_code_query_procedure_effect(value: Any, prefix: str = 'CodeQueryProc
         witness_available=witness_available_value,
         witness_chain=witness_chain_value,
         witness_effect_site_id=witness_effect_site_id_value,
+        witness_hops=witness_hops_value,
         witness_site_id=witness_site_id_value,
         witness_steps=witness_steps_value,
         witness_truncated=witness_truncated_value,
         provenance=provenance_value,
         provenance_truncated=provenance_truncated_value,
+    )
+
+def _decode_code_query_procedure_effect_witness(value: Any, prefix: str = 'CodeQueryProcedureEffectWitness') -> CodeQueryProcedureEffectWitness:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'callee_procedure_id',
+        'caller_procedure_id',
+        'certainty',
+        'dispatch_complete',
+        'execution_timing',
+        'external_callee_key',
+        'proof',
+        'site_ast_id',
+        'site_coverage',
+        'site_id',
+        'target_id',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'callee_procedure_id',
+        'caller_procedure_id',
+        'certainty',
+        'dispatch_complete',
+        'execution_timing',
+        'proof',
+        'site_ast_id',
+        'site_coverage',
+        'site_id',
+        'target_id',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    callee_procedure_id_value = _decode_string(value['callee_procedure_id'], f"{prefix}.callee_procedure_id")
+    caller_procedure_id_value = _decode_string(value['caller_procedure_id'], f"{prefix}.caller_procedure_id")
+    certainty_value = _decode_string(value['certainty'], f"{prefix}.certainty")
+    dispatch_complete_value = _decode_boolean(value['dispatch_complete'], f"{prefix}.dispatch_complete")
+    execution_timing_value = _decode_string(value['execution_timing'], f"{prefix}.execution_timing")
+    if 'external_callee_key' in value:
+        external_callee_key_value = _decode_defs_code_query_procedure_effect_witness_properties_external_callee_key(value['external_callee_key'], f"{prefix}.external_callee_key")
+    else:
+        external_callee_key_value = None
+    proof_value = _decode_string(value['proof'], f"{prefix}.proof")
+    site_ast_id_value = _decode_string(value['site_ast_id'], f"{prefix}.site_ast_id")
+    site_coverage_value = _decode_string(value['site_coverage'], f"{prefix}.site_coverage")
+    site_id_value = _decode_string(value['site_id'], f"{prefix}.site_id")
+    target_id_value = _decode_string(value['target_id'], f"{prefix}.target_id")
+    return CodeQueryProcedureEffectWitness(
+        callee_procedure_id=callee_procedure_id_value,
+        caller_procedure_id=caller_procedure_id_value,
+        certainty=certainty_value,
+        dispatch_complete=dispatch_complete_value,
+        execution_timing=execution_timing_value,
+        external_callee_key=external_callee_key_value,
+        proof=proof_value,
+        site_ast_id=site_ast_id_value,
+        site_coverage=site_coverage_value,
+        site_id=site_id_value,
+        target_id=target_id_value,
     )
 
 def _decode_code_query_program_point(value: Any, prefix: str = 'CodeQueryProgramPoint') -> CodeQueryProgramPoint:
@@ -21666,6 +21812,12 @@ def _decode_defs_code_query_export_local_definition_union_2_properties_status(va
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
+def _decode_defs_code_query_external_callee_key_properties_parameter_count(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
 class CodeQueryFlowCarrierSymbol(metaclass=_TaggedUnionMeta):
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryFlowCarrierSymbol:
@@ -22455,6 +22607,18 @@ def _decode_defs_code_query_occurrence_target_union_4_properties_target_kind(val
     if value != 'not_derived':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
+
+def _decode_defs_code_query_procedure_effect_witness_properties_external_callee_key(value: Any, prefix: str = "union") -> CodeQueryExternalCalleeKey | None:
+    errors = []
+    try:
+        return _decode_code_query_external_callee_key(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
 def _decode_defs_code_query_program_point_boundary(value: Any, prefix: str = 'CodeQueryProgramPointBoundary') -> CodeQueryProgramPointBoundary:
     values_repr = "['entry', 'normal_exit', 'exceptional_exit']"
@@ -26272,6 +26436,14 @@ def _decode_defs_code_query_result_item_union_42_properties_witness_effect_site_
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
+def _decode_defs_code_query_result_item_union_42_properties_witness_hops(value: Any, prefix: str = "array") -> list[CodeQueryProcedureEffectWitness]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_code_query_procedure_effect_witness(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
 def _decode_defs_code_query_result_item_union_42_properties_witness_site_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
@@ -27002,6 +27174,18 @@ def _decode_defs_code_query_result_item_union_52_properties_boundary_kind(value:
     errors = []
     try:
         return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_52_properties_external_callee_key(value: Any, prefix: str = "union") -> CodeQueryExternalCalleeKey | None:
+    errors = []
+    try:
+        return _decode_code_query_external_callee_key(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
     except DecoderError as error:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")

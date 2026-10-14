@@ -106,7 +106,7 @@ fieldless_codes! {
     IndexedLocationIdentity { Element, Aggregate }
     MoveInvalidation { Invalidated, Unknown }
     ValuePreservation { Identity, Preserving, Changing }
-    ValueUseKind { Dereference }
+    ValueUseKind { Dereference, Unbind }
     MemoryAccessKind { Field, Property, Static, Index, Dereference, LexicalCell, Capture }
     SynchronizationOperation { ChannelSend, ChannelReceive, ChannelClose }
     CallContinuationKind { Normal, Exceptional }

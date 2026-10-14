@@ -2721,10 +2721,12 @@ impl<'answer> FactCallableReceiverTargetProjection<'answer> {
     }
 }
 
-fn current_target_usage_proof(targets: &[SemanticId]) -> Option<UsageProof> {
-    match targets {
+fn current_target_usage_proof(binding: &ResolutionAnswer) -> Option<UsageProof> {
+    let ambiguous = matches!(binding.completion(), ResolutionCompletion::Incomplete(reasons)
+        if reasons.iter().any(|reason| matches!(reason, ResolutionIncompleteReason::InconsistentPrecedence(_))));
+    match binding.targets() {
         [] => None,
-        [_] => Some(UsageProof::Proven),
+        [_] if !ambiguous => Some(UsageProof::Proven),
         _ => Some(UsageProof::Unproven),
     }
 }
@@ -2732,7 +2734,8 @@ fn current_target_usage_proof(targets: &[SemanticId]) -> Option<UsageProof> {
 /// Project one callable target without collapsing sibling receiver channels.
 ///
 /// `UsageProof` retains the incumbent current-world contract: one selected
-/// target is proven and several selected alternatives are unproven. Binding
+/// target is proven when selection is unique. An ambiguous selection remains
+/// unproven even when its paths reach the same declaration. Binding
 /// completion and receiver admission remain independently available through
 /// `binding_shape` and `admission`; an open strict diagnostic does not rewrite
 /// the cardinality of the targets already selected by the resolver.
@@ -2750,7 +2753,7 @@ pub fn project_fact_callable_receiver_target(
         target: target.target(),
         binding_shape,
         admission,
-        proof: current_target_usage_proof(binding.targets())
+        proof: current_target_usage_proof(binding)
             .expect("a callable target disposition requires one retained binding target"),
     }
 }
@@ -2855,8 +2858,10 @@ pub fn classify_fact_reference_binding(
 /// Project current binding cardinality and strict completion into orthogonal
 /// graph fields.
 ///
-/// One retained current target carries the incumbent `Proven` value even when
-/// strict semantic completion remains open. Multiple retained alternatives
+/// One uniquely selected current target carries the incumbent `Proven` value
+/// even when strict semantic completion remains open. An inconsistent
+/// precedence marks ambiguous selection, separately from incompleteness, and
+/// cannot prove an edge even if its paths reach one declaration. Multiple retained alternatives
 /// remain `Unproven`. The projection status continues to report complete,
 /// ambiguous, binding-incomplete, and receiver-incomplete states without
 /// suppressing or relabeling the current target inventory. Structured
@@ -2884,7 +2889,7 @@ pub fn project_fact_reference_targets<'answer>(
         return FactReferenceTargetProjection {
             binding_shape,
             targets: binding.targets(),
-            proof: current_target_usage_proof(binding.targets()),
+            proof: current_target_usage_proof(binding),
             status: FactReferenceProjectionStatus::Excluded(admission),
         };
     }
@@ -2895,7 +2900,7 @@ pub fn project_fact_reference_targets<'answer>(
         return FactReferenceTargetProjection {
             binding_shape,
             targets: binding.targets(),
-            proof: current_target_usage_proof(binding.targets()),
+            proof: current_target_usage_proof(binding),
             status: FactReferenceProjectionStatus::AdmissionIncomplete(gap),
         };
     }
@@ -2925,7 +2930,7 @@ pub fn project_fact_reference_targets<'answer>(
         } => FactReferenceTargetProjection {
             binding_shape,
             targets: retained_targets,
-            proof: current_target_usage_proof(retained_targets),
+            proof: current_target_usage_proof(binding),
             status: FactReferenceProjectionStatus::Incomplete(completion),
         },
     }

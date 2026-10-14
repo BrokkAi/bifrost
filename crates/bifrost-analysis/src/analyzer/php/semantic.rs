@@ -30,7 +30,11 @@ use crate::analyzer::{DispatchExtensibility, Language, PhpAnalyzer, ProjectFile}
 use crate::hash::HashMap;
 use brokk_bifrost_php::graph::syntax::{clone_object_operand, object_creation_type};
 
-const ADAPTER_VERSION: &[u8] = b"php-value-semantics-v8";
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const ADAPTER_VERSION: &[u8] = b"php-value-semantics-v9";
 
 impl_program_semantics_provider!(PhpAnalyzer, PhpSemanticLowerer);
 

@@ -3377,6 +3377,7 @@ mod tests {
             &AnalyzerConfig::default(),
             &[DependencyPackEcosystem::Cpp],
             DependencyPackWorkspaceContext {
+                activation_receipt: None,
                 catalog: &catalog,
                 persistence: None,
                 activation: &activation,
@@ -3500,6 +3501,7 @@ mod tests {
             &AnalyzerConfig::default(),
             &[DependencyPackEcosystem::Cpp],
             DependencyPackWorkspaceContext {
+                activation_receipt: None,
                 catalog: &catalog,
                 persistence: None,
                 activation: &activation,
@@ -4215,6 +4217,7 @@ mod tests {
             &AnalyzerConfig::default(),
             &[DependencyPackEcosystem::Cpp],
             DependencyPackWorkspaceContext {
+                activation_receipt: None,
                 catalog: &catalog,
                 persistence: None,
                 activation: &activation,

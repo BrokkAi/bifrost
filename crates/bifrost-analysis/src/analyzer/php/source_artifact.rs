@@ -182,9 +182,10 @@ pub(crate) fn project_php_source(
         return finish(Vec::new(), Vec::new(), Vec::new(), diagnostics, false);
     };
     if tree.root_node().has_error() {
-        diagnostics.warning(
+        diagnostics.warning_for_source_entry(
             "php.source.syntax",
             Some(logical_path(origin, artifact_sha256, entry_path)),
+            Some(entry_path.to_owned()),
             "PHP declaration source contains syntax errors",
         );
     }

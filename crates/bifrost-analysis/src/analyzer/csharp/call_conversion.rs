@@ -2,7 +2,7 @@ use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner_with_
 use crate::analyzer::semantic_model::TypeRef;
 use crate::analyzer::usages::call_conversion::{
     ArgumentTypeConversion, CSharpPrimitive, CallArgumentConversionProver, ConversionKind,
-    ConversionUnknown, ResolvedConversionType,
+    ConversionUnknown, ModelArgumentApplicability, ResolvedConversionType,
 };
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use tree_sitter::Node;
@@ -49,25 +49,67 @@ impl CallArgumentConversionProver for CSharpCallArgumentConversionProver {
         let formal_type = model_type(formal_type)?;
         classify(source_type, formal_type)
     }
+
+    fn model_argument_applicability(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        actual: Node<'_>,
+        source: &str,
+        formal_type: &TypeRef,
+    ) -> ModelArgumentApplicability {
+        if file.language() != Language::CSharp {
+            return ModelArgumentApplicability::Unknown(ConversionUnknown::UnsupportedLanguage);
+        }
+        let source_type = match actual_type(actual, source) {
+            Ok(source_type) => source_type,
+            Err(reason) => return ModelArgumentApplicability::Unknown(reason),
+        };
+        let formal_type = match model_type(formal_type) {
+            Ok(formal_type) => formal_type,
+            Err(reason) => return ModelArgumentApplicability::Unknown(reason),
+        };
+        // These three built-in types have identity conversion and only char ->
+        // int numeric widening. Int constants do not implicitly convert to char;
+        // user-defined conversions cannot connect two built-in types (#3811).
+        if builtin_conversion_kind(source_type, formal_type).is_none() {
+            return ModelArgumentApplicability::Inapplicable;
+        }
+        match classify(source_type, formal_type) {
+            Ok(proof) => ModelArgumentApplicability::Applicable(Box::new(proof)),
+            Err(reason) => ModelArgumentApplicability::Unknown(reason),
+        }
+    }
 }
 
 fn classify(
     source: CSharpPrimitive,
     target: CSharpPrimitive,
 ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
-    let kind = if source == target {
-        ConversionKind::CSharpIdentity
-    } else if source == CSharpPrimitive::Char && target == CSharpPrimitive::Int32 {
-        ConversionKind::CSharpImplicitNumeric
-    } else {
-        return Err(ConversionUnknown::UnsupportedConversion);
-    };
+    let kind =
+        builtin_conversion_kind(source, target).ok_or(ConversionUnknown::UnsupportedConversion)?;
     Ok(ArgumentTypeConversion {
         source: ResolvedConversionType::CSharpPrimitive(source),
         target: ResolvedConversionType::CSharpPrimitive(target),
         kind,
         hierarchy: None,
     })
+}
+
+fn builtin_conversion_kind(
+    source: CSharpPrimitive,
+    target: CSharpPrimitive,
+) -> Option<ConversionKind> {
+    if source == target {
+        Some(ConversionKind::CSharpIdentity)
+    } else if source == CSharpPrimitive::Char && target == CSharpPrimitive::Int32 {
+        // This is the sole C# numeric conversion proved by this bounded
+        // adapter. Keep the wire kind exact; add a new kind before supporting
+        // any other numeric pair.
+        Some(ConversionKind::CSharpImplicitNumeric)
+    } else {
+        None
+    }
 }
 
 fn model_type(reference: &TypeRef) -> Result<CSharpPrimitive, ConversionUnknown> {

@@ -1,3 +1,6 @@
+# SQL resources are included as source text; planner-statistics needles split on LF.
+*.sql text eol=lf
+
 # Policy sources and formatter golds are compared with exact byte ranges.
 *.rqlp text eol=lf
 
@@ -56,6 +59,7 @@ tests/fixtures/php/foreach_consistent_typed_property_writes.php text eol=lf
 # normalized by the golden runner and binary fixture types remain unlisted.
 tests/fixtures/golden/**/*.c text eol=lf
 tests/fixtures/golden/**/*.cc text eol=lf
+tests/fixtures/golden/**/*.config text eol=lf
 tests/fixtures/golden/**/*.cpp text eol=lf
 tests/fixtures/golden/**/*.cs text eol=lf
 tests/fixtures/golden/**/*.go text eol=lf
@@ -83,6 +87,11 @@ tests/fixtures/golden/**/*.tsx text eol=lf
 tests/fixtures/golden/**/*.xml text eol=lf
 tests/fixtures/golden/**/*.yaml text eol=lf
 tests/fixtures/golden/**/*.yml text eol=lf
+
+# The rust-codeql-parity corpus asserts exact byte spans and call-site offsets
+# over its Rust fixtures, so a CRLF checkout shifts every span after the first
+# line. Keep the committed LF contract on Windows.
+tests/fixtures/rust-codeql-parity/**/*.rs text eol=lf
 
 # Tutorial Markdown contains executable source snippets whose bytes appear in
 # documented analyzer ranges and output identities.

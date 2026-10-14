@@ -446,7 +446,7 @@ fn package_precedence(
     choice: SemanticId,
     ordinal: u32,
 ) -> Vec<PrecedenceStep> {
-    match language {
+    let mut precedence = match language {
         Language::Go => {
             assert_eq!(ordinal, 0);
             go_spelling_precedence(identities, scope, None, 0)
@@ -484,7 +484,23 @@ fn package_precedence(
             )]
         }
         _ => panic!("package path precedence is undefined for {language:?}"),
+    };
+    let origin = if language == Language::Scala {
+        BindingOrigin::OtherCompilationUnitPackage
+    } else {
+        BindingOrigin::SameCompilationUnitPackage
+    };
+    if let Some(ordinal) = binding_origin_rank(language, origin) {
+        precedence.push(identities.register_precedence_namespace(
+            PrecedenceStep {
+                tier: PrecedenceTier::CandidateOriginRank,
+                ordinal,
+                semantic: choice,
+            },
+            namespace,
+        ));
     }
+    precedence
 }
 
 #[cfg(test)]
@@ -817,12 +833,27 @@ mod tests {
             .find(|path| {
                 path.start().node() == reference.root_scope
                     && path.end().node() == BindingNodeId::universal_root()
-                    && path.precedence().len() == 1
+                    && path
+                        .precedence()
+                        .iter()
+                        .any(|step| step.tier == PrecedenceTier::OtherCompilationUnitPackage)
             })
             .expect("Scala package lookup path is lowered");
         assert_eq!(
-            path.precedence()[0].tier,
-            PrecedenceTier::OtherCompilationUnitPackage
+            path.precedence()
+                .iter()
+                .find(|step| step.tier == PrecedenceTier::OtherCompilationUnitPackage)
+                .expect("Scala package lookup keeps its existing package tier")
+                .ordinal,
+            0
+        );
+        assert_eq!(
+            path.precedence()
+                .iter()
+                .find(|step| step.tier == PrecedenceTier::CandidateOriginRank)
+                .expect("Scala package lookup records its candidate origin")
+                .ordinal,
+            3
         );
         assert!(PrecedenceTier::LexicalBinding < PrecedenceTier::ExplicitImport);
         assert!(PrecedenceTier::ExplicitImport < PrecedenceTier::WildcardImport);

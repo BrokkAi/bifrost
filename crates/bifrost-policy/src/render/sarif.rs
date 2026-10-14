@@ -968,7 +968,7 @@ impl<'a> SarifNotification<'a> {
             PolicyRunCompletion::Complete => match run.scope() {
                 Some(scope) if scope.kind() == PolicyRunScopeKind::ChangedRange => (
                     "BIFROST_POLICY_RANGE_SCOPED",
-                    "Bifrost policy evaluation was range-scoped to the changed files: an empty \
+                    "Bifrost policy evaluation was range-scoped to the changed procedures: an empty \
                      result claims nothing about sinks outside them",
                     SarifNotificationLevel::Note,
                 ),
@@ -1357,9 +1357,9 @@ mod scratch_cache;
 
 #[cfg(test)]
 mod tests {
-    use brokk_bifrost_test_macros::hardwon;
     use super::*;
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn artifact_uri_preserves_only_segment_separators_and_unreserved_bytes() {

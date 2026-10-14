@@ -5,17 +5,19 @@
 //! names remain selected-context work or explicit gaps.
 
 use brokk_bifrost_core::analyzer::Range;
-use brokk_bifrost_core::analyzer::model::{CodeUnit, DeclarationKind};
+use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::{CodeUnit, CodeUnitType, DeclarationKind};
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     BindingProjectionFact, BindingProjectionKind, DeclarationTypeRole, DeclarationTypeSlotFact,
     FileResolutionFacts, PositionedIdentifierFact, ResolutionAdditionalDefinitionNamespaceFact,
     ResolutionBinderFact, ResolutionBinderKind, ResolutionCallArgumentListFact, ResolutionCallFact,
-    ResolutionCallableParameterFact, ResolutionCallableParameterListFact,
-    ResolutionCallableParameterSemanticsFact, ResolutionCallableReceiverOrigin,
-    ResolutionCallableReceiverOriginFact, ResolutionCallableSignatureFact,
-    ResolutionDeclarationVisibilityFact, ResolutionDefinitionUnitFact, ResolutionGapFact,
-    ResolutionGapKind, ResolutionIdentifierRole, ResolutionImportRouteFact,
+    ResolutionCallTypeArgumentFact, ResolutionCallableParameterFact,
+    ResolutionCallableParameterListFact, ResolutionCallableParameterSemanticsFact,
+    ResolutionCallableReceiverOrigin, ResolutionCallableReceiverOriginFact,
+    ResolutionCallableSignatureFact, ResolutionDeclarationVisibilityFact,
+    ResolutionDefinitionUnitFact, ResolutionEngineRuleEligibilityFact, ResolutionEngineRuleKind,
+    ResolutionGapFact, ResolutionGapKind, ResolutionIdentifierRole, ResolutionImportRouteFact,
     ResolutionImportRouteKind, ResolutionImportRouteSegmentFact, ResolutionImportSelectorFact,
     ResolutionImportSelectorKind, ResolutionInvocationRole, ResolutionInvocationRoleFact,
     ResolutionJvmAliasFact, ResolutionJvmAliasId, ResolutionJvmAliasKind,
@@ -35,7 +37,7 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionTypeTransferValueTransform,
 };
 use brokk_bifrost_core::analyzer::source_facts::{
-    PrimarySourceFactCollector, SourceDeclarationId, SourceOccurrenceId,
+    PrimarySourceFactCollector, SourceDeclarationId, SourceOccurrenceId, SourceOccurrenceProvenance,
 };
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::field_name_in_parent;
 use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
@@ -49,7 +51,7 @@ use tree_sitter::Node;
 
 use crate::scala::imports::scala_export_info_from_node;
 use crate::scala::structural::{SCALA_STRUCTURAL_SPEC, scala_occurrence_role};
-use crate::scala::supertypes::scala_supertype_lookup_nodes;
+use crate::scala::supertypes::{scala_self_type_lookup_nodes, scala_supertype_lookup_nodes};
 
 pub(super) struct ScalaResolutionExtraction {
     pub facts: FileResolutionFacts,
@@ -87,8 +89,10 @@ struct ScalaCaseClass<'source> {
 /// One member the compiler adds to a case class or its companion.
 struct ScalaCaseMember<'source> {
     name: &'static str,
-    /// The template that owns the member: the companion object, or the class.
+    /// The source template used for duplicate checks and the member's anchor.
     owner: Node<'source>,
+    owner_site: ResolutionSiteId,
+    owner_scope: ResolutionScopeId,
     access: (
         ResolutionMemberAccess,
         ResolutionMemberQualifierCompatibility,
@@ -129,6 +133,7 @@ struct ScalaResolutionBuilder<'a, 'source> {
     scope_ranges: Vec<Range>,
     /// The `apply` and `unapply` sites published for each case class, by class node.
     case_class_members: HashMap<usize, (Option<ResolutionSiteId>, Option<ResolutionSiteId>)>,
+    synthesized_case_class_companions: HashMap<usize, ResolutionSiteId>,
     next_parameter_ordinal: HashMap<ResolutionSiteId, u32>,
     pending_declared_value_types: Vec<(ResolutionSiteId, ResolutionTypeSlotId, Node<'source>)>,
     pending_type_aliases: Vec<(ResolutionSiteId, ResolutionTypeSlotId, Node<'source>)>,
@@ -183,6 +188,7 @@ pub(super) fn extract_scala_resolution<'source>(
         parameter_list_ordinals: HashMap::default(),
         scope_ranges: vec![node_range(root)],
         case_class_members: HashMap::default(),
+        synthesized_case_class_companions: HashMap::default(),
         next_parameter_ordinal: HashMap::default(),
         pending_declared_value_types: Vec::new(),
         pending_type_aliases: Vec::new(),
@@ -205,6 +211,7 @@ pub(super) fn extract_scala_resolution<'source>(
     builder.finish_supertypes(root);
     builder.finish_calls(root);
     builder.finish_shape_dependent_gaps(root);
+    builder.finish_generic_formals();
     builder.validate();
     ScalaResolutionExtraction {
         facts: builder.facts,
@@ -321,17 +328,6 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     self.add_site(node, ResolutionSiteKind::UnsupportedDeclaration, item.scope);
                 self.gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
             }
-            if node.kind() == "self_type" {
-                let site =
-                    self.add_site(node, ResolutionSiteKind::UnsupportedDeclaration, item.scope);
-                self.gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
-                self.facts
-                    .reference_enumeration_gaps
-                    .push(ResolutionReferenceEnumerationGapFact {
-                        site,
-                        kind: ResolutionGapKind::UnsupportedScopeOrBinder,
-                    });
-            }
 
             self.lower_occurrence(
                 node,
@@ -420,130 +416,150 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         {
             return None;
         }
-        let site = self.add_site(node, kind, scope);
-        self.declaration_sites.insert(node.id(), site);
-        self.declaration_nodes.insert(site, node);
-        if node.kind() == "package_object"
-            && let Some(name) = name
-        {
-            let package_declaration =
-                self.add_site(name, ResolutionSiteKind::PackageDeclaration, scope);
-            self.package_declarations
-                .insert(node.id(), package_declaration);
-        }
-        if let Some(name) = name {
-            self.identifier(
-                site,
-                name,
-                ResolutionIdentifierRole::Declaration,
-                namespace,
-                None,
-            );
-            let occurrence = self.collector.intern_node(node);
-            let name_occurrence = self.collector.intern_node(name);
-            let declaration = self.collector.declare(occurrence, Some(name_occurrence));
-            let has_source_declaration_unit = parsed
-                .source_declaration_units
-                .iter()
-                .any(|(source, _)| *source == declaration);
-            if has_source_declaration_unit {
-                self.declaration_sources.push((site, declaration));
-                let unit = parsed
+        let names = if matches!(
+            node.kind(),
+            "val_definition" | "var_definition" | "val_declaration" | "var_declaration"
+        ) {
+            let mut cursor = node.walk();
+            node.children_by_field_name("name", &mut cursor)
+                .map(Some)
+                .collect::<Vec<_>>()
+        } else {
+            vec![name]
+        };
+        let mut first_site = None;
+        for (ordinal, name) in names.into_iter().enumerate() {
+            let site_node = if ordinal == 0 {
+                node
+            } else {
+                name.expect("additional value declaration name")
+            };
+            let site = self.add_site(site_node, kind, scope);
+            first_site.get_or_insert(site);
+            self.declaration_sites.entry(node.id()).or_insert(site);
+            self.declaration_nodes.insert(site, node);
+            if node.kind() == "package_object"
+                && let Some(name) = name
+            {
+                let package_declaration =
+                    self.add_site(name, ResolutionSiteKind::PackageDeclaration, scope);
+                self.package_declarations
+                    .insert(node.id(), package_declaration);
+            }
+            if let Some(name) = name {
+                self.identifier(
+                    site,
+                    name,
+                    ResolutionIdentifierRole::Declaration,
+                    namespace,
+                    None,
+                );
+                let occurrence = self.collector.intern_node(node);
+                let name_occurrence = self.collector.intern_node(name);
+                let declaration = self.collector.declare(occurrence, Some(name_occurrence));
+                let has_source_declaration_unit = parsed
                     .source_declaration_units
                     .iter()
-                    .find_map(|(source, unit)| {
-                        if *source != declaration || unit.is_synthetic() {
-                            return None;
-                        }
-                        let matches_declaration_kind = match node.kind() {
-                            "class_definition" | "trait_definition" | "object_definition"
-                            | "enum_definition" | "full_enum_case" | "package_object"
-                            | "type_definition" => unit.is_class(),
-                            "function_definition" | "function_declaration" | "given_definition" => {
-                                unit.is_function()
+                    .any(|(source, _)| *source == declaration);
+                if has_source_declaration_unit {
+                    self.declaration_sources.push((site, declaration));
+                    let unit = parsed
+                        .source_declaration_units
+                        .iter()
+                        .find_map(|(source, unit)| {
+                            if *source != declaration || unit.is_synthetic() {
+                                return None;
                             }
-                            "val_definition" | "var_definition" | "val_declaration"
-                            | "var_declaration" => unit.is_field(),
-                            _ => false,
-                        };
-                        matches_declaration_kind.then_some(unit)
-                    });
-                if let Some(unit) = unit
-                    && self.claimed_definition_units.insert(unit.clone())
-                {
-                    self.facts
-                        .definition_units
-                        .push(ResolutionDefinitionUnitFact {
-                            declaration: site,
-                            unit: unit.clone(),
+                            let matches_declaration_kind = match node.kind() {
+                                "class_definition" | "trait_definition" | "object_definition"
+                                | "enum_definition" | "full_enum_case" | "package_object"
+                                | "type_definition" => unit.is_class(),
+                                "function_definition"
+                                | "function_declaration"
+                                | "given_definition" => unit.is_function(),
+                                "val_definition" | "var_definition" | "val_declaration"
+                                | "var_declaration" => unit.is_field(),
+                                _ => false,
+                            };
+                            matches_declaration_kind.then_some(unit)
                         });
-                }
-                // Only an alias publishes an identity slot: its value arrives
-                // through a transfer. A nominal type has none, so a reference
-                // to it projects the declaration itself as the type object.
-                if node.kind() == "type_definition" {
-                    let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
-                    self.facts
-                        .declaration_type_slots
-                        .push(DeclarationTypeSlotFact {
-                            declaration: site,
-                            slot,
-                            role: DeclarationTypeRole::Identity,
-                        });
-                    // A transparent alias denotes the type it is written as. An
-                    // opaque alias hides that type outside its definition and an
-                    // abstract member has none, so their identity stays open.
-                    if let Some(target) = node.child_by_field_name("type")
-                        && !has_opaque_modifier(node)
+                    if let Some(unit) = unit
+                        && self.claimed_definition_units.insert(unit.clone())
                     {
-                        self.pending_type_aliases.push((site, slot, target));
+                        self.facts
+                            .definition_units
+                            .push(ResolutionDefinitionUnitFact {
+                                declaration: site,
+                                unit: unit.clone(),
+                            });
                     }
+                    // Only an alias publishes an identity slot: its value arrives
+                    // through a transfer. A nominal type has none, so a reference
+                    // to it projects the declaration itself as the type object.
+                    if node.kind() == "type_definition" {
+                        let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+                        self.facts
+                            .declaration_type_slots
+                            .push(DeclarationTypeSlotFact {
+                                declaration: site,
+                                slot,
+                                role: DeclarationTypeRole::Identity,
+                            });
+                        // A transparent alias denotes the type it is written as. An
+                        // opaque alias hides that type outside its definition and an
+                        // abstract member has none, so their identity stays open.
+                        if let Some(target) = node.child_by_field_name("type")
+                            && !has_opaque_modifier(node)
+                        {
+                            self.pending_type_aliases.push((site, slot, target));
+                        }
+                    }
+                    let visibility_eligible = kind == ResolutionSiteKind::TypeDeclaration
+                        || namespace == ResolutionNamespace::Type
+                        || namespace == ResolutionNamespace::Callable
+                        || (member_kind == Some(ResolutionMemberKind::Field)
+                            && type_owner.is_some()
+                            && self.scope(scope).kind == ResolutionScopeKind::TypeBody);
+                    if visibility_eligible {
+                        self.publish_declaration_visibility(site, declaration, source_declarations);
+                    }
+                } else if node.kind() == "package_object" {
+                    // The incumbent Scala declaration model projects package
+                    // object members directly into the package. Preserve the
+                    // package object itself as a native source declaration too.
+                    self.declaration_sources.push((site, declaration));
+                } else {
+                    // A declaration the parser indexes no unit for (a local `def`,
+                    // `type` or class) is still a lexical binder.
+                    self.publish_unitless_declaration(
+                        site,
+                        declaration,
+                        if matches!(node.kind(), "val_declaration" | "var_declaration") {
+                            DeclarationKind::LocalVariable
+                        } else {
+                            DeclarationKind::BlockLocalItem
+                        },
+                    );
                 }
-                let visibility_eligible = kind == ResolutionSiteKind::TypeDeclaration
-                    || namespace == ResolutionNamespace::Type
-                    || namespace == ResolutionNamespace::Callable
-                    || (member_kind == Some(ResolutionMemberKind::Field)
-                        && type_owner.is_some()
-                        && self.scope(scope).kind == ResolutionScopeKind::TypeBody);
-                if visibility_eligible {
-                    self.publish_declaration_visibility(site, declaration, source_declarations);
+                self.publish_declaration_binder(
+                    node,
+                    site,
+                    scope,
+                    type_owner,
+                    namespace,
+                    binder,
+                    member_kind,
+                );
+                if matches!(node.kind(), "val_declaration" | "var_declaration") {
+                    self.add_declared_value_slot(
+                        site,
+                        DeclarationTypeRole::Value,
+                        node.child_by_field_name("type"),
+                    );
                 }
-            } else if node.kind() == "package_object" {
-                // The incumbent Scala declaration model projects package
-                // object members directly into the package. Preserve the
-                // package object itself as a native source declaration too.
-                self.declaration_sources.push((site, declaration));
-            } else {
-                // A declaration the parser indexes no unit for (a local `def`,
-                // `type` or class) is still a lexical binder.
-                self.publish_unitless_declaration(
-                    site,
-                    declaration,
-                    if matches!(node.kind(), "val_declaration" | "var_declaration") {
-                        DeclarationKind::LocalVariable
-                    } else {
-                        DeclarationKind::BlockLocalItem
-                    },
-                );
-            }
-            self.publish_declaration_binder(
-                node,
-                site,
-                scope,
-                type_owner,
-                namespace,
-                binder,
-                member_kind,
-            );
-            if matches!(node.kind(), "val_declaration" | "var_declaration") {
-                self.add_declared_value_slot(
-                    site,
-                    DeclarationTypeRole::Value,
-                    node.child_by_field_name("type"),
-                );
             }
         }
-        Some(site)
+        first_site
     }
 
     /// The visibility the source facts give a declaration. A declaration they
@@ -752,6 +768,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     .push(ResolutionCallableParameterListFact {
                         callable: site,
                         list_ordinal,
+                        contextual: scala_parameter_list_is_contextual(parameters),
                     });
             }
         }
@@ -835,6 +852,17 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         parsed: &ParsedFile,
         source_declarations: &brokk_bifrost_core::analyzer::scala_facts::ScalaSourceFacts,
     ) {
+        // The self-type header's first child is a template alias declaration,
+        // not a reference. Its ascription is lowered normally; the alias is
+        // published after all of those reference projections are available.
+        if node.parent().is_some_and(|parent| {
+            parent.kind() == "self_type"
+                && parent
+                    .named_child(0)
+                    .is_some_and(|binder| binder.id() == node.id())
+        }) {
+            return;
+        }
         let Some(role) = scala_occurrence_role(node) else {
             return;
         };
@@ -929,16 +957,13 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             qualified_path_segments(node, self.source)
         } else {
             None
-        };
+        }
+        .filter(|_| !receiver.is_some_and(|receiver| is_this_identifier(receiver, self.source)));
         // `this.member` looks the member up in the body of the template that
         // contains `this`, with no qualifier value, as Java and Kotlin do.
-        let this_scope = if qualified_segments.is_none() {
-            receiver
-                .filter(|receiver| is_this_identifier(*receiver, self.source))
-                .and_then(|receiver| self.this_type_body_scope(receiver))
-        } else {
-            None
-        };
+        let this_scope = receiver
+            .filter(|receiver| is_this_identifier(*receiver, self.source))
+            .and_then(|receiver| self.this_type_body_scope(receiver));
         let namespace = if this_scope.is_some() && namespace == ResolutionNamespace::TypeOrValue {
             ResolutionNamespace::Value
         } else {
@@ -1133,6 +1158,69 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             activation_start: scope_fact.start_byte,
             activation_end: scope_fact.end_byte,
         });
+        // Match Go's generic-formal frontier: the identity slot is stable,
+        // while its concrete type remains unknown until a call supplies an
+        // explicit positional type argument.
+        self.facts
+            .add_gap(site, ResolutionGapKind::UnsupportedExpressionType);
+    }
+
+    fn finish_generic_formals(&mut self) {
+        let signatures = self.facts.callable_signatures.clone();
+        for signature in signatures {
+            if signature.type_parameter_count == 0 {
+                continue;
+            }
+            let Some(owner_node) = self.declaration_nodes.get(&signature.callable).copied() else {
+                // Compiler-synthesized case-class callables share the class's
+                // parameter declarations; the persisted relation assigns each
+                // formal declaration to one callable owner.
+                continue;
+            };
+            let parameters = owner_node
+                .child_by_field_name("type_parameters")
+                .or_else(|| {
+                    let mut cursor = owner_node.walk();
+                    owner_node
+                        .named_children(&mut cursor)
+                        .find(|child| child.kind() == "type_parameters")
+                });
+            let parameters = parameters.expect("generic Scala callable has type parameters");
+            let mut cursor = parameters.walk();
+            let names = parameters
+                .named_children(&mut cursor)
+                .filter_map(|parameter| {
+                    if matches!(
+                        parameter.kind(),
+                        "covariant_type_parameter" | "contravariant_type_parameter"
+                    ) {
+                        parameter.child_by_field_name("name")
+                    } else if field_name_in_parent(parameters, parameter) == Some("name") {
+                        Some(parameter)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names.len(),
+                usize::try_from(signature.type_parameter_count)
+                    .expect("Scala type parameter count fits usize"),
+                "every callable type parameter has a declaration site"
+            );
+            for (ordinal, node) in names.into_iter().enumerate() {
+                let parameter = self
+                    .sites_by_node
+                    .get(&node.id())
+                    .copied()
+                    .expect("lowered Scala type parameter has a site");
+                self.facts.add_generic_formal(
+                    signature.callable,
+                    u32::try_from(ordinal).expect("Scala generic formal ordinal fits u32"),
+                    parameter,
+                );
+            }
+        }
     }
 
     fn lower_binder(
@@ -1931,6 +2019,140 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         while let Some(node) = stack.pop() {
             let mut cursor = node.walk();
             stack.extend(node.named_children(&mut cursor));
+            if node.kind() == "self_type" {
+                let mut ancestor = node.parent();
+                let subtype = loop {
+                    let Some(candidate) = ancestor else {
+                        break None;
+                    };
+                    if let Some(&site) = self.declaration_sites.get(&candidate.id())
+                        && is_type_declaration(candidate.kind())
+                    {
+                        break Some(site);
+                    }
+                    ancestor = candidate.parent();
+                };
+                if let Some(subtype) = subtype {
+                    let mut parent_ordinal = self
+                        .facts
+                        .supertypes
+                        .iter()
+                        .filter(|edge| edge.subtype == subtype)
+                        .count() as u32;
+                    let mut identity_slots = Vec::new();
+                    for (_, lookup) in scala_self_type_lookup_nodes(node) {
+                        let published = terminal_identifier(lookup)
+                            .and_then(|terminal| self.sites_by_node.get(&terminal.id()).copied())
+                            .and_then(|reference| {
+                                self.projected_slot(
+                                    reference,
+                                    BindingProjectionKind::TargetTypeIdentity,
+                                )
+                                .map(|slot| (reference, slot))
+                            });
+                        let Some((reference, slot)) = published else {
+                            self.gap(subtype, ResolutionGapKind::UnsupportedHierarchyTraversal);
+                            continue;
+                        };
+                        self.facts.supertypes.push(ResolutionSupertypeFact {
+                            subtype,
+                            parent_ordinal,
+                            supertype_reference: reference,
+                            supertype_slot: slot,
+                            kind: ResolutionSupertypeKind::SelfType,
+                        });
+                        identity_slots.push(slot);
+                        self.gap(reference, ResolutionGapKind::UnsupportedHierarchyTraversal);
+                        parent_ordinal = parent_ordinal
+                            .checked_add(1)
+                            .expect("Scala self-type parent ordinal fits u32");
+                    }
+                    let name = node.named_child(0).expect("a self-type has a binder");
+                    if node_text(name, self.source) != "this" {
+                        let scope = self
+                            .facts
+                            .scopes
+                            .iter()
+                            .find(|scope| {
+                                scope.owner == Some(subtype)
+                                    && scope.kind == ResolutionScopeKind::TypeBody
+                            })
+                            .expect("a self-type belongs to its template body")
+                            .id;
+                        let scope_fact = *self.scope(scope);
+                        let alias =
+                            self.add_site(name, ResolutionSiteKind::ValueDeclaration, scope);
+                        self.identifier(
+                            alias,
+                            name,
+                            ResolutionIdentifierRole::Declaration,
+                            ResolutionNamespace::Value,
+                            None,
+                        );
+                        let occurrence = self.collector.intern_node(node);
+                        let name_occurrence = self.collector.intern_node(name);
+                        let declaration = self.collector.declare(occurrence, Some(name_occurrence));
+                        self.publish_unitless_declaration(
+                            alias,
+                            declaration,
+                            DeclarationKind::LocalVariable,
+                        );
+                        self.facts.binders.push(ResolutionBinderFact {
+                            declaration: alias,
+                            scope,
+                            kind: ResolutionBinderKind::Local,
+                            hoisting: HoistingClass::ScopeWide,
+                            activation_start: scope_fact.start_byte,
+                            activation_end: scope_fact.end_byte,
+                        });
+                        if identity_slots.is_empty() {
+                            let identity = if let Some(annotation) = node.named_child(1) {
+                                self.declared_type_identity_slot(alias, annotation)
+                            } else {
+                                // Without an ascription the alias denotes the
+                                // enclosing instance's nominal type.
+                                let identity = self
+                                    .add_slot(subtype, ResolutionTypeSlotRole::TargetTypeIdentity);
+                                self.facts
+                                    .declaration_type_slots
+                                    .push(DeclarationTypeSlotFact {
+                                        declaration: subtype,
+                                        slot: identity,
+                                        role: DeclarationTypeRole::NominalIdentity,
+                                    });
+                                identity
+                            };
+                            identity_slots.push(identity);
+                        }
+                        let value =
+                            self.add_declared_value_slot(alias, DeclarationTypeRole::Value, None);
+                        // Compound bounds share the same multi-input producer
+                        // family as Java type-parameter bounds. The alias value
+                        // then has one ordinary declared-type producer.
+                        let identity = if identity_slots.len() == 1 {
+                            identity_slots[0]
+                        } else {
+                            let union =
+                                self.add_slot(alias, ResolutionTypeSlotRole::TargetTypeIdentity);
+                            for identity in identity_slots {
+                                crate::call_arguments::publish_jvm_type_union_transfer(
+                                    &mut self.facts,
+                                    identity,
+                                    union,
+                                );
+                            }
+                            union
+                        };
+                        crate::call_arguments::publish_jvm_declared_type_transfer(
+                            &mut self.facts,
+                            identity,
+                            value,
+                            ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+                        );
+                    }
+                }
+                continue;
+            }
             let Some(subtype) = self.declaration_sites.get(&node.id()).copied() else {
                 continue;
             };
@@ -2048,9 +2270,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
 
     /// The members the compiler adds to a case class: `copy` on the class, and
     /// `apply` and `unapply` (`unapplySeq` for a repeated parameter) on its
-    /// companion object. The companion is the explicit `object` when the source
-    /// writes one; otherwise the class itself stands in for it, because the
-    /// synthesized companion has no declaration of its own.
+    /// companion object. A missing source companion receives a synthetic site.
     ///
     /// Each member is a callable declaration positioned at the owner's name
     /// token, with the constructor's parameters, and is located at the class's
@@ -2077,6 +2297,35 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         class_site: ResolutionSiteId,
         parsed: &ParsedFile,
     ) {
+        let companion = scala_companion_object(class, self.source);
+        let (companion_node, companion_site, companion_scope, companion_access) = match companion {
+            Some(object) => {
+                let site = self.declaration_sites[&object.id()];
+                let scope = self.scopes_by_node[&object.id()];
+                (
+                    object,
+                    site,
+                    scope,
+                    (
+                        ResolutionMemberAccess::Type,
+                        ResolutionMemberQualifierCompatibility::RuntimeOrType,
+                    ),
+                )
+            }
+            None => {
+                let (site, scope) =
+                    self.add_synthesized_case_class_companion(class, class_site, parsed);
+                (
+                    class,
+                    site,
+                    scope,
+                    (
+                        ResolutionMemberAccess::Type,
+                        ResolutionMemberQualifierCompatibility::TypeOnly,
+                    ),
+                )
+            }
+        };
         let lists = super::declarations::scala_class_parameter_lists(class);
         // Without a parameter list the class has no constructor to locate the
         // members at.
@@ -2126,23 +2375,6 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 has_default: has_field_descendant(parameter, "default_value"),
             });
         }
-        let companion = scala_companion_object(class.node, source);
-        let (companion_node, companion_access) = match companion {
-            Some(object) => (
-                object,
-                (
-                    ResolutionMemberAccess::Type,
-                    ResolutionMemberQualifierCompatibility::RuntimeOrType,
-                ),
-            ),
-            None => (
-                class.node,
-                (
-                    ResolutionMemberAccess::Type,
-                    ResolutionMemberQualifierCompatibility::TypeOnly,
-                ),
-            ),
-        };
         let extractor = if scala_case_class_has_repeated_parameter(class.node) {
             "unapplySeq"
         } else {
@@ -2153,6 +2385,8 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             ScalaCaseMember {
                 name: "apply",
                 owner: companion_node,
+                owner_site: companion_site,
+                owner_scope: companion_scope,
                 access: companion_access,
                 parameters: modeled.then(|| mirrored.clone()),
                 returns_class: true,
@@ -2163,6 +2397,8 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             ScalaCaseMember {
                 name: extractor,
                 owner: companion_node,
+                owner_site: companion_site,
+                owner_scope: companion_scope,
                 access: companion_access,
                 parameters: Some(vec![ScalaCaseMemberParameter {
                     label: "x$0",
@@ -2177,6 +2413,8 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             ScalaCaseMember {
                 name: "copy",
                 owner: class.node,
+                owner_site: class.site,
+                owner_scope: self.scopes_by_node[&class.node.id()],
                 access: (
                     ResolutionMemberAccess::Instance,
                     ResolutionMemberQualifierCompatibility::RuntimeOnly,
@@ -2197,6 +2435,82 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             .insert(class.node.id(), (apply, unapply));
     }
 
+    fn add_synthesized_case_class_companion(
+        &mut self,
+        class: Node<'source>,
+        class_site: ResolutionSiteId,
+        parsed: &ParsedFile,
+    ) -> (ResolutionSiteId, ResolutionScopeId) {
+        let source_declaration = self
+            .declaration_sources
+            .iter()
+            .find_map(|(site, declaration)| (*site == class_site).then_some(*declaration))
+            .expect("a non-local case class has a source declaration");
+        let class_unit = parsed
+            .source_declaration_units
+            .iter()
+            .find_map(|(declaration, unit)| (*declaration == source_declaration).then_some(unit))
+            .expect("a case class source declaration has a code unit");
+        let name = declaration_name(class).expect("a named Scala case class");
+        let name_text = node_text(name, self.source).trim();
+        let companion_fq = class_unit
+            .fq()
+            .parent()
+            .expect("a class code unit has an enclosing name")
+            .with_pushed(segment_interner().intern(name_text, SegmentKind::Companion));
+        let companion_unit = CodeUnit::with_signature_and_fq(
+            class_unit.source().clone(),
+            CodeUnitType::Class,
+            class_unit.package_name(),
+            format!("{}$", class_unit.short_name()),
+            None,
+            true,
+            companion_fq,
+        );
+        let parent_scope = self.facts.sites[class_site.index()].scope;
+        let occurrence = self.collector.intern_subspan_bytes(
+            name.start_byte(),
+            name.end_byte(),
+            SourceOccurrenceProvenance::ExplicitSubspan,
+        );
+        let declaration = self.collector.declare(occurrence, Some(occurrence));
+        let site = self.push_site(
+            occurrence,
+            ResolutionSiteKind::TypeDeclaration,
+            parent_scope,
+        );
+        self.identifier(
+            site,
+            name,
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Type,
+            None,
+        );
+        self.declaration_sources.push((site, declaration));
+        self.facts
+            .definition_units
+            .push(ResolutionDefinitionUnitFact {
+                declaration: site,
+                unit: companion_unit,
+            });
+        let scope = ResolutionScopeId::try_from_index(self.facts.scopes.len())
+            .expect("Scala resolution scope count fits u32");
+        let range = node_range(name);
+        self.facts.scopes.push(ResolutionScopeFact {
+            id: scope,
+            parent: Some(parent_scope),
+            owner: Some(site),
+            kind: ResolutionScopeKind::TypeBody,
+            inheritance: ResolutionScopeInheritance::Lexical,
+            start_byte: range.start_byte,
+            end_byte: range.end_byte,
+        });
+        self.scope_ranges.push(range);
+        self.synthesized_case_class_companions
+            .insert(class.id(), site);
+        (site, scope)
+    }
+
     /// Publish one compiler-added member, unless the source already declares a
     /// member of that name (and, for the companion's `apply` and `unapply`, the
     /// same parameter count) in the owner: the written member replaces it.
@@ -2205,8 +2519,8 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         class: &ScalaCaseClass<'source>,
         member: ScalaCaseMember<'source>,
     ) -> Option<ResolutionSiteId> {
-        let owner_site = self.declaration_sites.get(&member.owner.id()).copied()?;
-        let owner_scope = self.scopes_by_node.get(&member.owner.id()).copied()?;
+        let owner_site = member.owner_site;
+        let owner_scope = member.owner_scope;
         let same_count = (member.owner.id() != class.node.id())
             .then(|| member.parameters.as_ref().map(Vec::len))
             .flatten();
@@ -2266,6 +2580,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             .push(ResolutionCallableParameterListFact {
                 callable: site,
                 list_ordinal: 0,
+                contextual: false,
             });
         // The parameters live in a scope of their own, so that their names do
         // not become binders of the owner's body.
@@ -2447,7 +2762,17 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 self.gap(call, ResolutionGapKind::UnsupportedCallApplicability);
                 continue;
             };
-            let Some(callee_node) = terminal_identifier(function) else {
+            let generic_function = (function.kind() == "generic_function").then_some(function);
+            let explicit_type_arguments = generic_function
+                .and_then(|function| function.child_by_field_name("type_arguments"))
+                .map(|arguments| {
+                    let mut cursor = arguments.walk();
+                    arguments.named_children(&mut cursor).collect::<Vec<_>>()
+                });
+            let callable_function = generic_function
+                .and_then(|function| function.child_by_field_name("function"))
+                .unwrap_or(function);
+            let Some(callee_node) = terminal_identifier(callable_function) else {
                 self.gap(call, ResolutionGapKind::UnsupportedCallApplicability);
                 continue;
             };
@@ -2613,8 +2938,44 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 receiver,
                 result,
                 extra_result_slots: Vec::new(),
-                explicit_type_argument_count: 0,
+                explicit_type_argument_count: explicit_type_arguments.as_ref().map_or(
+                    0,
+                    |arguments| {
+                        u32::try_from(arguments.len())
+                            .expect("Scala explicit call type argument count fits u32")
+                    },
+                ),
             });
+            if let Some(arguments) = explicit_type_arguments {
+                for (ordinal, argument) in arguments.into_iter().enumerate() {
+                    let identity = self.declared_type_identity_slot(call, argument);
+                    let value = self.add_slot(call, ResolutionTypeSlotRole::DeclaredValue);
+                    self.facts.type_transfers.push(ResolutionTypeTransferFact {
+                        input: identity,
+                        output: value,
+                        kind: ResolutionTypeTransferKind::DeclaredType,
+                        indirection_delta: 0,
+                        reference_indirection_delta: 0,
+                        value_transform: ResolutionTypeTransferValueTransform::ToRuntime {
+                            addressable: false,
+                        },
+                    });
+                    self.facts
+                        .call_type_arguments
+                        .push(ResolutionCallTypeArgumentFact {
+                            call,
+                            ordinal: u32::try_from(ordinal)
+                                .expect("Scala explicit type argument count fits u32"),
+                            value,
+                        });
+                }
+            }
+            self.facts
+                .engine_rule_eligibilities
+                .push(ResolutionEngineRuleEligibilityFact {
+                    site: call,
+                    rule: ResolutionEngineRuleKind::DirectOwnerExactPrimitiveDominance,
+                });
         }
     }
 
@@ -2627,6 +2988,20 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         declaration: ResolutionSiteId,
         type_node: Node<'source>,
     ) -> ResolutionTypeSlotId {
+        if let Some(name) = scala_intrinsic_declared_type_name(type_node) {
+            let scope = self.facts.sites[declaration.index()].scope;
+            let type_site = self.add_site(type_node, ResolutionSiteKind::TypeReference, scope);
+            let slot = self.add_slot(type_site, ResolutionTypeSlotRole::TargetTypeIdentity);
+            let name = self.intern_name(&name);
+            self.facts.intrinsic_type_seeds.push(
+                brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeSeedFact::direct(
+                    slot,
+                    name,
+                    brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind::LanguageBuiltin,
+                ),
+            );
+            return slot;
+        }
         scala_callable_result_type_head(type_node)
             .and_then(|head| self.sites_by_node.get(&head.id()).copied())
             .and_then(|reference| {
@@ -2792,6 +3167,16 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             }
             if node.kind() == "class_definition" && has_case_modifier(node) {
                 self.add_case_class_companion_aliases(node, site);
+                if !scala_has_companion_object(node, self.source) {
+                    let companion = self.synthesized_case_class_companions[&node.id()];
+                    self.facts
+                        .singleton_relations
+                        .push(ResolutionSingletonRelationFact {
+                            declaration: companion,
+                            enclosing_type: Some(site),
+                            kind: ResolutionSingletonRelationKind::Companion,
+                        });
+                }
             }
             if !matches!(node.kind(), "object_definition" | "package_object") {
                 continue;
@@ -4581,6 +4966,13 @@ fn is_type_parameter_name(node: Node<'_>) -> bool {
     })
 }
 
+fn scala_parameter_list_is_contextual(parameters: Node<'_>) -> bool {
+    let mut cursor = parameters.walk();
+    parameters
+        .children(&mut cursor)
+        .any(|child| matches!(child.kind(), "implicit" | "using"))
+}
+
 fn type_parameter_count(node: Node<'_>) -> u32 {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
@@ -5115,8 +5507,14 @@ fn is_call_target(node: Node<'_>) -> bool {
             let is_function = parent
                 .child_by_field_name("function")
                 .is_some_and(|function| function.id() == child.id());
-            return is_function
-                && terminal_identifier(child).is_some_and(|terminal| terminal.id() == node.id());
+            let callable = if child.kind() == "generic_function" {
+                child
+                    .child_by_field_name("function")
+                    .and_then(terminal_identifier)
+            } else {
+                terminal_identifier(child)
+            };
+            return is_function && callable.is_some_and(|terminal| terminal.id() == node.id());
         }
         if matches!(
             parent.kind(),
@@ -5364,9 +5762,34 @@ fn scala_callable_result_type_head(node: Node<'_>) -> Option<Node<'_>> {
                     .named_children(&mut cursor)
                     .find(|child| child.kind() != "annotation")?;
             }
+            "repeated_parameter_type" | "by_name_type" | "lazy_parameter_type" => {
+                let mut cursor = current.walk();
+                current = current.named_children(&mut cursor).next()?;
+            }
             _ => return None,
         }
     }
+}
+
+fn scala_intrinsic_declared_type_name(node: Node<'_>) -> Option<String> {
+    let arity = match node.kind() {
+        "function_type" => {
+            let parameters = node.child_by_field_name("parameter_types")?;
+            let mut cursor = parameters.walk();
+            parameters.named_children(&mut cursor).count()
+        }
+        "tuple_type" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor).count()
+        }
+        _ => return None,
+    };
+    let constructor = match node.kind() {
+        "function_type" => "scala.Function",
+        "tuple_type" => "scala.Tuple",
+        _ => unreachable!(),
+    };
+    Some(format!("{constructor}{arity}"))
 }
 
 fn contains_kind(root: Node<'_>, kind: &str) -> bool {
@@ -5412,6 +5835,166 @@ mod tests {
             .expect("Scala grammar");
         let tree = parser.parse(source, None).expect("Scala syntax tree");
         crate::scala::declarations::parse_scala_file(&file, source, &tree)
+    }
+
+    #[test]
+    #[hardwon(
+        "#3499: secondary val/var declaration names had no inherited member or declared-type rows"
+    )]
+    fn multi_name_member_declarations_share_ascription_projections() {
+        let parsed = parse(
+            "package app\ntrait Members { val qualifier, other: String; var current, previous: String }\n",
+        );
+        let facts = &parsed.resolution_facts;
+        let declaration = |name: &str| {
+            facts
+                .identifiers
+                .iter()
+                .find(|identifier| {
+                    identifier.role == ResolutionIdentifierRole::Declaration
+                        && facts.names[identifier.name.index()].spelling == name
+                })
+                .expect("each name has a declaration")
+                .site
+        };
+        let owner = declaration("Members");
+        for names in [["qualifier", "other"], ["current", "previous"]] {
+            let mut inputs = Vec::new();
+            for name in names {
+                let site = declaration(name);
+                let member = facts
+                    .member_owners
+                    .iter()
+                    .find(|row| row.member == site)
+                    .expect("each name has a member-owner row");
+                assert_eq!(member.owner, owner);
+                assert_eq!(member.kind, ResolutionMemberKind::Field);
+                let slot = facts
+                    .declaration_type_slots
+                    .iter()
+                    .find(|row| row.declaration == site)
+                    .expect("each name has a declared-value slot");
+                assert_eq!(slot.role, DeclarationTypeRole::Value);
+                let transfer = facts
+                    .type_transfers
+                    .iter()
+                    .find(|row| row.output == slot.slot)
+                    .expect("each declared value takes its ascribed type");
+                assert_eq!(transfer.kind, ResolutionTypeTransferKind::DeclaredType);
+                inputs.push(transfer.input);
+            }
+            assert_eq!(
+                inputs[0], inputs[1],
+                "a multi-name declaration shares its ascription projection"
+            );
+            assert_eq!(
+                facts.type_slots[inputs[0].index()].role,
+                ResolutionTypeSlotRole::TargetTypeIdentity
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#2771: self-type headers poisoned member lookup with an unsupported binder gap")]
+    fn self_type_aliases_are_template_scoped_and_reuse_ascribed_projections() {
+        let parsed = parse(
+            "trait Tokens\ntrait Named { self: Tokens => }\ntrait Anonymous { this: Tokens => }\ntrait Plain { self => }\n",
+        );
+        let facts = &parsed.resolution_facts;
+        assert!(
+            !facts
+                .gaps
+                .iter()
+                .any(|gap| gap.kind == ResolutionGapKind::UnsupportedScopeOrBinder),
+            "self-type headers have structured binder support: {:?}",
+            facts.gaps
+        );
+        assert!(
+            !facts
+                .identifiers
+                .iter()
+                .any(|identifier| { facts.names[identifier.name.index()].spelling == "this" })
+        );
+        let aliases = facts
+            .identifiers
+            .iter()
+            .filter(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Declaration
+                    && facts.names[identifier.name.index()].spelling == "self"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 2);
+        for alias in aliases {
+            let binder = facts
+                .binders
+                .iter()
+                .find(|binder| binder.declaration == alias.site)
+                .expect("self alias binder");
+            let scope = &facts.scopes[binder.scope.index()];
+            assert_eq!(scope.kind, ResolutionScopeKind::TypeBody);
+            assert_eq!(binder.hoisting, HoistingClass::ScopeWide);
+            assert_eq!(binder.activation_start, scope.start_byte);
+            assert_eq!(binder.activation_end, scope.end_byte);
+            let value = facts
+                .declaration_type_slots
+                .iter()
+                .find(|value| value.declaration == alias.site)
+                .expect("self alias value type");
+            assert_eq!(value.role, DeclarationTypeRole::Value);
+            if let Some(edge) = facts
+                .supertypes
+                .iter()
+                .find(|edge| Some(edge.subtype) == scope.owner)
+            {
+                assert_eq!(edge.kind, ResolutionSupertypeKind::SelfType);
+                assert!(
+                    facts.type_transfers.iter().any(|transfer| {
+                        transfer.input == edge.supertype_slot && transfer.output == value.slot
+                    }),
+                    "self alias uses its parent's identity projection: {:?}",
+                    facts.type_transfers
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn self_type_bounds_publish_edges_without_becoming_nominal_subtypes() {
+        let parsed = parse("trait Rules { this: Tokens with Audited => def run(): Unit = () }\n");
+        let facts = &parsed.resolution_facts;
+        let rules = facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Declaration
+                    && facts.names[identifier.name.index()].spelling == "Rules"
+            })
+            .expect("Rules declaration");
+        let mut edges = facts
+            .supertypes
+            .iter()
+            .filter(|edge| edge.subtype == rules.site)
+            .collect::<Vec<_>>();
+        edges.sort_by_key(|edge| edge.parent_ordinal);
+        assert_eq!(edges.len(), 2, "self-type edges: {edges:?}");
+        assert_eq!(edges[0].kind, ResolutionSupertypeKind::SelfType);
+        assert_eq!(edges[1].kind, ResolutionSupertypeKind::SelfType);
+        for (edge, expected_name) in edges.into_iter().zip(["Tokens", "Audited"]) {
+            assert!(facts.identifiers.iter().any(|identifier| {
+                identifier.site == edge.supertype_reference
+                    && identifier.role == ResolutionIdentifierRole::Reference
+                    && facts.names[identifier.name.index()].spelling == expected_name
+            }));
+            assert!(facts.binding_projections.iter().any(|projection| {
+                projection.reference == edge.supertype_reference
+                    && projection.output == edge.supertype_slot
+                    && projection.kind == BindingProjectionKind::TargetTypeIdentity
+            }));
+            assert!(facts.gaps.iter().any(|gap| {
+                gap.site == edge.supertype_reference
+                    && gap.kind == ResolutionGapKind::UnsupportedHierarchyTraversal
+            }));
+        }
     }
 
     #[test]
@@ -5536,7 +6119,8 @@ mod tests {
         );
         assert_eq!(copy.access, ResolutionMemberAccess::Instance);
 
-        // With no written companion the class stands in for it.
+        // With no written companion, generated companion members have a
+        // distinct synthetic owner and the class retains only instance members.
         let solo = facts
             .sites
             .iter()
@@ -5546,11 +6130,19 @@ mod tests {
             .filter(|site| members_of(*site).iter().any(|(name, _)| *name == "copy"))
             .find(|site| *site != point_class)
             .expect("Solo owns its members");
-        let solo_members = members_of(solo);
-        let apply = solo_members
+        let companion = facts
+            .singleton_relations
+            .iter()
+            .find(|relation| {
+                relation.kind == ResolutionSingletonRelationKind::Companion
+                    && relation.enclosing_type == Some(solo)
+            })
+            .expect("Solo has a synthesized companion relation");
+        let companion_members = members_of(companion.declaration);
+        let apply = companion_members
             .iter()
             .find(|(name, _)| *name == "apply")
-            .expect("the stand-in companion has apply")
+            .expect("the synthesized companion has apply")
             .1;
         assert_eq!(parameters_of(apply.member), [("v", false)]);
         assert_eq!(
@@ -5560,6 +6152,7 @@ mod tests {
                 ResolutionMemberQualifierCompatibility::TypeOnly
             )
         );
+        assert_ne!(companion.declaration, solo);
         for (name, expected) in [("apply", 1), ("unapply", 2)] {
             assert_eq!(
                 facts
@@ -5569,6 +6162,52 @@ mod tests {
                     .count(),
                 expected,
                 "a JVM alias of the synthesized `{name}`: the written `apply` of Point replaces its synthesized one"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "8b8fb64b96ee: a case class without a written companion had no companion relation for synthesized extractor members"
+    )]
+    fn case_classes_without_companions_publish_synthesized_companion_relations() {
+        let parsed = parse(
+            "package demo\n\
+             case class Solo(v: Int)\n\
+             object Outer { case class Nested(v: Int) }\n",
+        );
+        let facts = &parsed.resolution_facts;
+        for name in ["Solo", "Nested"] {
+            let class = facts
+                .identifiers
+                .iter()
+                .find(|identifier| {
+                    identifier.role == ResolutionIdentifierRole::Declaration
+                        && facts.names[identifier.name.index()].spelling == name
+                })
+                .unwrap_or_else(|| panic!("missing case class {name}"))
+                .site;
+            let relation = facts
+                .singleton_relations
+                .iter()
+                .find(|relation| {
+                    relation.kind == ResolutionSingletonRelationKind::Companion
+                        && relation.enclosing_type == Some(class)
+                })
+                .unwrap_or_else(|| panic!("missing synthesized companion relation for {name}"));
+            assert_ne!(
+                relation.declaration, class,
+                "{name} needs a distinct companion identity"
+            );
+            assert!(
+                facts.member_owners.iter().any(|member| {
+                    member.owner == relation.declaration
+                        && facts.identifiers.iter().any(|identifier| {
+                            identifier.site == member.member
+                                && facts.names[identifier.name.index()].spelling == "unapply"
+                        })
+                }),
+                "{name}'s synthesized companion must own its extractor"
             );
         }
     }
@@ -5915,6 +6554,60 @@ mod tests {
             transfer.output == receiver && transfer.kind == ResolutionTypeTransferKind::Receiver
         }));
         assert_eq!(facts.type_slots[receiver.index()].site, sink_call.call);
+    }
+
+    #[test]
+    #[hardwon(
+        "5020e82c89c6: Scala explicit call type arguments were omitted from applicability obligations"
+    )]
+    fn scala_explicit_method_type_arguments_publish_call_slots() {
+        let source = "package conformance\n\
+            final class GenericWorker {\n\
+              def identity[A](value: A): A = value\n\
+            }\n\
+            object GenericCaller {\n\
+              def identity[A](value: A): A = value\n\
+              def root(worker: GenericWorker): Int = {\n\
+                val direct = identity[Int](7)\n\
+                worker.identity[Int](7)\n\
+              }\n\
+            }\n";
+        let parsed = parse(source);
+        let facts = &parsed.resolution_facts;
+        let explicit_calls = facts
+            .calls
+            .iter()
+            .filter(|call| call.explicit_type_argument_count == 1)
+            .collect::<Vec<_>>();
+        assert_eq!(explicit_calls.len(), 2, "calls={:?}", facts.calls);
+        for call in explicit_calls {
+            let arguments = facts
+                .call_type_arguments
+                .iter()
+                .filter(|argument| argument.call == call.call)
+                .collect::<Vec<_>>();
+            let [argument] = arguments.as_slice() else {
+                panic!("one type-argument slot for {call:?}");
+            };
+            assert_eq!(argument.ordinal, 0);
+            let type_argument_transfer = facts
+                .type_transfers
+                .iter()
+                .find(|transfer| {
+                    transfer.output == argument.value
+                        && transfer.kind == ResolutionTypeTransferKind::DeclaredType
+                })
+                .expect("explicit type argument has a declared-type transfer");
+            assert!(facts.binding_projections.iter().any(|projection| {
+                projection.output == type_argument_transfer.input
+                    && projection.kind == BindingProjectionKind::TargetTypeIdentity
+                    && facts.identifiers.iter().any(|identifier| {
+                        identifier.site == projection.reference
+                            && identifier.namespace == ResolutionNamespace::Type
+                            && facts.names[identifier.name.index()].spelling == "Int"
+                    })
+            }));
+        }
     }
 
     #[test]
@@ -6615,6 +7308,28 @@ mod tests {
                 slot.declaration == binder.declaration && slot.role == DeclarationTypeRole::Identity
             }));
         }
+        let convert = declaration_named("convert").expect("generic callable declaration");
+        let generic_formals = facts
+            .generic_formals
+            .iter()
+            .filter(|formal| formal.owner == convert)
+            .collect::<Vec<_>>();
+        assert_eq!(generic_formals.len(), 1);
+        assert_eq!(generic_formals[0].ordinal, 0);
+        assert_eq!(
+            facts.names[facts
+                .identifiers
+                .iter()
+                .find(|identifier| {
+                    identifier.site == generic_formals[0].parameter
+                        && identifier.role == ResolutionIdentifierRole::Declaration
+                })
+                .expect("generic formal has declaration name")
+                .name
+                .index()]
+            .spelling,
+            "T"
+        );
         assert!(
             references_named("Bound").len() >= 3,
             "type bounds and annotations"
@@ -6709,6 +7424,14 @@ mod tests {
         }));
         let box_type = declaration_named("Box").expect("class or companion declaration");
         let pair_type = declaration_named("Pair").expect("case class declaration");
+        let pair_companion = facts
+            .singleton_relations
+            .iter()
+            .find(|relation| {
+                relation.kind == ResolutionSingletonRelationKind::Companion
+                    && relation.enclosing_type == Some(pair_type)
+            })
+            .map_or(pair_type, |relation| relation.declaration);
         assert!(!facts.gaps.iter().any(|gap| {
             gap.site == pair_type && gap.kind == ResolutionGapKind::UnsupportedRoute
         }));
@@ -6723,11 +7446,9 @@ mod tests {
         for (member, parameter_count) in [("apply", 2), ("unapply", 1)] {
             assert!(
                 facts.jvm_aliases.iter().any(|alias| {
-                    facts
-                        .member_owners
-                        .iter()
-                        .any(|owner| owner.member == alias.declaration && owner.owner == pair_type)
-                        && alias.kind == ResolutionJvmAliasKind::Method
+                    facts.member_owners.iter().any(|owner| {
+                        owner.member == alias.declaration && owner.owner == pair_companion
+                    }) && alias.kind == ResolutionJvmAliasKind::Method
                         && facts.names[alias.member_name.index()].spelling == member
                         && alias.parameter_count == parameter_count
                         && alias.status == ResolutionJvmAliasStatus::CompilerModeDependent
@@ -6782,13 +7503,6 @@ mod tests {
         }));
         assert!(!facts.gaps.iter().any(|gap| {
             gap.site == box_object.declaration && gap.kind == ResolutionGapKind::UnsupportedRoute
-        }));
-        assert!(facts.gaps.iter().any(|gap| {
-            gap.kind == ResolutionGapKind::UnsupportedScopeOrBinder
-                && facts.sites[gap.site.index()].kind == ResolutionSiteKind::UnsupportedDeclaration
-                && source[facts.sites[gap.site.index()].start_byte
-                    ..facts.sites[gap.site.index()].end_byte]
-                    .starts_with("self:")
         }));
         assert!(facts.extension_receivers.iter().any(|receiver| {
             facts.identifiers.iter().any(|identifier| {
@@ -7216,23 +7930,30 @@ mod tests {
         assert_eq!(owner_segments(encode_alias), ["example", "Outer$Nested"]);
 
         let nested_case = declaration_named("NestedCase").expect("nested case class");
+        let nested_companion = facts
+            .singleton_relations
+            .iter()
+            .find(|relation| {
+                relation.kind == ResolutionSingletonRelationKind::Companion
+                    && relation.enclosing_type == Some(nested_case)
+            })
+            .map_or(nested_case, |relation| relation.declaration);
         assert!(!facts.gaps.iter().any(|gap| {
             gap.site == nested_case && gap.kind == ResolutionGapKind::UnsupportedRoute
         }));
         assert!(facts.additional_definition_namespaces.iter().any(|fact| {
             fact.declaration == nested_case && fact.namespace == ResolutionNamespace::Value
         }));
-        let nested_apply =
-            facts
-                .jvm_aliases
-                .iter()
-                .find(|alias| {
-                    facts.member_owners.iter().any(|owner| {
-                        owner.member == alias.declaration && owner.owner == nested_case
-                    }) && alias.kind == ResolutionJvmAliasKind::Method
-                        && facts.names[alias.member_name.index()].spelling == "apply"
-                })
-                .expect("nested case class companion apply alias");
+        let nested_apply = facts
+            .jvm_aliases
+            .iter()
+            .find(|alias| {
+                facts.member_owners.iter().any(|owner| {
+                    owner.member == alias.declaration && owner.owner == nested_companion
+                }) && alias.kind == ResolutionJvmAliasKind::Method
+                    && facts.names[alias.member_name.index()].spelling == "apply"
+            })
+            .expect("nested case class companion apply alias");
         assert_eq!(
             owner_segments(nested_apply),
             ["example", "Outer$NestedCase$"]

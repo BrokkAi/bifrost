@@ -1131,6 +1131,7 @@ pub(super) fn remount_member_owner(
         translation.semantic(property.definition()),
         translation.semantic(property.owner_definition()),
         translation.node(property.owner_scope_head()),
+        property.member_name(),
         property.kind(),
         property.access(),
         property.qualifier_compatibility(),

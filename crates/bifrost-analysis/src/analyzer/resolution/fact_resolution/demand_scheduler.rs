@@ -4,11 +4,13 @@
 //! endpoint becomes readable once, after all of its positioned prefix tasks
 //! finish. Cyclic selected-root dependencies still return no answer.
 
+use super::completed_roots::RootMemoKey;
 use super::*;
 
 pub(super) struct Resources<'resources, 'source> {
     pub(super) session: &'resources mut FactReadSession<'source>,
     pub(super) hierarchy: &'resources mut HierarchyOperationArena,
+    pub(super) completed_roots: Option<(&'resources SelectedDemandState, u64, [u8; 32])>,
     pub(super) forward_candidate_artifacts: &'resources mut ForwardCandidateArtifactCache,
 }
 
@@ -297,6 +299,7 @@ pub(crate) enum BatchOutcome {
 
 struct Task<'a> {
     root: SemanticId,
+    memo_key: Option<RootMemoKey>,
     frame: Option<DemandFactEvaluationTask<'a>>,
     answer: Option<FactResolutionAnswer>,
     /// This task's own frame metrics, mirrored after every poll of it.
@@ -460,6 +463,7 @@ impl<'a> Scheduler<'a> {
         let id = self.tasks.len();
         self.tasks.push(Task {
             root,
+            memo_key: None,
             frame: Some(DemandFactEvaluationTask::new(state)),
             answer: None,
             metrics: ResolutionBatchMetrics::default(),
@@ -474,6 +478,16 @@ impl<'a> Scheduler<'a> {
         assert!(self.task_ids.insert(root, id).is_none());
         self.runnable.push_back(Runnable::Task(id));
         Some(id)
+    }
+
+    fn retain_completed_roots(&self, operation: &Resources<'_, '_>) {
+        if let Some((memo, _, _)) = operation.completed_roots {
+            for task in &self.tasks {
+                if let (Some(key), Some(answer)) = (&task.memo_key, &task.answer) {
+                    memo.retain(key, answer, operation.session);
+                }
+            }
+        }
     }
 
     /// One resolution per input root, in input order.
@@ -724,6 +738,7 @@ fn resolve_admitted_batch<'a>(
         if answered_roots == root_task_count {
             // Selected authority is still finalized by the enclosing owner;
             // these are internal completed tasks, not public native results.
+            scheduler.retain_completed_roots(operation);
             return Ok(BatchOutcome::Ready(scheduler.take_root_resolutions(
                 &root_tasks,
                 root_task_count,
@@ -747,6 +762,7 @@ fn resolve_admitted_batch<'a>(
             )? {
                 RoundOutcome::Continue => continue,
                 RoundOutcome::Ready => {
+                    scheduler.retain_completed_roots(operation);
                     return Ok(BatchOutcome::Ready(scheduler.take_root_resolutions(
                         &root_tasks,
                         root_task_count,
@@ -912,7 +928,31 @@ fn poll_round<'a>(
             .as_mut()
             .expect("runnable task is live")
             .inject_closure_discharges(&scheduler.closure_discharges);
-        let polled = {
+        let cached = if let Some((memo, access, context)) = operation.completed_roots {
+            let task = &mut scheduler.tasks[id];
+            let evaluation = task
+                .frame
+                .as_ref()
+                .expect("runnable task is live")
+                .evaluation
+                .as_ref()
+                .expect("task is between polls");
+            if task.memo_key.is_none() {
+                task.memo_key = evaluation.root_seed.as_ref().and_then(|seed| {
+                    RootMemoKey::new(operation.session, task.root, seed, access, context)
+                });
+                task.memo_key
+                    .as_ref()
+                    .and_then(|key| memo.lookup(key, operation.session))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let polled = if let Some(answer) = cached {
+            Ok(DemandFactEvaluationPoll::Ready(Box::new(answer)))
+        } else {
             let relations = &scheduler.relations;
             let relation_ids = &scheduler.relation_ids;
             let claims = &mut scheduler.claims;
@@ -1012,7 +1052,7 @@ fn poll_round<'a>(
                     if !evaluation.publish_qualified_hierarchy_reference(
                         root,
                         scheduler.tasks[id].answer.as_ref().unwrap(),
-                    ) {
+                    )? {
                         return Ok(RoundOutcome::Cancelled);
                     }
                 }
@@ -1057,7 +1097,7 @@ fn poll_round<'a>(
                     if let Some(answer) = &scheduler.tasks[dependency].answer {
                         let mut evaluation =
                             FactEvaluation::new(operation.session, operation.hierarchy, reference);
-                        if !evaluation.publish_qualified_hierarchy_reference(reference, answer) {
+                        if !evaluation.publish_qualified_hierarchy_reference(reference, answer)? {
                             return Ok(RoundOutcome::Cancelled);
                         }
                     } else {

@@ -37,6 +37,20 @@ macro_rules! impl_program_semantics_provider {
                 )
             }
 
+            fn storage_language_key_for_file(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+            ) -> Option<$crate::analyzer::semantic::StorageLanguageKey> {
+                Some(
+                    $crate::analyzer::semantic::StorageLanguageKey::from_adapter(
+                        $crate::analyzer::tree_sitter_analyzer::LanguageAdapter::storage_language_key_for_file(
+                            self.inner.adapter(),
+                            file,
+                        ),
+                    ),
+                )
+            }
+
             fn materialize(
                 &self,
                 file: &$crate::analyzer::ProjectFile,
@@ -94,6 +108,20 @@ macro_rules! impl_program_semantics_provider {
                     &lowerer,
                     file,
                     max_source_bytes,
+                )
+            }
+
+            fn storage_language_key_for_file(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+            ) -> Option<$crate::analyzer::semantic::StorageLanguageKey> {
+                Some(
+                    $crate::analyzer::semantic::StorageLanguageKey::from_adapter(
+                        $crate::analyzer::tree_sitter_analyzer::LanguageAdapter::storage_language_key_for_file(
+                            self.inner.adapter(),
+                            file,
+                        ),
+                    ),
                 )
             }
 

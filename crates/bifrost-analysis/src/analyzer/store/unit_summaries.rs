@@ -338,11 +338,7 @@ pub(super) const DELETE_STALE_GENERATION_VERSIONS_SQL: &str =
        (SELECT generation FROM analysis_epochs
         WHERE analysis_epochs.lang = resolution_unit_summary_versions.lang), 0)";
 
-/// Delete the headers no version row binds; the children cascade. Shared
-/// headers that another workspace still binds stay.
-pub(super) const DELETE_UNBOUND_SUMMARIES_SQL: &str = "DELETE FROM resolution_unit_summaries
-     WHERE NOT EXISTS (SELECT 1 FROM resolution_unit_summary_versions AS versions
-                       WHERE versions.summary_id = resolution_unit_summaries.summary_id)";
+pub(super) use brokk_bifrost_core::cache_gc::DELETE_UNBOUND_SUMMARIES_SQL;
 
 const OPEN_VERSION_SQL: &str = "SELECT summary_id, valid_from FROM resolution_unit_summary_versions
      WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3 AND unit_key = ?4
@@ -494,7 +490,7 @@ impl AnalyzerStore {
         let snapshot = snapshot.clone();
         let cancellation = cancellation.clone();
         let statements = self.statement_counter();
-        self.conn.execute(move |conn| {
+        self.execute_selection_publication(move |conn| {
             let started = Instant::now();
             let statements_before = statements.count();
             let _trace = StatementCount::register(conn, &statements);
@@ -1050,11 +1046,8 @@ fn close_unsettled(
             ],
         )?;
     }
-    // A profile replacement or a failed unit unbinds headers; delete them with
-    // the rows that bound them.
-    if report.closed_versions > 0 || report.rederived > 0 {
-        tx.execute(DELETE_UNBOUND_SUMMARIES_SQL, [])?;
-    }
+    // Unbound content-addressed headers remain reusable by another build until
+    // periodic GC, including when this pass switches a same-revision profile.
     tx.commit()?;
     Ok(())
 }

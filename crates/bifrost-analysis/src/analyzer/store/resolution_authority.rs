@@ -65,9 +65,16 @@ impl AuthorityValidations {
 /// Published answers read by one selected operation, bounded by its touched keys.
 #[derive(Default)]
 pub(super) struct AuthorityRequestMemo {
+    /// Canonical content reached by this query. Supplemental aliases are never
+    /// reused inside the query; cleanup leaves their high-water counters intact.
+    pub(super) canonical_digests:
+        HashMap<crate::analyzer::resolution::ResolutionIdentityDigestKey, [u8; 32]>,
     mounts: HashSet<(SelectedResolutionMountOrdinal, i64)>,
     semantic_identities: HashMap<(i64, u32), Option<[u8; 32]>>,
     node_identities: HashMap<(i64, u32), Option<[u8; 32]>>,
+    /// Raw declaration keys, including absence, from immutable blob publications.
+    /// Decode with the current mount ordinal at use; never retain mounted IDs.
+    pub(super) rust_reason_owners: HashMap<(i64, i64), Option<i64>>,
 }
 
 pub(crate) struct SelectedResolutionAuthority<'project> {

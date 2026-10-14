@@ -467,12 +467,12 @@ pub struct GoAnalyzerConfig {
 /// each one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GoDependencyDiscoveryMode {
-    /// Do not invoke the Go toolchain or publish dependency evidence.
-    #[default]
-    Disabled,
     /// Discover exact reachable modules for compatible installed-pack
     /// activation, without reading dependency sources or generating packs.
+    #[default]
     CuratedPackEvidence,
+    /// Do not invoke the Go toolchain or publish dependency evidence.
+    Disabled,
     /// Discover exact reachable source sets and prepare dependency packs for
     /// the complete dependency surface.
     FullProduction,
@@ -480,9 +480,8 @@ pub enum GoDependencyDiscoveryMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoDependencyDiscoveryConfig {
-    /// Go dependency discovery is opt-in because every enabled mode invokes
-    /// the configured Go toolchain. Full production can additionally index a
-    /// large local module graph.
+    /// Curated-pack discovery invokes the configured Go toolchain. Full
+    /// production can additionally index a large local module graph.
     pub mode: GoDependencyDiscoveryMode,
     /// Go executable to use. Relative names are resolved by the parent
     /// process before the hardened child environment is installed.
@@ -500,7 +499,7 @@ pub struct GoDependencyDiscoveryConfig {
 impl Default for GoDependencyDiscoveryConfig {
     fn default() -> Self {
         Self {
-            mode: GoDependencyDiscoveryMode::Disabled,
+            mode: GoDependencyDiscoveryMode::default(),
             go_executable: None,
             workspace_patterns: vec!["./...".to_owned()],
             gopath: None,

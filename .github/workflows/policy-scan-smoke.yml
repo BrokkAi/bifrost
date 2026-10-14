@@ -41,8 +41,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  prepared-selection-windows:
+    name: prepared semantic selection (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+
+      - name: Cache prepared semantic selection build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: policy-scan-smoke-prepared-selection
+
+      - name: Verify complete prepared semantic selection
+        env:
+          BIFROST_PARALLELISM: 1
+          RAYON_NUM_THREADS: 1
+          JAVA_HOME: ''
+        run: >-
+          cargo test --locked --lib -p brokk-bifrost-semantic-packs
+          --features release-tooling prepared_registry
+
   smoke:
     name: policy action (${{ matrix.os }})
+    # Windows cold binary and test builds exceed one job's time budget.
+    # Keep the same registry tests required before either smoke platform.
+    needs: prepared-selection-windows
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -85,6 +116,7 @@ jobs:
           --features brokk-bifrost-semantic-packs/release-tooling
 
       - name: Verify complete prepared semantic selection
+        if: runner.os != 'Windows'
         env:
           BIFROST_PARALLELISM: 1
           RAYON_NUM_THREADS: 1

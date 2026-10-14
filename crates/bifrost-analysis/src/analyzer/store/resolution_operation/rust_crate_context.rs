@@ -11,6 +11,8 @@ pub(super) const UNLOWERED_EXPORT_REASON: &str = "UnloweredExportedDeclaration";
 
 pub(in crate::analyzer::store) const SELECTED_MODULE_PLACEMENTS_SCHEMA_SQL: &str =
     include_str!("rust_selected_module_placements.sql");
+pub(in crate::analyzer::store) const SELECTED_MODULE_PLACEMENTS_FILL_SQL: &str =
+    include_str!("rust_selected_module_placements_fill.sql");
 
 pub(super) const NAMING: &str = include_str!("rust_crate_point_naming.sql");
 /// One file's selected blob and its selected mount ordinal, both keyed on the
@@ -172,22 +174,8 @@ pub(super) const FILE_CRATES: &str = "SELECT units.unit_key
 /// Rust placements supply the module path/scope route; the shared member row
 /// supplies the selected source file. `topology_id` is only the Rust-owned
 /// crosswalk retained by the point-context API.
-pub(super) const MODULES: &str = "WITH RECURSIVE graph(
- workspace_id, lang, generation, revision, unit_key, summary_id
-) AS (
- SELECT workspace_id, lang, generation, revision, unit_key, summary_id
- FROM selected_rust_unit_summaries WHERE summary_id=?1
- UNION
- SELECT child.workspace_id, child.lang, child.generation, child.revision,
-        child.unit_key, child.summary_id
- FROM graph
- JOIN main.resolution_unit_summary_dependencies AS dependency
-   ON dependency.summary_id=graph.summary_id AND dependency.boundary='workspace'
- JOIN selected_rust_unit_summaries AS child
-   ON child.workspace_id=graph.workspace_id AND child.generation=graph.generation
-  AND child.unit_key=dependency.dependency_unit_key
-)
-SELECT units.topology_id, placement.module_path, members.blob_id, members.rel_path,
+pub(super) const MODULES: &str =
+    "SELECT units.topology_id, placement.module_path, members.blob_id, members.rel_path,
  scopes.resolution_scope, contexts.edition,
  mount.mount_ordinal, mount.blob_id,
  (contexts.target_kind='detached' AND EXISTS(
@@ -197,7 +185,8 @@ SELECT units.topology_id, placement.module_path, members.blob_id, members.rel_pa
    WHERE cargo.workspace_id=graph.workspace_id
      AND cargo.generation=graph.generation AND cargo_context.target_kind<>'detached')),
  mount.semantic_language
-FROM graph
+FROM selected_rust_unit_summaries AS root
+CROSS JOIN selected_rust_unit_closure AS graph ON graph.root_unit_key=root.unit_key
 CROSS JOIN selected_rust_unit_summaries AS units ON units.summary_id=graph.summary_id
 CROSS JOIN main.rust_resolution_unit_summary_contexts AS contexts
   ON contexts.summary_id=graph.summary_id
@@ -211,7 +200,7 @@ CROSS JOIN source_rust_module_scopes AS scopes
   ON scopes.blob_id=members.blob_id AND scopes.ordinal=placement.scope_ordinal
 LEFT JOIN temp.selected_resolution_mounts AS mount
   ON mount.storage_language='rust' AND mount.persisted_relative_path=members.rel_path
-WHERE scopes.resolution_scope IS NOT NULL";
+WHERE root.summary_id=?1 AND scopes.resolution_scope IS NOT NULL";
 pub(super) const MODULE_PLACEMENTS: &str = "SELECT topology_id, container_path, placement_blob
      FROM selected_rust_module_placements
      WHERE placement_blob=?1 AND container_path=?2";
@@ -1135,24 +1124,19 @@ const DETACHED_SCOPE_CRATES: &str = "SELECT COUNT(*) FROM selected_rust_unit_sum
 /// it costs one primary-key range per summary and one index seek per member
 /// file rather than a pass over the selection or Rust topology sources.
 const CLOSURE_SCOPE_MOUNTS_HEAD: &str =
-    "WITH RECURSIVE closure(summary_id, workspace_id, generation, unit_key) AS (
- SELECT summary_id, workspace_id, generation, unit_key
- FROM selected_rust_unit_summaries WHERE unit_key IN ";
-const CLOSURE_SCOPE_MOUNTS_TAIL: &str = "
- UNION
- SELECT child.summary_id, child.workspace_id, child.generation, child.unit_key
- FROM closure
- CROSS JOIN main.resolution_unit_summary_dependencies AS dependency
-  ON dependency.summary_id=closure.summary_id AND dependency.boundary='workspace'
- CROSS JOIN selected_rust_unit_summaries AS child
-  ON child.workspace_id=closure.workspace_id
- AND child.generation=closure.generation
- AND child.unit_key=dependency.dependency_unit_key
-) INSERT OR IGNORE INTO temp.selected_resolution_scope_mounts(mount_ordinal)
- SELECT DISTINCT mount.mount_ordinal FROM closure
+    "INSERT OR IGNORE INTO temp.selected_resolution_scope_mounts(mount_ordinal)
+ SELECT DISTINCT mount.mount_ordinal
+ FROM selected_rust_unit_closure AS closure
  CROSS JOIN selected_rust_unit_members AS member ON member.summary_id=closure.summary_id
  CROSS JOIN temp.selected_resolution_mounts AS mount
-  ON mount.storage_language = 'rust' AND mount.persisted_relative_path = member.rel_path";
+  ON mount.storage_language='rust' AND mount.persisted_relative_path=member.rel_path
+ WHERE closure.root_unit_key IN ";
+const CLOSURE_SCOPE_MOUNTS_TAIL: &str = "";
+#[cfg(any(test, feature = "test-support"))]
+static CLOSURE_SCOPE_MOUNTS_PIN: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("{CLOSURE_SCOPE_MOUNTS_HEAD}(?1){CLOSURE_SCOPE_MOUNTS_TAIL}")
+});
+
 /// The mounts no crate row can place, which a crate closure cannot narrow:
 /// another language's files, and a content mount carrying an editor buffer
 /// whose path the crate derivation has never seen.
@@ -2002,7 +1986,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         route,
                         anchor,
                         anchor_semantic,
-                        activation: _,
+                        ..
                     } => (
                         *identity,
                         *source_scope_head,
@@ -4116,6 +4100,11 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
         ("rust_point_boundary_import_names", BOUNDARY_IMPORT_NAMES, 2),
         ("rust_point_file_crates", FILE_CRATES, 2),
         ("rust_point_modules", MODULES, 1),
+        (
+            "rust_scope_closure_mounts",
+            CLOSURE_SCOPE_MOUNTS_PIN.as_str(),
+            1,
+        ),
         ("rust_point_module_placements", MODULE_PLACEMENTS, 2),
         ("rust_point_named", NAMED, 7),
         ("rust_point_import_root_name", IMPORT_ROOT_NAME, 3),
@@ -4387,6 +4376,7 @@ mod tests {
             [],
         )
         .unwrap();
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
         let (topology, blob): (i64, i64) = conn
             .query_row(
                 "SELECT topology_id,blob_id FROM selected_rust_crate_containers WHERE container_path='crate' AND rel_path='src/lib.rs'",
@@ -4399,6 +4389,7 @@ mod tests {
             [blob],
         )
         .unwrap();
+        conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
 
         for (module, namespace, name, expected) in [
             (
@@ -4491,6 +4482,7 @@ mod tests {
             [],
         )
         .unwrap();
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
 
         const LEGACY: &str = r#"WITH candidates(rel_path, declaration_id, local_extent, is_glob) AS (
             SELECT DISTINCT target_source.rel_path, bridge.declaration_id,
@@ -4973,6 +4965,7 @@ mod tests {
             crate::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
             crate::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
             conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+            crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
             let (blob, site): (i64, i64) = conn
                 .query_row(
                     "SELECT declaration_blob_id,declaration_site FROM rust_crate_exports WHERE namespace='type' AND name='Foo' AND origin='declaration'",
@@ -4991,6 +4984,7 @@ mod tests {
                 })
                 .unwrap();
             conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,semantic_language,persisted_relative_path) SELECT 0,?1,'rust','rust','t.rs'", [blob]).unwrap();
+            conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
             let read: i64 = conn
                 .query_row(
                     &format!(
@@ -5261,6 +5255,7 @@ mod tests {
         let store = analyzer.store().unwrap();
         let conn = store.read_conn().unwrap();
         conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
         let topology: i64 = conn
             .query_row(
                 "SELECT topology_id FROM selected_rust_crates WHERE crate_name='demo'",
@@ -5344,9 +5339,11 @@ mod tests {
         crate::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
         crate::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
         conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
         // The walk reads the selected mounts; stage each summary member's file as
         // one mount, the way a selected operation does.
         conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,persisted_relative_path) SELECT row_number() OVER(),blob_id,'rust',rel_path FROM (SELECT DISTINCT member.blob_id,member.rel_path FROM selected_rust_unit_summaries AS units CROSS JOIN main.resolution_unit_summary_members AS member ON member.summary_id=units.summary_id)", []).unwrap();
+        conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
         let parents: Vec<(String, String, Option<String>)> = conn
             .prepare("SELECT placement.module_path, member.rel_path, placement.parent_module_path
              FROM selected_rust_unit_summaries AS units
@@ -5499,6 +5496,7 @@ mod tests {
         crate::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
         crate::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
         conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
         let topology: i64 = conn
             .query_row(
                 "SELECT topology_id FROM selected_rust_crates WHERE crate_name='cycle'",
@@ -5562,6 +5560,7 @@ mod tests {
         crate::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
         crate::analyzer::store::rust_crates::register_point_export_functions(&conn).unwrap();
         conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
         let (topology, key, blob): (i64, Vec<u8>, i64) = conn.query_row("SELECT topology_id,crate_key,blob_id FROM selected_rust_crate_containers WHERE container_path='crate' AND rel_path='src/lib.rs'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
         let summary_id: i64 = conn
             .query_row(
@@ -5571,6 +5570,7 @@ mod tests {
             )
             .unwrap();
         conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,semantic_language,persisted_relative_path) VALUES(0,?1,'rust','rust','src/lib.rs')", [blob]).unwrap();
+        conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
         let (target_blob, target_site): (i64, i64) = conn.query_row(
             "SELECT declaration_blob_id,declaration_site FROM rust_crate_exports WHERE topology_id=?1 AND module_path='crate::inner' AND namespace='type' AND name='Thing' AND origin='declaration'",
             [topology], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
@@ -5621,8 +5621,12 @@ mod tests {
                 );
                 assert!(
                     plan.iter().any(|step| {
-                        step.contains("SEARCH versions USING PRIMARY KEY")
-                            && step.contains("unit_key=?")
+                        step.contains("SEARCH")
+                            && step.contains(if pin.name == "rust_scope_dependency_closure" {
+                                "selected_rust_unit_closure_summary"
+                            } else {
+                                "selected_rust_unit_summaries_key"
+                            })
                     }),
                     "{state:?} {} must use selected shared unit versions: {plan:?}",
                     pin.name
@@ -5638,9 +5642,11 @@ mod tests {
                 if pin.name == "rust_scope_dependency_closure" {
                     assert!(
                         plan.iter().any(|step| {
-                            step.contains("SEARCH dependency USING PRIMARY KEY (summary_id=?)")
+                            step.contains("SEARCH closure USING")
+                                && step.contains("selected_rust_unit_closure_summary")
+                                && step.contains("root_unit_key=?")
                         }),
-                        "{state:?} closure traversal must seek outgoing shared dependency rows: {plan:?}"
+                        "{state:?} closure mounts must seek the materialized root rows: {plan:?}"
                     );
                     assert!(
                         plan.iter().any(|step| {
@@ -5855,6 +5861,12 @@ mod tests {
                     | "rust_point_reference_names_workspace_crate" => {
                         vec![int(0), int(0), text("inner")]
                     }
+                    name if name.starts_with("rust_point_targets_") => {
+                        let mut params = pin.params.clone();
+                        params[0] = int(topology);
+                        params[4] = int(topology);
+                        params
+                    }
                     name => panic!("populate the new point query's parameters: {name}"),
                 };
                 let mut parameter_sets = vec![pin.params.clone()];
@@ -5974,14 +5986,19 @@ mod tests {
                             "{state:?} imported macro lookup must use only live summary rows: {plan:?}"
                         );
                     }
-                    if pin.name == "rust_point_access_placements" {
+                    if matches!(
+                        pin.name.as_str(),
+                        "rust_point_access_placements"
+                            | "rust_point_access_reference_placements"
+                            | "rust_point_module_placements"
+                    ) {
                         assert!(
                             plan.iter().any(|step| {
                                 step.contains(
-                                    "rust_resolution_unit_summary_placements_member (summary_id=? AND member_ordinal=?)",
+                                    "selected_rust_module_placements_blob (placement_blob=?",
                                 )
                             }),
-                            "{state:?} dependency placement lookup must seek placements by member: {plan:?}"
+                            "{state:?} placement lookup must seek the materialized blob index: {plan:?}"
                         );
                     }
                     if pin.name == "rust_point_boundary_import_names" {
@@ -6398,7 +6415,7 @@ mod tests {
                     if pin.name == "rust_graph_crate_member_files" {
                         assert!(
                             plan.iter()
-                                .any(|step| step.contains("resolution_unit_summary_versions_open")),
+                                .any(|step| step.contains("selected_rust_unit_summaries_key")),
                             "{state:?} {} must seek the active unit version: {plan:?}",
                             pin.name
                         );
@@ -6484,6 +6501,7 @@ mod tests {
         crate::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
         crate::analyzer::store::rust_crates::register_point_export_functions(&conn).unwrap();
         conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
         let (key, blob): (Vec<u8>, i64) = conn.query_row(
             "SELECT crate_key,blob_id FROM selected_rust_crate_containers WHERE rel_path='src/lib.rs' LIMIT 1",
             [],
@@ -6497,6 +6515,7 @@ mod tests {
             )
             .unwrap();
         conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,semantic_language,persisted_relative_path) VALUES(0,?1,'rust','rust','src/lib.rs')", [blob]).unwrap();
+        conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
         let member_files = pinned("rust_graph_crate_member_files");
         let graph_keys = pinned("rust_graph_crate_keys");
         let file_crates = pinned("rust_point_file_crates");
@@ -6536,7 +6555,8 @@ mod tests {
                     pin.name
                 );
                 assert!(
-                    plan.iter().any(|step| step.contains("SEARCH")),
+                    pin.name == "rust_graph_crate_keys"
+                        || plan.iter().any(|step| step.contains("SEARCH")),
                     "{state:?} {} has no indexed seek: {plan:?}",
                     pin.name
                 );
@@ -6546,14 +6566,13 @@ mod tests {
             assert!(
                 keys_plan
                     .iter()
-                    .any(|step| step.contains("SEARCH versions USING")),
-                "{state:?} crate key enumeration must seek selected unit versions: {keys_plan:?}"
+                    .any(|step| step.contains("SCAN selected_rust_unit_summaries USING COVERING INDEX selected_rust_unit_summaries_key")),
+                "{state:?} crate key enumeration must walk the selected unit key index: {keys_plan:?}"
             );
             assert!(
                 member_plan.iter().any(|step| {
-                    step.contains("SEARCH versions USING PRIMARY KEY")
+                    step.contains("SEARCH units USING INDEX selected_rust_unit_summaries_key")
                         && step.contains("unit_key=?")
-                        && step.contains("valid_from<?")
                 }),
                 "{state:?} member enumeration must seek the active unit version: {member_plan:?}"
             );
@@ -6573,7 +6592,7 @@ mod tests {
             let cfg_plan = explain_pin(&conn, &cfg);
             assert!(
                 cfg_plan.iter().any(|step| {
-                    step.contains("SEARCH versions USING PRIMARY KEY")
+                    step.contains("SEARCH units USING INDEX selected_rust_unit_summaries_key")
                         && step.contains("unit_key=?")
                 }),
                 "{state:?} Rust cfg lookup must seek the selected unit version: {cfg_plan:?}"
@@ -6586,10 +6605,8 @@ mod tests {
             );
             let graph_plan = explain_pin(&conn, &graph_definitions);
             assert!(
-                graph_plan
-                    .iter()
-                    .any(|step| step.contains("SEARCH versions USING PRIMARY KEY")),
-                "{state:?} graph definition enumeration must seek the live unit version: {graph_plan:?}"
+                graph_plan.iter().any(|step| step == "SCAN units"),
+                "{state:?} graph definition enumeration must enumerate only materialized selected units: {graph_plan:?}"
             );
             assert!(
                 graph_plan.iter().any(|step| {
@@ -6600,17 +6617,16 @@ mod tests {
             let modules_plan = explain_pin(&conn, &modules);
             assert!(
                 modules_plan.iter().any(|step| {
-                    step.contains(
-                        "SEARCH versions USING INDEX resolution_unit_summary_versions_summary",
-                    ) && step.contains("summary_id=?")
+                    step.contains("SEARCH root USING INDEX selected_rust_unit_summaries_summary")
+                        && step.contains("summary_id=?")
                 }),
                 "{state:?} module enumeration must seek its live summary: {modules_plan:?}"
             );
             assert!(
                 modules_plan.iter().any(|step| {
-                    step.contains("SEARCH dependency USING PRIMARY KEY (summary_id=?)")
+                    step.contains("SEARCH graph USING INDEX selected_rust_unit_closure_summary")
                 }),
-                "{state:?} module dependency closure must seek shared dependency rows: {modules_plan:?}"
+                "{state:?} module dependency closure must seek materialized root rows: {modules_plan:?}"
             );
             assert!(
                 modules_plan.iter().any(|step| {
@@ -6618,21 +6634,15 @@ mod tests {
                         "SEARCH placement USING INDEX rust_resolution_unit_summary_placements_member (summary_id=?)",
                     )
                 }),
-                "{state:?} module enumeration must seek Rust placements by the recursive graph summary: {modules_plan:?}"
+                "{state:?} module enumeration must seek Rust placements by the selected closure summary: {modules_plan:?}"
             );
             let module_placements_plan = explain_pin(&conn, &module_placements);
             assert!(
                 module_placements_plan
                     .iter()
-                    .any(|step| { step.contains("resolution_unit_summary_members_blob") }),
-                "{state:?} module placement lookup must seek shared members by blob: {module_placements_plan:?}"
-            );
-            assert!(
-                module_placements_plan.iter().any(|step| {
-                    step.contains("SEARCH placement USING PRIMARY KEY (summary_id=? AND module_path=? AND member_ordinal=?)")
-                        || step.contains("rust_resolution_unit_summary_placements_member")
-                }),
-                "{state:?} module placement lookup must seek Rust placements by member: {module_placements_plan:?}"
+                    .any(|step| step
+                        .contains("selected_rust_module_placements_blob (placement_blob=?)")),
+                "{state:?} module placement lookup must seek the materialized blob index: {module_placements_plan:?}"
             );
         }
     }

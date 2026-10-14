@@ -1,0 +1,41 @@
+{
+  "created_at": "<TIMESTAMP>",
+  "engine": {
+    "build_identity": "fixture-build",
+    "executable_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version": "9.9.0"
+  },
+  "failure": {
+    "class": "no-compatible-release",
+    "message": "no candidate satisfies the pack request and engine contract",
+    "retryable": false
+  },
+  "inventory": {
+    "fetched_at": "<TIMESTAMP>",
+    "fetched_online": true,
+    "index_sha256": "6b621d6c80f8127cc4c1733a0a165a3a5d2cadf6fea6fbac827157caf4e313e1"
+  },
+  "outcome_schema_version": 1,
+  "rejections": [
+    {
+      "detail": "missing capabilities {}; unsupported schema axes [(\"release.policy_bundle\", [7], []), (\"content:rules/fixture/policy.rql.policy_bundle\", [7], [])]; capability contract mismatch false; engine range mismatch false",
+      "pack_id": "bifrost.public.rules",
+      "reason": "engine-contract",
+      "release_version": "1.0.0",
+      "tag": "rules/v1.0.0"
+    }
+  ],
+  "request": {
+    "dependencies": [],
+    "pack_id": "bifrost.public.rules",
+    "repository": "https://github.com/BrokkAi/bifrost-packs",
+    "request_schema_version": 1,
+    "selection": {
+      "allowed_versions": "*",
+      "channel": "stable",
+      "mode": "preferred"
+    }
+  },
+  "selection": null,
+  "status": "failed"
+}

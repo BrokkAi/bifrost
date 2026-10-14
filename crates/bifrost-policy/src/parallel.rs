@@ -7,8 +7,9 @@
 //! a wider host does not scale peak in-flight materialization without bound. A
 //! width of one selects the strictly serial evaluation path.
 
-use crate::coordinator::owned_policy_analyzer_config;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use brokk_bifrost_analysis::analyzer::AnalyzerConfig;
 
 /// Environment variable that overrides the concurrent-policy worker count.
 ///
@@ -37,7 +38,7 @@ pub fn policy_evaluation_parallelism() -> usize {
     {
         return value;
     }
-    default_policy_evaluation_parallelism(owned_policy_analyzer_config().parallelism())
+    default_policy_evaluation_parallelism(AnalyzerConfig::default().parallelism())
 }
 
 /// The unset-variable width: half the analyzer pool width, one through eight.

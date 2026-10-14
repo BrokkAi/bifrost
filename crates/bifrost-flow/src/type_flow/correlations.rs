@@ -28,7 +28,7 @@ use super::is_assignment_transfer_marker;
 use crate::analyzer::semantic::{
     BindingOriginIndex, CancellationToken, ControlEdgeId, GuardPredicate, ProcedureHandle,
     ProgramPointId, SemanticBudget, SemanticBudgetExceeded, SemanticEffect, SemanticGapImpact,
-    SemanticValueKind, SemanticWork, ValueId,
+    SemanticValueKind, SemanticWork, ValueFlowKind, ValueId, ValueUseKind,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -107,6 +107,41 @@ pub struct CorrelationAnalysis {
     pub definitions: Vec<DefinitionRecord>,
     /// One row per reachable supported guard edge and data binding.
     pub guard_edge_exclusions: Vec<CorrelationCandidate>,
+    /// Reaching definitions before the requested semantic events. Flow-state
+    /// clients use this to answer initialization at the exact read site.
+    pub data_reaching_at_event: Vec<DataReachingAtEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ConditionKey {
+    Truthy,
+    Nullness,
+    BooleanEquality(bool),
+}
+
+/// The data definitions reaching one selected semantic event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataReachingAtEvent {
+    pub event: usize,
+    pub binding: ValueId,
+    pub definitions: Vec<DefinitionRecord>,
+    pub may_be_uninitialized: bool,
+    pub unknown: bool,
+}
+
+pub(crate) fn guard_condition_bindings(procedure: &ProcedureHandle) -> Vec<ValueId> {
+    let semantics = procedure.semantics();
+    let origins = BindingOriginIndex::new(procedure);
+    let mut bindings = semantics
+        .guard_facts()
+        .iter()
+        .filter_map(|guard| {
+            guard_binding_condition(semantics, guard, &origins).map(|(binding, _, _)| binding)
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_unstable();
+    bindings.dedup();
+    bindings
 }
 
 /// Why a correlation analysis did not produce a result.
@@ -160,12 +195,48 @@ pub(super) fn analyze_correlations_with_boolean_bindings(
     budget: &mut SemanticBudget,
     cancellation: Option<&CancellationToken>,
 ) -> Result<CorrelationAnalysis, CorrelationError> {
+    analyze_correlations_with_observations(
+        procedure,
+        bool_bindings,
+        data_bindings,
+        open_bindings,
+        &HashSet::default(),
+        correlation_events,
+        &[],
+        &[],
+        &[],
+        budget,
+        cancellation,
+    )
+}
+
+/// Analyze correlated definitions and report reaching definitions before
+/// selected events. `read_events` are `(event, point, event_index, binding)`;
+/// `omitted_edges` is the exact request-local projection already used by the
+/// owning flow derivation. `uninitialized_entry_bindings` carries the
+/// language-specific fact that a local slot starts unbound; other clients
+/// leave entry definitions initialized for their own value-flow purpose.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analyze_correlations_with_observations(
+    procedure: &ProcedureHandle,
+    bool_bindings: &[ValueId],
+    data_bindings: &[ValueId],
+    open_bindings: &HashSet<ValueId>,
+    uninitialized_entry_bindings: &HashSet<ValueId>,
+    correlation_events: &[Vec<usize>],
+    read_events: &[(usize, ProgramPointId, usize, ValueId)],
+    uncertain_return_edges: &[ControlEdgeId],
+    omitted_edges: &[ControlEdgeId],
+    budget: &mut SemanticBudget,
+    cancellation: Option<&CancellationToken>,
+) -> Result<CorrelationAnalysis, CorrelationError> {
     check_cancelled(cancellation)?;
     let semantics = procedure.semantics();
-    if bool_bindings.is_empty() || data_bindings.is_empty() {
+    if data_bindings.is_empty() || (bool_bindings.is_empty() && read_events.is_empty()) {
         return Ok(CorrelationAnalysis {
             definitions: Vec::new(),
             guard_edge_exclusions: Vec::new(),
+            data_reaching_at_event: Vec::new(),
         });
     }
     charge_reused_preprocessing_inputs(semantics, budget)?;
@@ -179,7 +250,7 @@ pub(super) fn analyze_correlations_with_boolean_bindings(
     // Index every definition needed by the surviving relational question.
     let mut definitions = DefinitionTable::new();
     definitions.index_entry_definitions(
-        semantics.entry_point(),
+        semantics,
         data_bindings,
         bool_bindings,
         budget,
@@ -190,6 +261,7 @@ pub(super) fn analyze_correlations_with_boolean_bindings(
         data_bindings,
         bool_bindings,
         open_bindings,
+        uninitialized_entry_bindings,
         &binding_origins,
         correlation_events,
         budget,
@@ -198,7 +270,7 @@ pub(super) fn analyze_correlations_with_boolean_bindings(
 
     // State is stored only where it is consumed or where it can change, and
     // the fixpoint runs over the reduced graph those points form.
-    let successors = cfg_successors(semantics, budget, cancellation)?;
+    let successors = cfg_successors(semantics, omitted_edges, budget, cancellation)?;
     let carried = carried_points(
         semantics,
         &successors,
@@ -206,9 +278,18 @@ pub(super) fn analyze_correlations_with_boolean_bindings(
         bool_bindings,
         write_targets,
         correlation_events,
+        read_events,
+        uncertain_return_edges,
+        &binding_origins,
         cancellation,
     )?;
     let carried_successors = carried_successors(&successors, &carried, budget, cancellation)?;
+    let guard_edges = guard_edge_facts(semantics, &binding_origins);
+    let read_failure_edges = read_exception_edges(semantics, read_events);
+    let uncertain_return_edges = uncertain_return_edges
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
 
     let initial = FlowState::entry(data_bindings, bool_bindings, &definitions, budget)?;
     let point_count = semantics.points().len();
@@ -242,21 +323,104 @@ pub(super) fn analyze_correlations_with_boolean_bindings(
         )?;
         exits[point_id.index()] = exit_state.clone();
 
-        for &target_point in &carried_successors[point_id.index()] {
+        for &transition in &carried_successors[point_id.index()] {
             check_cancelled(cancellation)?;
             charge_edges(budget, 1)?;
-            let target = target_point.index();
-            let changed = states[target].join(&exit_state, budget)?;
+            let mut edge_state = exit_state.clone();
+            if let Some((binding, key, expected)) = guard_edges.get(&transition.edge).copied() {
+                refine_guard_edge(
+                    &mut edge_state,
+                    data_bindings,
+                    binding,
+                    key,
+                    expected,
+                    transition.edge,
+                    point_id,
+                    semantics,
+                    budget,
+                )?;
+            }
+            if let Some(&(read_binding, continuation)) = read_failure_edges.get(&transition.edge) {
+                refine_read_exception_edge(
+                    &mut edge_state,
+                    read_binding,
+                    continuation,
+                    &definitions,
+                );
+            }
+            if uncertain_return_edges.contains(&transition.edge) {
+                edge_state.uncertain_return = true;
+            }
+            let target = transition.target.index();
+            let changed = states[target].join(&edge_state, budget)?;
             if changed && !queued[target] {
                 queued[target] = true;
-                worklist.push_back(target_point);
+                worklist.push_back(transition.target);
             }
         }
     }
 
+    let mut data_reaching_at_event = Vec::new();
+    for &(event, point, event_index, binding) in read_events {
+        check_cancelled(cancellation)?;
+        let Some(state) = states.get(point.index()) else {
+            continue;
+        };
+        if state.is_bottom() {
+            data_reaching_at_event.push(DataReachingAtEvent {
+                event,
+                binding,
+                definitions: Vec::new(),
+                may_be_uninitialized: false,
+                unknown: false,
+            });
+            continue;
+        }
+        let observed = state_at_event(
+            semantics,
+            point,
+            event_index,
+            state,
+            &definitions,
+            bool_bindings,
+            data_bindings,
+            open_bindings,
+            &binding_origins,
+            &correlation_events[point.index()],
+            budget,
+            cancellation,
+        )?;
+        let mut ids = observed
+            .reaching
+            .get(&binding)
+            .map(|ids| ids.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        ids.sort_unstable();
+        let may_be_uninitialized = ids
+            .iter()
+            .any(|definition| definitions.uninitialized_data.contains(definition));
+        let unknown = ids
+            .iter()
+            .any(|definition| definitions.unknown_data.contains(definition));
+        let unknown = unknown || (observed.uncertain_return && may_be_uninitialized);
+        data_reaching_at_event.push(DataReachingAtEvent {
+            event,
+            binding,
+            definitions: ids
+                .into_iter()
+                .map(|index| definitions.data_records[index])
+                .collect(),
+            may_be_uninitialized,
+            unknown,
+        });
+    }
+    data_reaching_at_event.sort_by_key(|row| row.event);
+
     let mut guard_edge_exclusions = Vec::new();
     for guard in semantics.guard_facts() {
-        let Some((bool_binding, true_fact)) = guard_binding_and_true_fact(semantics, guard) else {
+        let Some((bool_binding, key, true_fact)) =
+            guard_binding_condition(semantics, guard, &binding_origins)
+        else {
             continue;
         };
         assert!(
@@ -271,13 +435,15 @@ pub(super) fn analyze_correlations_with_boolean_bindings(
             let Some(edge) = edge else { continue };
             for &data_binding in data_bindings {
                 let pairs = state.pairs(data_binding, bool_binding);
-                let candidate = make_candidate(
+                let candidate = make_condition_candidate(
                     edge,
                     bool_binding,
+                    key,
                     expected,
                     data_binding,
                     &pairs,
                     &definitions,
+                    semantics,
                 );
                 if !candidate.all_reaching_data_defs.is_empty() {
                     guard_edge_exclusions.push(candidate);
@@ -297,6 +463,7 @@ pub(super) fn analyze_correlations_with_boolean_bindings(
     Ok(CorrelationAnalysis {
         definitions: definitions.data_records,
         guard_edge_exclusions,
+        data_reaching_at_event,
     })
 }
 
@@ -378,16 +545,42 @@ fn component_writes(
                 source,
                 target,
                 kind,
-            } if bool_bindings.binary_search(target).is_ok()
-                && kind.preserves_runtime_class()
-                && !is_assignment_transfer_marker(point, event_index, *source, *target) =>
-            {
-                writes.push(ComponentWrite::Boolean {
-                    binding: *target,
-                    event_index,
-                    rhs: Some(*source),
-                });
+            } => {
+                if let ValueFlowKind::Transfer(transfer) = kind
+                    && matches!(
+                        transfer.kind,
+                        crate::analyzer::semantic::TransferKind::Move { .. }
+                    )
+                    && data_bindings.binary_search(source).is_ok()
+                {
+                    writes.push(ComponentWrite::Data {
+                        binding: *source,
+                        event_index,
+                        rhs: None,
+                    });
+                }
+                if bool_bindings.binary_search(target).is_ok()
+                    && kind.preserves_runtime_class()
+                    && !is_assignment_transfer_marker(point, event_index, *source, *target)
+                {
+                    writes.push(ComponentWrite::Boolean {
+                        binding: *target,
+                        event_index,
+                        rhs: Some(*source),
+                    });
+                }
             }
+            SemanticEffect::ValueUse {
+                kind: ValueUseKind::Unbind,
+                value,
+            } => push(
+                &mut writes,
+                data_bindings,
+                bool_bindings,
+                event_index,
+                *value,
+                None,
+            ),
             SemanticEffect::MemoryStore {
                 location, value, ..
             } if semantics
@@ -484,20 +677,24 @@ fn component_writes(
 /// A point is carried when it is the entry, when two or more edges reach it
 /// and its state is therefore a join, when it replaces a component, or when a
 /// guard the consumer queries reads its exit state.
+#[allow(clippy::too_many_arguments)]
 fn carried_points(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
-    successors: &[Vec<ProgramPointId>],
+    successors: &[Vec<(ControlEdgeId, ProgramPointId)>],
     data_bindings: &[ValueId],
     bool_bindings: &[ValueId],
     write_targets: WriteTargets<'_>,
     correlation_events: &[Vec<usize>],
+    read_events: &[(usize, ProgramPointId, usize, ValueId)],
+    uncertain_return_edges: &[ControlEdgeId],
+    binding_origins: &BindingOriginIndex,
     cancellation: Option<&CancellationToken>,
 ) -> Result<Vec<bool>, CorrelationError> {
     let point_count = successors.len();
     let mut predecessors = vec![0usize; point_count];
     for targets in successors {
         check_cancelled(cancellation)?;
-        for target in targets {
+        for &(_, target) in targets {
             predecessors[target.index()] = predecessors[target.index()].saturating_add(1);
         }
     }
@@ -519,9 +716,19 @@ fn carried_points(
             carried[point.id.index()] = true;
         }
     }
+    for &(_, point, _, _) in read_events {
+        carried[point.index()] = true;
+    }
+    for &edge in uncertain_return_edges {
+        let source = semantics
+            .control_edge(edge)
+            .expect("uncertain continuation edges belong to the procedure")
+            .source_point;
+        carried[source.index()] = true;
+    }
     for guard in semantics.guard_facts() {
         check_cancelled(cancellation)?;
-        if guard_binding_and_true_fact(semantics, guard).is_some() {
+        if guard_binding_condition(semantics, guard, binding_origins).is_some() {
             carried[guard.point.index()] = true;
         }
     }
@@ -534,12 +741,18 @@ fn carried_points(
 /// runs over this reduced graph.  Uncarried points have one predecessor, so
 /// the chains hanging off distinct carried points are disjoint and building
 /// the whole relation walks each CFG edge a bounded number of times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CarriedTransition {
+    edge: ControlEdgeId,
+    target: ProgramPointId,
+}
+
 fn carried_successors(
-    successors: &[Vec<ProgramPointId>],
+    successors: &[Vec<(ControlEdgeId, ProgramPointId)>],
     carried: &[bool],
     budget: &mut SemanticBudget,
     cancellation: Option<&CancellationToken>,
-) -> Result<Vec<Vec<ProgramPointId>>, CorrelationError> {
+) -> Result<Vec<Vec<CarriedTransition>>, CorrelationError> {
     let point_count = carried.len();
     let mut reduced = vec![Vec::new(); point_count];
     // Generation stamps make the per-walk visited set O(1) to reset. The set
@@ -553,23 +766,29 @@ fn carried_successors(
             continue;
         }
         check_cancelled(cancellation)?;
-        generation += 1;
-        stack.clear();
-        stack.extend(successors[index].iter().copied());
         let mut reached = Vec::new();
-        while let Some(next) = stack.pop() {
-            charge_edges(budget, 1)?;
-            if visited[next.index()] == generation {
-                continue;
+        for &(first_edge, first_target) in &successors[index] {
+            generation = generation.wrapping_add(1);
+            stack.clear();
+            stack.push(first_target);
+            while let Some(next) = stack.pop() {
+                charge_edges(budget, 1)?;
+                if visited[next.index()] == generation {
+                    continue;
+                }
+                visited[next.index()] = generation;
+                if carried[next.index()] {
+                    reached.push(CarriedTransition {
+                        edge: first_edge,
+                        target: next,
+                    });
+                    continue;
+                }
+                stack.extend(successors[next.index()].iter().map(|(_, target)| *target));
             }
-            visited[next.index()] = generation;
-            if carried[next.index()] {
-                reached.push(next);
-                continue;
-            }
-            stack.extend(successors[next.index()].iter().copied());
         }
-        reached.sort_unstable();
+        reached.sort_unstable_by_key(|transition| (transition.edge, transition.target));
+        reached.dedup();
         reduced[index] = reached;
     }
     Ok(reduced)
@@ -578,18 +797,259 @@ fn carried_successors(
 /// This procedure's CFG as a successor list, charged once per edge.
 fn cfg_successors(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    omitted_edges: &[ControlEdgeId],
     budget: &mut SemanticBudget,
     cancellation: Option<&CancellationToken>,
-) -> Result<Vec<Vec<ProgramPointId>>, CorrelationError> {
+) -> Result<Vec<Vec<(ControlEdgeId, ProgramPointId)>>, CorrelationError> {
     let mut successors = vec![Vec::new(); semantics.points().len()];
+    let omitted_edges = omitted_edges.iter().copied().collect::<HashSet<_>>();
     for point in semantics.points() {
         check_cancelled(cancellation)?;
-        for (_edge_id, edge) in semantics.successor_edges(point.id) {
+        for (edge_id, edge) in semantics.successor_edges(point.id) {
             charge_edges(budget, 1)?;
-            successors[point.id.index()].push(edge.target_point);
+            if !omitted_edges.contains(&edge_id) {
+                successors[point.id.index()].push((edge_id, edge.target_point));
+            }
         }
     }
     Ok(successors)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReadContinuation {
+    Normal,
+    Exceptional,
+}
+
+fn guard_edge_facts(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    binding_origins: &BindingOriginIndex,
+) -> HashMap<ControlEdgeId, (ValueId, ConditionKey, BoolFact)> {
+    let mut result = HashMap::default();
+    for guard in semantics.guard_facts() {
+        let Some((binding, key, true_fact)) =
+            guard_binding_condition(semantics, guard, binding_origins)
+        else {
+            continue;
+        };
+        for (edge, fact) in [
+            (guard.true_edge, true_fact),
+            (guard.false_edge, true_fact.opposite()),
+        ] {
+            if let Some(edge) = edge {
+                assert!(
+                    result.insert(edge, (binding, key, fact)).is_none(),
+                    "one control edge carries one normalized guard fact"
+                );
+            }
+        }
+    }
+    result
+}
+
+fn read_exception_edges(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    read_events: &[(usize, ProgramPointId, usize, ValueId)],
+) -> HashMap<ControlEdgeId, (ValueId, ReadContinuation)> {
+    // Keep the established exceptional-edge projection for existing callers.
+    // Initialization queries also select local reads without an explicit
+    // handler edge: their normal successors exclude paths where the read
+    // raises, so a later read cannot report the same failure again.
+    let mut result = HashMap::default();
+    let observed_reads = read_events
+        .iter()
+        .map(|&(_, point, _, binding)| (point, binding))
+        .collect::<HashSet<_>>();
+    for point in semantics.points() {
+        let bindings = point
+            .events
+            .iter()
+            .filter_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local | ValueFlowKind::Parameter | ValueFlowKind::Receiver,
+                    source,
+                    ..
+                } if semantics
+                    .value(source)
+                    .is_some_and(|value| value.kind.is_binding()) =>
+                {
+                    Some(source)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        if bindings.len() != 1 {
+            continue;
+        }
+        let binding = *bindings.iter().next().expect("one binding was checked");
+        let outgoing = semantics.successor_edges(point.id).collect::<Vec<_>>();
+        let has_exceptional_edge = outgoing
+            .iter()
+            .any(|(_, edge)| edge.kind == crate::analyzer::semantic::ControlEdgeKind::Exceptional);
+        if !has_exceptional_edge && !observed_reads.contains(&(point.id, binding)) {
+            continue;
+        }
+        for (edge_id, edge) in outgoing {
+            let continuation =
+                if edge.kind == crate::analyzer::semantic::ControlEdgeKind::Exceptional {
+                    ReadContinuation::Exceptional
+                } else {
+                    ReadContinuation::Normal
+                };
+            result.insert(edge_id, (binding, continuation));
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refine_guard_edge(
+    state: &mut FlowState,
+    data_bindings: &[ValueId],
+    boolean_binding: ValueId,
+    condition: ConditionKey,
+    expected: BoolFact,
+    edge: ControlEdgeId,
+    point: ProgramPointId,
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    budget: &mut SemanticBudget,
+) -> Result<(), CorrelationError> {
+    if state.is_bottom() {
+        return Ok(());
+    }
+    for &data_binding in data_bindings {
+        let Some(reaching) = state.reaching.get(&data_binding) else {
+            continue;
+        };
+        let pairs = state.pairs(data_binding, boolean_binding);
+        if pairs.is_empty() {
+            continue;
+        }
+        let mut allowed = HashSet::default();
+        for &data_definition in reaching {
+            let mut constrained = false;
+            let mut compatible = false;
+            let mut unconstrained = false;
+            for pair in pairs
+                .iter()
+                .filter(|pair| pair.data_definition == data_definition)
+            {
+                if pair_matches_condition(pair, condition, semantics) {
+                    constrained = true;
+                    compatible |= pair.fact == expected || pair.fact == BoolFact::Unknown;
+                } else {
+                    unconstrained = true;
+                }
+            }
+            if !constrained || compatible || unconstrained {
+                allowed.insert(data_definition);
+            }
+        }
+        if let Some(reaching) = state.reaching.get_mut(&data_binding) {
+            reaching.retain(|definition| allowed.contains(definition));
+        }
+        for ((candidate, _), pairs) in &mut state.correlated {
+            if *candidate == data_binding {
+                pairs.retain(|pair| allowed.contains(&pair.data_definition));
+            }
+        }
+        if state.reaching[&data_binding].is_empty() {
+            state.reachable = false;
+            return Ok(());
+        }
+    }
+    state.normalize();
+    let definition = BooleanDefinition {
+        binding: boolean_binding,
+        point,
+        event_index: usize::MAX - 1,
+        rhs: None,
+        condition: Some(condition),
+        edge: Some(edge),
+    };
+    replace_boolean_fact_component(state, boolean_binding, definition, expected, budget)
+}
+
+fn pair_matches_condition(
+    pair: &Pair,
+    condition: ConditionKey,
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+) -> bool {
+    if pair.boolean_definition.condition == Some(condition) {
+        return true;
+    }
+    condition == ConditionKey::Truthy
+        && pair.boolean_definition.condition.is_none()
+        && pair
+            .boolean_definition
+            .rhs
+            .and_then(|rhs| intrinsic_boolean(semantics, rhs))
+            .is_some()
+}
+
+fn refine_read_exception_edge(
+    state: &mut FlowState,
+    binding: ValueId,
+    continuation: ReadContinuation,
+    definitions: &DefinitionTable,
+) {
+    if state.is_bottom() {
+        return;
+    }
+    let Some(reaching) = state.reaching.get_mut(&binding) else {
+        return;
+    };
+    match continuation {
+        ReadContinuation::Normal => {
+            reaching.retain(|definition| !definitions.uninitialized_data.contains(definition));
+        }
+        ReadContinuation::Exceptional => {
+            reaching.retain(|definition| {
+                definitions.uninitialized_data.contains(definition)
+                    || definitions.unknown_data.contains(definition)
+            });
+        }
+    }
+    if reaching.is_empty() {
+        state.reachable = false;
+        return;
+    }
+    for ((candidate, _), pairs) in &mut state.correlated {
+        if *candidate == binding {
+            pairs.retain(|pair| reaching.contains(&pair.data_definition));
+        }
+    }
+    state.normalize();
+}
+
+fn is_uninitialized_definition(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    definition: DefinitionRecord,
+) -> bool {
+    if definition.is_entry() {
+        return false;
+    }
+    semantics
+        .point(definition.point)
+        .and_then(|point| point.events.get(definition.event_index))
+        .is_some_and(|event| match &event.effect {
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Transfer(transfer),
+                source,
+                ..
+            } => {
+                *source == definition.binding
+                    && matches!(
+                        transfer.kind,
+                        crate::analyzer::semantic::TransferKind::Move { .. }
+                    )
+            }
+            SemanticEffect::ValueUse {
+                kind: ValueUseKind::Unbind,
+                value,
+            } => *value == definition.binding,
+            _ => false,
+        })
 }
 
 pub(super) fn check_cancelled(
@@ -761,7 +1221,6 @@ pub(super) fn tested_boolean_bindings_from_copy_graph(
     if literal_values.is_empty() {
         return Ok(Vec::new());
     }
-
     let mut literal_reachable = literal_values.iter().copied().collect::<HashSet<_>>();
     let mut worklist = literal_values.into_iter().collect::<VecDeque<_>>();
     while let Some(source) = worklist.pop_front() {
@@ -808,30 +1267,46 @@ pub(super) fn tested_boolean_bindings_from_copy_graph(
     Ok(values)
 }
 
-fn guard_binding_and_true_fact(
+fn guard_binding_condition(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     guard: &crate::analyzer::semantic::GuardFact,
-) -> Option<(ValueId, BoolFact)> {
-    match guard.predicate {
-        GuardPredicate::Truthy { value } => Some((value, BoolFact::True)),
+    binding_origins: &BindingOriginIndex,
+) -> Option<(ValueId, ConditionKey, BoolFact)> {
+    let (subject, key, fact) = match guard.predicate {
+        GuardPredicate::Truthy { value } => (value, ConditionKey::Truthy, BoolFact::True),
+        GuardPredicate::NullComparison { null_on_true } => (
+            guard.subject?,
+            ConditionKey::Nullness,
+            BoolFact::from_literal(null_on_true),
+        ),
         GuardPredicate::ConstantEquality { negated, constant } => {
             let SemanticValueKind::Boolean(value) = semantics.value(constant)?.kind else {
                 return None;
             };
-            let subject = guard.subject?;
             let fact = BoolFact::from_literal(value);
-            Some((subject, if negated { fact.opposite() } else { fact }))
+            (
+                guard.subject?,
+                ConditionKey::BooleanEquality(value),
+                if negated { fact.opposite() } else { fact },
+            )
         }
         GuardPredicate::ConstantBoolean { .. }
         | GuardPredicate::OrderedIntegerComparison { .. }
         | GuardPredicate::OrderedFloatComparison { .. }
         | GuardPredicate::NanComparison { .. }
-        | GuardPredicate::NullComparison { .. }
         | GuardPredicate::InstanceOf { .. }
         | GuardPredicate::ExactClass { .. }
         | GuardPredicate::HasMember { .. }
-        | GuardPredicate::Opaque { .. } => None,
-    }
+        | GuardPredicate::Opaque { .. } => return None,
+    };
+    let binding = binding_origins
+        .unique_binding_origin(subject)
+        .unwrap_or(subject);
+    semantics
+        .value(binding)?
+        .kind
+        .is_binding()
+        .then_some((binding, key, fact))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -840,6 +1315,8 @@ struct BooleanDefinition {
     point: ProgramPointId,
     event_index: usize,
     rhs: Option<ValueId>,
+    condition: Option<ConditionKey>,
+    edge: Option<ControlEdgeId>,
 }
 
 impl BooleanDefinition {
@@ -874,6 +1351,11 @@ struct Pair {
 /// correlation this analysis exists to keep.
 #[derive(Debug, Clone, Default)]
 struct FlowState {
+    reachable: bool,
+    /// A represented normal continuation crossed a call whose return effects
+    /// are unresolved. This is carried only for local-initialization reads;
+    /// a read is open only when an uninitialized definition also reaches it.
+    uncertain_return: bool,
     /// Reaching definitions of each tracked data binding, as indices into the
     /// definition table.  The same set for every boolean binding.
     reaching: HashMap<ValueId, HashSet<usize>>,
@@ -930,7 +1412,10 @@ impl FlowState {
         definitions: &DefinitionTable,
         budget: &mut SemanticBudget,
     ) -> Result<Self, CorrelationError> {
-        let mut state = Self::default();
+        let mut state = Self {
+            reachable: true,
+            ..Self::default()
+        };
         for &data_binding in data_bindings {
             let data_definition = *definitions
                 .data_lookup
@@ -952,6 +1437,8 @@ impl FlowState {
                 point: definitions.entry_point,
                 event_index: BooleanDefinition::ENTRY_EVENT_INDEX,
                 rhs: None,
+                condition: None,
+                edge: None,
             };
             charge_entries(budget, 1)?;
             state.facts.insert(
@@ -966,7 +1453,7 @@ impl FlowState {
 
     /// The point has no state yet: nothing has reached it.
     fn is_bottom(&self) -> bool {
-        self.reaching.is_empty() && self.facts.is_empty()
+        !self.reachable
     }
 
     /// The `(data definition, boolean definition, fact)` triples that reach
@@ -1030,6 +1517,8 @@ impl FlowState {
             *self = other.clone();
             return Ok(true);
         }
+        let uncertain_return_changed = !self.uncertain_return && other.uncertain_return;
+        self.uncertain_return |= other.uncertain_return;
         let empty_reaching = HashSet::<usize>::default();
         let empty_facts = HashSet::<(BooleanDefinition, BoolFact)>::default();
         let changed_data = other
@@ -1135,7 +1624,7 @@ impl FlowState {
                 }
             }
         }
-        Ok(changed)
+        Ok(changed || uncertain_return_changed)
     }
 }
 
@@ -1145,6 +1634,8 @@ struct DefinitionTable {
     data_records: Vec<DefinitionRecord>,
     data_lookup: HashMap<DefinitionRecord, usize>,
     boolean_records: HashMap<BooleanDefinition, BooleanDefinition>,
+    uninitialized_data: HashSet<usize>,
+    unknown_data: HashSet<usize>,
 }
 
 impl DefinitionTable {
@@ -1154,12 +1645,13 @@ impl DefinitionTable {
 
     fn index_entry_definitions(
         &mut self,
-        entry_point: ProgramPointId,
+        semantics: &crate::analyzer::semantic::ProcedureSemantics,
         data_bindings: &[ValueId],
         bool_bindings: &[ValueId],
         budget: &mut SemanticBudget,
         cancellation: Option<&CancellationToken>,
     ) -> Result<(), CorrelationError> {
+        let entry_point = semantics.entry_point();
         self.entry_point = entry_point;
         for &binding in data_bindings {
             check_cancelled(cancellation)?;
@@ -1179,6 +1671,8 @@ impl DefinitionTable {
                 point: entry_point,
                 event_index: BooleanDefinition::ENTRY_EVENT_INDEX,
                 rhs: None,
+                condition: None,
+                edge: None,
             });
         }
         Ok(())
@@ -1191,6 +1685,7 @@ impl DefinitionTable {
         data_bindings: &[ValueId],
         bool_bindings: &[ValueId],
         open_bindings: &HashSet<ValueId>,
+        uninitialized_entry_bindings: &HashSet<ValueId>,
         binding_origins: &BindingOriginIndex,
         correlation_events: &[Vec<usize>],
         budget: &mut SemanticBudget,
@@ -1239,6 +1734,8 @@ impl DefinitionTable {
                             point: point.id,
                             event_index,
                             rhs,
+                            condition: None,
+                            edge: None,
                         });
                     }
                 }
@@ -1246,8 +1743,17 @@ impl DefinitionTable {
         }
         self.data_records.sort_unstable();
         self.data_lookup.clear();
+        self.uninitialized_data.clear();
+        self.unknown_data.clear();
         for (index, definition) in self.data_records.iter().copied().enumerate() {
             self.data_lookup.insert(definition, index);
+            if (definition.is_entry() && uninitialized_entry_bindings.contains(&definition.binding))
+                || is_uninitialized_definition(semantics, definition)
+            {
+                self.uninitialized_data.insert(index);
+            } else if !definition.is_entry() && definition.rhs.is_none() {
+                self.unknown_data.insert(index);
+            }
         }
         Ok(())
     }
@@ -1314,37 +1820,111 @@ fn transfer_point(
         &correlation_events[point_id.index()],
     ) {
         check_cancelled(cancellation)?;
-        match write {
-            ComponentWrite::Data {
-                binding,
-                event_index,
-                rhs,
-            } => {
-                let definition = definitions.data_definition(binding, point_id, event_index, rhs);
-                replace_data_component(&mut state, binding, definition);
-            }
-            ComponentWrite::Boolean {
-                binding,
-                event_index,
-                rhs,
-            } => {
-                let definition = BooleanDefinition {
-                    binding,
-                    point: point_id,
-                    event_index,
-                    rhs,
-                };
-                replace_boolean_component(
-                    &mut state,
-                    binding,
-                    rhs,
-                    definition,
-                    semantics,
-                    bool_bindings,
-                    budget,
-                )?;
-            }
+        apply_component_write(
+            &mut state,
+            point_id,
+            write,
+            definitions,
+            semantics,
+            bool_bindings,
+            budget,
+        )?;
+    }
+    Ok(state)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_component_write(
+    state: &mut FlowState,
+    point: ProgramPointId,
+    write: ComponentWrite,
+    definitions: &DefinitionTable,
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    bool_bindings: &[ValueId],
+    budget: &mut SemanticBudget,
+) -> Result<(), CorrelationError> {
+    match write {
+        ComponentWrite::Data {
+            binding,
+            event_index,
+            rhs,
+        } => {
+            let definition = definitions.data_definition(binding, point, event_index, rhs);
+            replace_data_component(state, binding, definition);
         }
+        ComponentWrite::Boolean {
+            binding,
+            event_index,
+            rhs,
+        } => {
+            let definition = BooleanDefinition {
+                binding,
+                point,
+                event_index,
+                rhs,
+                condition: None,
+                edge: None,
+            };
+            replace_boolean_component(
+                state,
+                binding,
+                rhs,
+                definition,
+                semantics,
+                bool_bindings,
+                budget,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn state_at_event(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    point_id: ProgramPointId,
+    event_index: usize,
+    entry_state: &FlowState,
+    definitions: &DefinitionTable,
+    bool_bindings: &[ValueId],
+    data_bindings: &[ValueId],
+    open_bindings: &HashSet<ValueId>,
+    binding_origins: &BindingOriginIndex,
+    correlation_events: &[usize],
+    budget: &mut SemanticBudget,
+    cancellation: Option<&CancellationToken>,
+) -> Result<FlowState, CorrelationError> {
+    let point = semantics.point(point_id).expect("validated point exists");
+    let mut state = entry_state.clone();
+    let writes = component_writes(
+        semantics,
+        point,
+        data_bindings,
+        bool_bindings,
+        WriteTargets {
+            open_bindings,
+            binding_origins,
+        },
+        correlation_events,
+    );
+    for write in writes {
+        let write_index = match write {
+            ComponentWrite::Data { event_index, .. }
+            | ComponentWrite::Boolean { event_index, .. } => event_index,
+        };
+        if write_index >= event_index {
+            break;
+        }
+        check_cancelled(cancellation)?;
+        apply_component_write(
+            &mut state,
+            point_id,
+            write,
+            definitions,
+            semantics,
+            bool_bindings,
+            budget,
+        )?;
     }
     Ok(state)
 }
@@ -1587,6 +2167,7 @@ pub(super) fn correlation_event_candidate(effect: &SemanticEffect) -> bool {
     )
 }
 
+#[cfg(test)]
 fn make_candidate(
     edge: ControlEdgeId,
     bool_binding: ValueId,
@@ -1595,9 +2176,65 @@ fn make_candidate(
     pairs: &HashSet<Pair>,
     definitions: &DefinitionTable,
 ) -> CorrelationCandidate {
+    make_candidate_filtered(
+        edge,
+        bool_binding,
+        None,
+        expected,
+        data_binding,
+        pairs,
+        definitions,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_condition_candidate(
+    edge: ControlEdgeId,
+    bool_binding: ValueId,
+    condition: ConditionKey,
+    expected: BoolFact,
+    data_binding: ValueId,
+    pairs: &HashSet<Pair>,
+    definitions: &DefinitionTable,
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+) -> CorrelationCandidate {
+    make_candidate_filtered(
+        edge,
+        bool_binding,
+        Some(condition),
+        expected,
+        data_binding,
+        pairs,
+        definitions,
+        Some(semantics),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_candidate_filtered(
+    edge: ControlEdgeId,
+    bool_binding: ValueId,
+    condition: Option<ConditionKey>,
+    expected: BoolFact,
+    data_binding: ValueId,
+    pairs: &HashSet<Pair>,
+    definitions: &DefinitionTable,
+    semantics: Option<&crate::analyzer::semantic::ProcedureSemantics>,
+) -> CorrelationCandidate {
     let mut by_data = HashMap::<usize, (bool, bool, bool)>::default();
     for pair in pairs {
         let entry = by_data.entry(pair.data_definition).or_default();
+        if condition.is_some_and(|condition| {
+            !pair_matches_condition(
+                pair,
+                condition,
+                semantics.expect("a condition check has semantic values"),
+            )
+        }) {
+            entry.2 = true;
+            continue;
+        }
         match pair.fact {
             BoolFact::Unknown => entry.2 = true,
             fact if fact == expected => entry.0 = true,
@@ -1674,6 +2311,8 @@ mod correlation_properties {
             point: ProgramPointId::new(index as u32),
             event_index: index,
             rhs: None,
+            condition: None,
+            edge: None,
         }
     }
 
@@ -1681,7 +2320,10 @@ mod correlation_properties {
         data_bindings: &[ValueId],
         boolean_bindings: &[ValueId],
     ) -> (FlowState, ReferenceState) {
-        let mut actual = FlowState::default();
+        let mut actual = FlowState {
+            reachable: true,
+            ..FlowState::default()
+        };
         let mut reference = ReferenceState::default();
         for &data_binding in data_bindings {
             actual
@@ -1972,7 +2614,7 @@ mod correlation_properties {
     /// the carried points a fixpoint over the whole CFG reaches, which is what
     /// makes storing state only at carried points equivalent.
     fn reachable_in_full_graph(
-        successors: &[Vec<ProgramPointId>],
+        successors: &[Vec<(ControlEdgeId, ProgramPointId)>],
         from: usize,
     ) -> std::collections::BTreeSet<usize> {
         // Reachability along one or more edges, so a cycle reports its own
@@ -1981,7 +2623,7 @@ mod correlation_properties {
         let mut visited = vec![false; successors.len()];
         let mut queue = VecDeque::from([from]);
         while let Some(point) = queue.pop_front() {
-            for target in &successors[point] {
+            for (_, target) in &successors[point] {
                 if !visited[target.index()] {
                     visited[target.index()] = true;
                     seen.insert(target.index());
@@ -1994,7 +2636,8 @@ mod correlation_properties {
 
     /// A carried marking the production rule can produce: every point two or
     /// more edges reach is carried, and any other point may be.
-    fn graph_strategy() -> impl Strategy<Value = (Vec<Vec<ProgramPointId>>, Vec<bool>)> {
+    fn graph_strategy()
+    -> impl Strategy<Value = (Vec<Vec<(ControlEdgeId, ProgramPointId)>>, Vec<bool>)> {
         (2_usize..=8)
             .prop_flat_map(|point_count| {
                 (
@@ -2007,21 +2650,26 @@ mod correlation_properties {
                 )
             })
             .prop_map(|(point_count, edges, extra)| {
+                let mut next_edge = 0;
                 let successors = edges
                     .into_iter()
                     .map(|targets| {
-                        let mut targets = targets
-                            .into_iter()
-                            .map(|target| ProgramPointId::new(target as u32))
-                            .collect::<Vec<_>>();
+                        let mut targets = targets;
                         targets.sort_unstable();
                         targets.dedup();
                         targets
+                            .into_iter()
+                            .map(|target| {
+                                let edge = ControlEdgeId::new(next_edge);
+                                next_edge += 1;
+                                (edge, ProgramPointId::new(target as u32))
+                            })
+                            .collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>();
                 let mut predecessors = vec![0usize; point_count];
                 for targets in &successors {
-                    for target in targets {
+                    for (_, target) in targets {
                         predecessors[target.index()] += 1;
                     }
                 }
@@ -2056,8 +2704,8 @@ mod correlation_properties {
                 let mut queue = VecDeque::from([source]);
                 while let Some(point) = queue.pop_front() {
                     for target in &reduced[point] {
-                        if closure.insert(target.index()) {
-                            queue.push_back(target.index());
+                        if closure.insert(target.target.index()) {
+                            queue.push_back(target.target.index());
                         }
                     }
                 }

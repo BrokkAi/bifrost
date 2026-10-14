@@ -1279,6 +1279,29 @@ impl SemanticArtifactSourceSnapshot {
 }
 
 /// A standalone per-language adapter boundary for immutable semantic artifacts.
+///
+/// The exact physical language namespace used by the analyzer store. This is
+/// intentionally distinct from semantic `Language`: adapters may publish more
+/// than one physical projection for the same semantic language (for example
+/// TypeScript/TSX and C/C++).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StorageLanguageKey(String);
+
+impl StorageLanguageKey {
+    /// Retain the exact key returned by a language adapter.
+    pub fn from_adapter(key: &'static str) -> Self {
+        Self(key.to_owned())
+    }
+
+    pub(crate) fn from_store(key: String) -> Self {
+        Self(key)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 pub trait ProgramSemanticsProvider: Send + Sync {
     /// Capabilities published by the semantic adapter selected for a file.
     /// This metadata is available before lowering so query planning can report
@@ -1297,6 +1320,13 @@ pub trait ProgramSemanticsProvider: Send + Sync {
         file: &ProjectFile,
         max_source_bytes: usize,
     ) -> Result<Option<SemanticArtifactSourceSnapshot>, SemanticProviderError>;
+
+    /// Exact physical storage namespace selected by this provider's adapter
+    /// for `file`. This must come from the same adapter that owns the semantic
+    /// source snapshot; coarse `Language` cannot distinguish dialect rows.
+    fn storage_language_key_for_file(&self, _file: &ProjectFile) -> Option<StorageLanguageKey> {
+        None
+    }
 
     /// Derive the complete identity of the file's current atomic source
     /// snapshot without parsing, lowering procedures, or charging semantic

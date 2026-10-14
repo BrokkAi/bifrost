@@ -1,6 +1,7 @@
 //! Durable semantic identities and artifact-local dense IDs.
 
 use std::fmt;
+use std::hash::Hasher;
 use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -242,7 +243,9 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// 14's structural source-mapping identity. Every cached semantic artifact
 /// and every wire id derived from one rotates exactly once when this constant
 /// moves; that is a mechanical consequence of extending the IR, not a signal
-/// that anything else changed.
+/// that anything else changed. A checked-in golden expectation that embeds one
+/// of those ids must be re-blessed with `BIFROST_BLESS=1` in the same change;
+/// the code-query tutorial pages elide them (#5016).
 pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 45;
 
 impl SemanticIrVersion {
@@ -1198,6 +1201,14 @@ impl SemanticArtifactKey {
         digest.finish()
     }
 
+    /// Hashes the semantic environment that scopes every public wire id: the
+    /// adapter name and fingerprint, the IR version, configuration and
+    /// dependencies. Changing any of them (an adapter `ADAPTER_VERSION` bump or
+    /// a `SEMANTIC_IR_SCHEMA_VERSION` bump) rotates every id derived from this
+    /// key even when the documented behavior does not change. A checked-in
+    /// golden expectation that embeds such an id must be re-blessed with
+    /// `BIFROST_BLESS=1` in the same change; the code-query tutorial pages
+    /// elide these volatile ids instead (#5016).
     fn push_environment_identity(&self, digest: &mut LengthDelimitedDigest) {
         digest.push(self.adapter.name().as_bytes());
         digest.push(self.adapter.fingerprint().as_bytes());
@@ -1253,6 +1264,79 @@ impl LengthDelimitedDigest {
         let mut value = [0_u8; 32];
         value.copy_from_slice(&digest);
         StableDigest::from_array(value)
+    }
+}
+
+pub(crate) struct SemanticDigestHasher(LengthDelimitedDigest);
+
+impl SemanticDigestHasher {
+    pub(crate) fn new(domain: &[u8]) -> Self {
+        Self(LengthDelimitedDigest::new(domain))
+    }
+
+    pub(crate) fn finish_digest(self) -> StableDigest {
+        self.0.finish()
+    }
+}
+
+impl Hasher for SemanticDigestHasher {
+    fn finish(&self) -> u64 {
+        let digest = self.0.clone().finish();
+        let mut head = [0_u8; 8];
+        head.copy_from_slice(&digest.as_bytes()[..8]);
+        u64::from_le_bytes(head)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.push(bytes);
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_u128(&mut self, value: u128) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(u64::try_from(value).expect("usize fits u64 on supported targets"));
+    }
+
+    fn write_i8(&mut self, value: i8) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_i16(&mut self, value: i16) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_i32(&mut self, value: i32) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_i64(&mut self, value: i64) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_i128(&mut self, value: i128) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.write_i64(i64::try_from(value).expect("isize fits i64 on supported targets"));
     }
 }
 

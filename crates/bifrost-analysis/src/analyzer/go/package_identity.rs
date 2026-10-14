@@ -123,6 +123,41 @@ fn go_signature_applicability(
     }
 }
 
+/// Resolve one structurally selected member path with provider-supplied
+/// postings. Native and incumbent navigation share the walk, including the
+/// rule that an absent segment cannot be bypassed by a later matching name.
+pub(crate) struct GoVisibleMemberPath {
+    pub(crate) symbol_name: String,
+    pub(crate) reference_name: String,
+}
+
+pub(crate) fn go_visible_member_path<'a>(
+    package: &str,
+    mut members: impl Iterator<Item = &'a str>,
+    package_member: impl Fn(&str, &str) -> Option<String>,
+    symbol: impl Fn(&str) -> Option<String>,
+    mut step: impl FnMut() -> bool,
+) -> Option<GoVisibleMemberPath> {
+    if !step() {
+        return None;
+    }
+    let first = members.next()?;
+    let mut target = package_member(package, first)?;
+    let mut reference = format!("{package}.{first}");
+    for member in members {
+        if !step() {
+            return None;
+        }
+        target = symbol(&format!("{target}.{member}"))?;
+        reference.push('.');
+        reference.push_str(member);
+    }
+    Some(GoVisibleMemberPath {
+        symbol_name: target,
+        reference_name: reference,
+    })
+}
+
 /// The activated overlay, read as a Go package index.
 #[derive(Clone, Copy)]
 pub(crate) struct GoOverlayPackages<'a> {

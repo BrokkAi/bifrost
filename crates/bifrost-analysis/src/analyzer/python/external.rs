@@ -606,7 +606,7 @@ fn python_module_name_from_import_root(import_root: &Path, path: &Path) -> Optio
     python_module_name_from_relative(path.strip_prefix(import_root).ok()?)
 }
 
-pub(super) fn python_module_name_from_relative(relative: &Path) -> Option<String> {
+pub(crate) fn python_module_name_from_relative(relative: &Path) -> Option<String> {
     Some(python_module_components_from_relative(relative)?.join("."))
 }
 
@@ -1008,7 +1008,14 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                         .filter(|(_, base)| !self.is_typing_marker_base(*base, &owner, guard))
                         .map(|(ordinal, base)| HierarchyFact {
                             hierarchy_kind: crate::analyzer::semantic_model::HierarchyKind::Extends,
-                            target: self.hierarchy_type_ref(base, &owner, guard),
+                            target: {
+                                let mut target = self.hierarchy_type_ref(base, &owner, guard);
+                                if let TypeRef::Named { name, .. } = &mut target {
+                                    *name =
+                                        python_qualified_base_name(name, self.module).into_owned();
+                                }
+                                target
+                            },
                             declaration_ordinal: Some(
                                 u32::try_from(ordinal).expect("Python base ordinal fits u32"),
                             ),
@@ -2406,11 +2413,23 @@ fn node_identifier(node: Option<Node<'_>>, source: &str) -> Option<String> {
     .filter(|name| !name.is_empty())
 }
 
-/// Whether a decorated definition is the setter or deleter half of the
-/// property it is named for, rather than a member of its own.
+/// Module-relative spelling of a structured Python base name.
+pub(crate) fn python_qualified_base_name<'a>(
+    name: &'a str,
+    module: &str,
+) -> std::borrow::Cow<'a, str> {
+    if name.contains('.') {
+        name.into()
+    } else {
+        format!("{module}.{name}").into()
+    }
+}
+
 /// The root every Python class extends when it names no other base.
 const PYTHON_OBJECT_TYPE: &str = "builtins.object";
 
+/// Whether a decorated definition is the setter or deleter half of the
+/// property it is named for, rather than a member of its own.
 fn declares_property_accessor(decorated: Node<'_>, name: &str, source: &str) -> bool {
     named_children(decorated)
         .filter(|child| child.kind() == "decorator")

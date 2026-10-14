@@ -1286,7 +1286,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     "diff_scoped": {
                         "type": "boolean",
                         "default": false,
-                        "description": "When true, with diff_base, the taint composition binds sinks only in the files the diff base changed, and reports only findings whose sink lies in them. The run carries a scope record that names the examined files; an empty result is then no claim about sinks outside them. Other policies and the ICFG taint engine still run over the whole workspace and say so in their scope record. Requires diff_base and incremental true."
+                        "description": "When true, with diff_base, the taint composition binds sinks only in procedures overlapping changed hunks from the diff base, and reports only findings whose sink lies in those procedures. The run carries a scope record that names the examined procedure ranges; an empty result is then no claim about sinks outside them. Other policies and the ICFG taint engine still run over the whole workspace and say so in their scope record. Requires diff_base and incremental true."
                     },
                     "incremental": {
                         "type": "boolean",

@@ -131,7 +131,16 @@ impl SemanticModelOverlay {
                         continue;
                     }
                 };
-                let resolved = self.resolve_edge_target(name, "java");
+                let resolved = self.resolve_edge_target(
+                    name,
+                    "java",
+                    match edge.hierarchy_kind {
+                        HierarchyKind::Implements => {
+                            HierarchyTargetShape::Kind(SemanticModelSymbolKind::Interface)
+                        }
+                        _ => HierarchyTargetShape::Kind(current.kind),
+                    },
+                );
                 if let Some(defect) = resolved.defect {
                     answer
                         .incomplete

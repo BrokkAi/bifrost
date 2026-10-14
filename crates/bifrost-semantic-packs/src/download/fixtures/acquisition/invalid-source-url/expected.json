@@ -1,0 +1,19 @@
+{
+  "created_at": "<TIMESTAMP>",
+  "engine": {
+    "build_identity": "fixture-build",
+    "executable_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version": "9.9.0"
+  },
+  "failure": {
+    "class": "invalid-source",
+    "message": "trusted URLs require HTTPS without credentials, ports, queries, or fragments",
+    "retryable": false
+  },
+  "inventory": null,
+  "outcome_schema_version": 1,
+  "rejections": [],
+  "request": null,
+  "selection": null,
+  "status": "failed"
+}

@@ -186,4 +186,109 @@ export function after() { return view; }"#;
             }
         }
     }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4479: the released TS/TSX grammar rejected raw NUL in string/comment payloads"
+    )]
+    #[test]
+    fn ts_tsx_raw_nul_payload_preserves_opaque_nodes_and_later_declarations() {
+        for (path, language) in [
+            ("view.ts", Language::TypeScript),
+            ("view.tsx", Language::TypeScript),
+            ("view.jsx", Language::JavaScript),
+        ] {
+            // `.jsx` intentionally uses the TSX grammar, while ordinary `.js`
+            // continues to use its separate JavaScript grammar.
+            let jsx = if path == "view.ts" {
+                ""
+            } else {
+                "export const view = <div>{quoted}</div>;\n"
+            };
+            let source = format!(
+                "const quoted = 'a\0b';\n/* c\0d */\nconst templated = `e\0f`;\n{jsx}export function after() {{ return quoted + templated; }}\n"
+            );
+            assert_eq!(
+                source.as_bytes().iter().filter(|&&byte| byte == 0).count(),
+                3,
+                "{path}: test source must contain actual NUL bytes"
+            );
+
+            let file = ProjectFile::new(std::env::current_dir().unwrap(), path);
+            let grammar = js_ts_tree_sitter_language_for_file(&file, language).unwrap();
+            let tree = parse_with_language(&source, &grammar).unwrap().unwrap();
+            let root = tree.root_node();
+            assert!(!root.has_error(), "{path}: {}", root.to_sexp());
+            assert_eq!(root.end_byte(), source.len(), "{path}: parser input tail");
+
+            let (mut found_string, mut found_comment, mut found_template) = (false, false, false);
+            let mut nodes = vec![root];
+            while let Some(node) = nodes.pop() {
+                let text = node.utf8_text(source.as_bytes()).unwrap();
+                match node.kind() {
+                    "string" if text == "'a\0b'" => found_string = true,
+                    "comment" if text == "/* c\0d */" => found_comment = true,
+                    "template_string" if text == "`e\0f`" => found_template = true,
+                    _ => {}
+                }
+                let mut cursor = node.walk();
+                nodes.extend(node.named_children(&mut cursor));
+            }
+            assert!(found_string, "{path}: raw string payload was not preserved");
+            assert!(
+                found_comment,
+                "{path}: raw comment payload was not preserved"
+            );
+            assert!(
+                found_template,
+                "{path}: raw template payload was not preserved"
+            );
+
+            let parsed = if language == Language::TypeScript {
+                crate::typescript::parse_typescript_file(&file, &source, &tree)
+            } else {
+                crate::javascript::parse_javascript_file(&file, &source, &tree)
+            };
+            assert!(
+                parsed
+                    .declarations()
+                    .iter()
+                    .any(|unit| unit.identifier() == "after"),
+                "{path}: declaration after opaque NUL payload was lost"
+            );
+            if path != "view.ts" {
+                assert!(
+                    parsed
+                        .declarations()
+                        .iter()
+                        .any(|unit| unit.identifier() == "view"),
+                    "{path}: JSX declaration after opaque NUL payload was lost"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_nul_in_executable_ts_tsx_contexts_remains_a_parse_error() {
+        let invalid_sources = [
+            "export const broken\0Name = 1;",
+            "const value = `before ${broken\0Name} after`;",
+        ];
+        for (path, language) in [
+            ("near-miss.ts", Language::TypeScript),
+            ("near-miss.tsx", Language::TypeScript),
+            ("near-miss.jsx", Language::JavaScript),
+        ] {
+            let file = ProjectFile::new(std::env::current_dir().unwrap(), path);
+            let grammar = js_ts_tree_sitter_language_for_file(&file, language).unwrap();
+            for source in invalid_sources {
+                assert!(source.as_bytes().contains(&0));
+                let tree = parse_with_language(source, &grammar).unwrap().unwrap();
+                assert!(
+                    tree.root_node().has_error(),
+                    "{path}: executable NUL unexpectedly parsed cleanly: {}",
+                    tree.root_node().to_sexp()
+                );
+            }
+        }
+    }
 }

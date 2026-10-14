@@ -1303,6 +1303,13 @@ impl DependencyDiscoveryEvidence {
         &self.informational_evidence
     }
 
+    /// Exact declared module identities retained from the completed discovery
+    /// publication, for same-process activation receipts. This exposes the
+    /// existing query result without creating another retained collection.
+    pub(crate) fn activation_receipt_declared_modules(&self) -> impl Iterator<Item = &str> {
+        self.declared_modules.iter().map(String::as_str)
+    }
+
     /// Whether the build declares `path` or a module containing it: an exact
     /// declared identity, or one reached by walking the dotted path back
     /// toward its root (`requests.adapters.HTTPAdapter` is declared when the

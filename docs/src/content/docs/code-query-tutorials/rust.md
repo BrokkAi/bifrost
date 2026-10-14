@@ -174,10 +174,10 @@ projects that source match to its unique suspension point.
         "completeness": "complete",
         "proof": "proven"
       },
-      "id": "5fb24806fe461a1d5e98280cc39ecc70aa7c713adb2e5336790d43e7316101cb",
+      "id": "<public-id>",
       "language": "rust",
       "path": "rust/lib.rs",
-      "procedure_id": "609308a9b08e859530fb04e94dd651dae7f9b8de075928d1906d4ebc73bca579",
+      "procedure_id": "<public-id>",
       "provenance": [
         {
           "seed": {
@@ -191,9 +191,9 @@ projects that source match to its unique suspension point.
             {
               "op": "program_point_of",
               "result": {
-                "id": "5fb24806fe461a1d5e98280cc39ecc70aa7c713adb2e5336790d43e7316101cb",
+                "id": "<public-id>",
                 "path": "rust/lib.rs",
-                "procedure_id": "609308a9b08e859530fb04e94dd651dae7f9b8de075928d1906d4ebc73bca579",
+                "procedure_id": "<public-id>",
                 "range": {
                   "end_column": 24,
                   "end_line": 24,

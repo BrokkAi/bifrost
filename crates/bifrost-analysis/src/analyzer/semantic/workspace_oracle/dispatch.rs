@@ -41,6 +41,7 @@ use crate::analyzer::semantic_model::{
     compiled_flow_claims_agree,
 };
 use crate::analyzer::structural::resolution::{BoundaryStatus, MethodFamilyRelation};
+use crate::analyzer::usages::call_relations::PrefetchedCallFile;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, CallApplicationKind, DefinitionLookupStatus, DispatchQuality,
     ExactExternalCallProof, dispatch_quality_for_status, go_allocation_selector_method,
@@ -175,6 +176,7 @@ struct PreparedCallDispatch {
 pub struct PreparedWorkspaceDispatchPool<'a> {
     oracle: WorkspaceSemanticOracle<'a>,
     sessions: Mutex<Vec<Arc<PreparedWorkspaceDispatchPoolEntry<'a>>>>,
+    prefetched: Mutex<HashMap<ProjectFile, PrefetchedCallFile>>,
 }
 
 struct PreparedWorkspaceDispatchPoolEntry<'a> {
@@ -186,6 +188,88 @@ struct PreparedWorkspaceDispatchPoolEntry<'a> {
 }
 
 impl<'a> PreparedWorkspaceDispatchPool<'a> {
+    /// Resolve only native forward answers for the reverse inventory. Artifact
+    /// materialization and all semantic projection stay on the demanding thread.
+    #[doc(hidden)]
+    pub fn prefetch_callers(
+        &self,
+        sites: &[crate::analyzer::usages::CallSite],
+        request: &SemanticRequest<'_>,
+    ) -> Result<(), SemanticProviderError> {
+        if request.budget.first_refusal().is_some()
+            || request.cancellation.is_cancelled()
+            || request.cancellation.soft_deadline_passed()
+        {
+            self.discard_prefetched();
+            return Ok(());
+        }
+        // The prefetch is one language's native operation, so ask the supports
+        // that own the submitted sites. A language without a selected native
+        // reverse operation answers nothing and stays on the demand path.
+        let snapshot = self.oracle.active_semantic_model_snapshot();
+        let languages = sites
+            .iter()
+            .map(|site| site.file.language())
+            .collect::<HashSet<_>>();
+        let mut answers = HashMap::default();
+        for language in languages {
+            let Some(support) = language_support(language) else {
+                continue;
+            };
+            let Some(result) = support.prefetch_reverse_call_targets(
+                self.oracle.workspace,
+                sites,
+                request.cancellation,
+                snapshot.clone(),
+            ) else {
+                continue;
+            };
+            answers.extend(
+                result.map_err(|error| SemanticProviderError::internal(error.to_string()))?,
+            );
+        }
+        if crate::profiling::enabled() {
+            let prefetched = answers
+                .values()
+                .map(|file| file.outcomes.len())
+                .sum::<usize>();
+            crate::profiling::note(format!(
+                "taint.compose.callers.prefetch retained={} prefetched={prefetched}",
+                sites.len()
+            ));
+        }
+        self.prefetched
+            .lock()
+            .expect("caller prefetch lock")
+            .extend(answers);
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn discard_prefetched(&self) {
+        self.prefetched
+            .lock()
+            .expect("caller prefetch lock")
+            .clear();
+        let sessions = self
+            .sessions
+            .lock()
+            .expect("prepared workspace dispatch pool lock");
+        for entry in sessions.iter() {
+            if let Some(session) = entry
+                .session
+                .lock()
+                .expect("prepared workspace dispatch session lock")
+                .as_mut()
+            {
+                session.prefetched = None;
+                if let Some(low_level) = session.low_level.as_mut() {
+                    low_level.discard_prefetched();
+                }
+            }
+        }
+    }
+
     /// The pool entry of `artifact`'s exact allocation, created empty when the
     /// pool has none.
     fn entry(
@@ -276,6 +360,12 @@ impl<'a> PreparedWorkspaceDispatchPool<'a> {
         call: &CallSiteHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        if request.budget.first_refusal().is_some()
+            || request.cancellation.is_cancelled()
+            || request.cancellation.soft_deadline_passed()
+        {
+            self.discard_prefetched();
+        }
         if request.cancellation.is_cancelled() {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
@@ -313,7 +403,19 @@ impl<'a> PreparedWorkspaceDispatchPool<'a> {
                 work: SemanticWork::default(),
             });
         }
+        let file = ProjectFile::new(
+            self.oracle.workspace.analyzer().project().root(),
+            entry.artifact.key().path().as_path(),
+        );
+        let prefetched = self
+            .prefetched
+            .lock()
+            .expect("caller prefetch lock")
+            .remove(&file);
         if let Some(session) = retained.as_mut() {
+            if prefetched.is_some() {
+                session.prefetched = prefetched;
+            }
             session.expect_calls(expected);
             return session.resolve_call(call, request);
         }
@@ -321,6 +423,7 @@ impl<'a> PreparedWorkspaceDispatchPool<'a> {
         let mut session = self
             .oracle
             .prepare_call_dispatch_session(Arc::clone(&entry.artifact));
+        session.prefetched = prefetched;
         session.expect_calls(expected);
         let outcome = session.resolve_call(call, request)?;
         let replayable = matches!(
@@ -358,6 +461,7 @@ pub struct PreparedWorkspaceDispatchSession<'a> {
     low_level_source_paid: bool,
     /// Announced whole-call spans held until the exact-syntax session exists.
     expected_calls: Vec<Range>,
+    prefetched: Option<PrefetchedCallFile>,
 }
 
 impl PreparedWorkspaceDispatchSession<'_> {
@@ -479,6 +583,9 @@ impl PreparedWorkspaceDispatchSession<'_> {
             .low_level
             .as_mut()
             .expect("the first real dispatch call initializes its source session");
+        if let Some(prefetched) = self.prefetched.take() {
+            low_level.install_prefetched(prefetched);
+        }
         low_level.expect_calls(std::mem::take(&mut self.expected_calls));
         let source_was_paid = self.low_level_source_paid;
         let mut lookup = low_level.dispatch_at_bounded(
@@ -1045,6 +1152,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         PreparedWorkspaceDispatchPool {
             oracle: self.clone(),
             sessions: Mutex::new(Vec::new()),
+            prefetched: Mutex::new(HashMap::default()),
         }
     }
 
@@ -1060,6 +1168,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             low_level: None,
             low_level_source_paid: false,
             expected_calls: Vec::new(),
+            prefetched: None,
         }
     }
 
@@ -3088,7 +3197,8 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 nested_entries: resolution_work
                     .setup_nodes
                     .saturating_add(resolution_work.scope_nodes)
-                    .saturating_add(resolution_work.summary_expansions),
+                    .saturating_add(resolution_work.summary_expansions)
+                    .saturating_add(resolution_work.resolution_rounds),
                 ..SemanticWork::default()
             };
             work = work.conservative_add(charged);
@@ -5049,7 +5159,9 @@ pub(crate) fn dispatch_result_work(result: &DispatchResult) -> SemanticWork {
             Some(OracleRelationSubject::DispatchBoundary(kind)) => {
                 Some(dispatch_boundary_kind_locator_work(kind))
             }
-            Some(OracleRelationSubject::DispatchCandidate(_)) | None => None,
+            Some(OracleRelationSubject::DispatchCandidate(_))
+            | Some(OracleRelationSubject::MemoryOperation(_))
+            | None => None,
         })
         .fold(SemanticWork::default(), SemanticWork::conservative_add);
     let owned_text_bytes = result

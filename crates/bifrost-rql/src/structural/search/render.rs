@@ -1,8 +1,10 @@
 use super::results::CodeQueryAbsentMemberLocation;
 use super::results::CodeQueryConfigurationFact;
 use super::results::CodeQueryCrossDomain;
+use super::results::CodeQueryExternalCalleeKey;
 use super::results::CodeQueryMatchRelations;
 use super::results::CodeQueryPointsToCandidate;
+use super::results::CodeQueryProcedureEffectWitness;
 use super::results::CodeQueryRuntimeKeyedReadValue;
 use super::*;
 
@@ -1458,6 +1460,18 @@ pub(super) fn render_dispatch_outcome(
     }
 }
 
+fn render_external_callee_key(
+    key: &crate::analyzer::usages::effects::ModeledProcedureKey,
+) -> CodeQueryExternalCalleeKey {
+    CodeQueryExternalCalleeKey {
+        language: key.language.clone(),
+        owner: key.owner.clone(),
+        member: key.member.clone(),
+        has_receiver: key.has_receiver,
+        parameter_count: key.parameter_count,
+    }
+}
+
 /// One bounded dispatch arm of one site.
 ///
 /// The target declaration is rendered through the same `render_unit_declaration`
@@ -1492,6 +1506,12 @@ pub(super) fn render_dispatch_target(
         coverage: site.answer.coverage.label(),
         dispatch: site.answer.dispatch_label(arm),
         boundary_kind: arm.boundary_kind,
+        external_callee_key: arm
+            .unmaterialized_target
+            .as_ref()
+            .map(effects::external_modeled_key)
+            .as_ref()
+            .map(render_external_callee_key),
     }
 }
 
@@ -3967,6 +3987,26 @@ pub(super) fn render_procedure_effect(
         witness_site_id: row.witness_site_id().map(str::to_owned),
         witness_effect_site_id: row.witness_effect_site_id().map(str::to_owned),
         witness_chain: row.witness_chain(),
+        witness_hops: row
+            .witness
+            .iter()
+            .map(|step| CodeQueryProcedureEffectWitness {
+                caller_procedure_id: step.caller_procedure_id.clone(),
+                callee_procedure_id: step.callee_procedure_id.clone(),
+                site_id: step.site_id.clone(),
+                site_ast_id: step.site_ast_id.clone(),
+                target_id: step.target_id.clone(),
+                proof: step.proof.label(),
+                dispatch_complete: step.dispatch_complete,
+                site_coverage: step.site_coverage.label(),
+                certainty: step.certainty.label(),
+                execution_timing: step.execution_timing.label(),
+                external_callee_key: step
+                    .external_callee_key
+                    .as_ref()
+                    .map(render_external_callee_key),
+            })
+            .collect(),
         witness_truncated: row.witness_truncated,
         pack_id: row.pack_id.clone(),
         model_id: row.model_id.clone(),

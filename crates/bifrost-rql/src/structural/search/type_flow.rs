@@ -1372,6 +1372,8 @@ fn root_result_persistence_key(
     if workspace.store().is_none_or(|store| store.is_ephemeral()) {
         return None;
     }
+    let owner_storage_language_key =
+        workspace.semantic_artifact_storage_language_key(root.artifact().key())?;
     let workspace_content = workspace.analyzer().workspace_content_identity()?;
     let active_pack = active_semantic_model_pack_digest(active_semantic_model_snapshot);
     let semantics = root_result_semantics_digest(adapter, limits, semantic_limits);
@@ -1386,6 +1388,7 @@ fn root_result_persistence_key(
             representation_version: ROOT_RESULT_REPRESENTATION_VERSION,
         },
         root_public_digest: *procedure_public_digest(root).as_bytes(),
+        owner_storage_language_key,
     })
 }
 

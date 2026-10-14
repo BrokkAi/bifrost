@@ -75,7 +75,7 @@ tree-sitter-properties = "0.3.0"
 tree-sitter-javascript = { package = "brokk-tree-sitter-javascript", version = "=0.25.3" }
 tree-sitter-python = "0.25.0"
 tree-sitter-c-sharp = { package = "brokk-tree-sitter-c-sharp", version = "=0.23.8" }
-tree-sitter-cpp = { package = "brokk-tree-sitter-cpp", version = "=0.24.2" }
+tree-sitter-cpp = { package = "brokk-tree-sitter-cpp", version = "=0.24.3" }
 tree-sitter-java = "0.23.5"
 tree-sitter-php = { package = "brokk-tree-sitter-php", version = "=0.24.4" }
 tree-sitter-rbs = "=0.2.2"
@@ -83,7 +83,7 @@ tree-sitter-ruby = "0.23.1"
 tree-sitter-rust = { package = "brokk-tree-sitter-rust", version = "=0.24.5" }
 # Brokk's fork carries TypeScript declaration-grammar repairs that are not yet
 # available in an upstream release (#3502).
-tree-sitter-typescript = { package = "brokk-tree-sitter-typescript", version = "=0.23.5" }
+tree-sitter-typescript = { package = "brokk-tree-sitter-typescript", version = "=0.23.6" }
 tree-sitter-yaml = "0.7.2"
 tree-sitter-yarnlock = "=0.2.0"
 yarn-lock-parser = "=0.14.0"

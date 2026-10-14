@@ -281,6 +281,7 @@ fn encode_rows(
             "owner_scope_head_node",
             codec::encode_node(item.owner_scope_head()),
         );
+        row.cell("member_name", item.member_name());
         row.cell("member_kind", item.kind().label());
         row.cell("member_access", item.access().label());
         row.cell(
@@ -496,10 +497,12 @@ fn encode_rows(
 #[cfg(test)]
 pub(in crate::analyzer::store) fn typed_fragment_digest(
     fragment: &LoweredTypedFragment,
+    fragment_content: [u8; 32],
     cancellation: &CancellationToken,
 ) -> Result<Option<[u8; 32]>> {
+    use crate::analyzer::resolution::CanonicalIdentityHasher;
     let mut digest = CanonicalHasher::new(b"bifrost-selected-stage-typed:v1");
-    digest.field("fragment", &fragment.fragment().as_bytes());
+    digest.identity_field("fragment", fragment.fragment(), |_| Ok(fragment_content))?;
     digest.field("language", fragment.language().config_label().as_bytes());
     let completed = encode_rows(fragment, cancellation, |family, sequence, row| {
         digest.field("family", family.as_bytes());
@@ -815,10 +818,12 @@ fn decode_member_owner(row: &Row<'_>) -> Result<LoweredMemberOwnerProperty> {
     let kind: String = row.get("member_kind")?;
     let access: String = row.get("member_access")?;
     let compatibility: String = row.get("qualifier_compatibility")?;
+    let member_name: String = row.get("member_name")?;
     Ok(typed_rows::decode_member_owner_fields(
         row_semantic(row, "definition")?,
         row_semantic(row, "owner_definition")?,
         codec::decode_node(row.get("owner_scope_head_node")?),
+        &member_name,
         &kind,
         &access,
         &compatibility,
@@ -1888,7 +1893,7 @@ SELECT 'member scope definition' AS invariant,new.sequence AS sequence FROM temp
 UNION ALL
 SELECT 'member scope head' AS invariant,new.sequence AS sequence FROM temp.selected_resolution_stage_member_scopes new CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=?2 CROSS JOIN main.resolution_member_scope_properties old ON old.blob_id=mount.blob_id AND old.scope_head_node_key=new.scope_head_node-?3 WHERE new.producer_id=?1 AND new.scope_head_node BETWEEN ?3 AND ?4
 UNION ALL
-SELECT 'member owner tuple' AS invariant,new.sequence AS sequence FROM temp.selected_resolution_stage_member_owners new CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=?2 CROSS JOIN main.resolution_member_owner_properties old ON old.blob_id=mount.blob_id AND old.definition_semantic_key=new.definition_key-?3 AND new.owner_definition_key=?3+old.owner_definition_semantic_key AND new.owner_scope_head_node=?3+old.owner_scope_head_node_key AND new.member_kind=old.member_kind AND new.member_access=old.member_access AND new.qualifier_compatibility=old.qualifier_compatibility WHERE new.producer_id=?1 AND new.definition_key BETWEEN ?3 AND ?4
+SELECT 'member owner tuple' AS invariant,new.sequence AS sequence FROM temp.selected_resolution_stage_member_owners new CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=?2 CROSS JOIN main.resolution_member_owner_properties old ON old.blob_id=mount.blob_id AND old.definition_semantic_key=new.definition_key-?3 AND new.owner_definition_key=?3+old.owner_definition_semantic_key AND new.owner_scope_head_node=?3+old.owner_scope_head_node_key AND new.member_name=old.member_name AND new.member_kind=old.member_kind AND new.member_access=old.member_access AND new.qualifier_compatibility=old.qualifier_compatibility WHERE new.producer_id=?1 AND new.definition_key BETWEEN ?3 AND ?4
 UNION ALL
 SELECT 'deferred owner definition' AS invariant,new.sequence AS sequence FROM temp.selected_resolution_stage_deferred_member_owners new CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=?2 CROSS JOIN main.resolution_deferred_member_owners old ON old.blob_id=mount.blob_id AND old.definition=new.definition_key-?3 WHERE new.producer_id=?1 AND new.definition_key BETWEEN ?3 AND ?4
 UNION ALL

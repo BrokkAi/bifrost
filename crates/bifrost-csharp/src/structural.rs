@@ -2,8 +2,8 @@
 
 use crate::syntax::{csharp_conditional_member_access, csharp_member_name};
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_decorators_under, attach_role_with_derived_name, attach_terminal_callee,
-    csharp_integer_literal_value, first_named_child,
+    CalleeSpineStep, attach_decorators_under, attach_role_with_derived_name,
+    attach_terminal_callee, csharp_integer_literal_value, first_named_child, terminal_callee_leaf,
 };
 use brokk_bifrost_core::analyzer::structural::callable::{
     CallKind, CallSiteContext, CallSiteFacts,
@@ -260,6 +260,21 @@ pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
 ];
 
 use brokk_bifrost_core::analyzer::tree_walk::{expression_target_node, last_named_child};
+
+/// Grammar steps for the shared call-callee spine. A value expression has no step.
+pub fn callee_spine_step(kind: &str) -> Option<CalleeSpineStep> {
+    use CalleeSpineStep::{ChildKind, Field, Name};
+    match kind {
+        "identifier" => Some(Name),
+        "member_access_expression"
+        | "member_binding_expression"
+        | "qualified_name"
+        | "alias_qualified_name" => Some(Field("name")),
+        "generic_name" => Some(ChildKind("identifier")),
+        "conditional_access_expression" => Some(ChildKind("member_binding_expression")),
+        _ => None,
+    }
+}
 
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = expression_target_node(expression);
@@ -813,7 +828,11 @@ impl StructuralSpec for CSharpStructuralSpec {
                     node.child_by_field_name("function")
                 };
                 if let Some(function) = function {
-                    attach_terminal_callee(sink, function, expression_name_node(function));
+                    attach_terminal_callee(
+                        sink,
+                        function,
+                        terminal_callee_leaf(function, callee_spine_step),
+                    );
                     if let Some(target) = callable_target_node(function)
                         && target.kind() == "member_access_expression"
                         && let Some(receiver) = target.child_by_field_name("expression")

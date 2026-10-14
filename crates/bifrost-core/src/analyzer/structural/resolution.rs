@@ -60,9 +60,11 @@ labelled_enum! {
 /// orders separate lets a language add a tier without renumbering existing
 /// path rows.
 ///
-/// `NameOnlyFallback` remains the weakest tier: it is selected only when a
-/// resolver scans a bare-name index after a structured route was available,
-/// which the anti-fallback contract forbids.
+/// `NameOnlyFallback` remains the weakest resolution tier: it is selected only
+/// when a resolver scans a bare-name index after a structured route was
+/// available, which the anti-fallback contract forbids. `CandidateOriginRank`
+/// sorts after it because it is a marker consumed by the dedicated origin-rank
+/// comparison before the ordinary precedence walk, not a resolved tier.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +79,9 @@ pub enum PrecedenceTier {
     NameOnlyFallback,
     OtherCompilationUnitPackage,
     DefaultImport,
+    /// Candidate origin rank, compared across lexical choice points before
+    /// their ordinary precedence traces.
+    CandidateOriginRank,
 }
 
 /// Values in declaration order, which is the stable persisted code order.
@@ -91,6 +96,7 @@ pub const ALL_PRECEDENCE_TIERS: &[PrecedenceTier] = &[
     PrecedenceTier::NameOnlyFallback,
     PrecedenceTier::OtherCompilationUnitPackage,
     PrecedenceTier::DefaultImport,
+    PrecedenceTier::CandidateOriginRank,
 ];
 
 impl PrecedenceTier {
@@ -105,6 +111,7 @@ impl PrecedenceTier {
         "name_only_fallback",
         "other_compilation_unit_package",
         "default_import",
+        "candidate_origin_rank",
     ];
 
     pub const fn label(self) -> &'static str {
@@ -119,6 +126,7 @@ impl PrecedenceTier {
             Self::NameOnlyFallback => "name_only_fallback",
             Self::OtherCompilationUnitPackage => "other_compilation_unit_package",
             Self::DefaultImport => "default_import",
+            Self::CandidateOriginRank => "candidate_origin_rank",
         }
     }
 
@@ -141,6 +149,7 @@ impl PrecedenceTier {
             Self::DefaultImport => 7,
             Self::ExternalRoot => 8,
             Self::NameOnlyFallback => 9,
+            Self::CandidateOriginRank => 10,
         }
     }
 }
@@ -908,6 +917,7 @@ mod tests {
                 PrecedenceTier::DefaultImport,
                 PrecedenceTier::ExternalRoot,
                 PrecedenceTier::NameOnlyFallback,
+                PrecedenceTier::CandidateOriginRank,
             ]
         );
 
@@ -919,7 +929,8 @@ mod tests {
         assert!(PrecedenceTier::OtherCompilationUnitPackage < PrecedenceTier::DefaultImport);
         assert!(PrecedenceTier::DefaultImport < PrecedenceTier::ExternalRoot);
         assert!(PrecedenceTier::ExternalRoot < PrecedenceTier::NameOnlyFallback);
-        assert_eq!(sorted.last(), Some(&PrecedenceTier::NameOnlyFallback));
+        assert!(PrecedenceTier::NameOnlyFallback < PrecedenceTier::CandidateOriginRank);
+        assert_eq!(sorted.last(), Some(&PrecedenceTier::CandidateOriginRank));
 
         let mut dispatch = ALL_MEMBER_DISPATCH_TIERS.to_vec();
         dispatch.sort();

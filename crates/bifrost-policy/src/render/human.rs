@@ -3492,7 +3492,7 @@ fn write_run_completion<W: Write>(
 }
 
 /// The scope a run states beside its completion (spec M4.0): a range-scoped
-/// run says how many files it examined, so an empty result is not read as
+/// run names the procedure ranges it examined, so an empty result is not read as
 /// absence elsewhere, and every reason the run stayed wider than requested.
 fn write_run_scope<W: Write>(
     output: &mut BoundedWriter<W>,
@@ -3501,12 +3501,25 @@ fn write_run_scope<W: Write>(
     match scope.kind() {
         PolicyRunScopeKind::ChangedRange => write!(
             output,
-            "; range-scoped: {} files examined",
-            scope.examined_files().len()
+            "; range-scoped: {} procedures examined",
+            scope.examined_procedures().len()
         ),
         PolicyRunScopeKind::Workspace => write!(output, "; scope: workspace"),
     }
     .map_err(map_io_error)?;
+    for procedure in scope.examined_procedures() {
+        let span = procedure
+            .byte_span()
+            .expect("examined procedure has a byte span");
+        write!(
+            output,
+            "; {}:{}..{}",
+            escape_terminal_text(procedure.path()),
+            span.start(),
+            span.end()
+        )
+        .map_err(map_io_error)?;
+    }
     for reason in scope.widened() {
         write!(output, "; widened: {}", escape_terminal_text(reason)).map_err(map_io_error)?;
     }

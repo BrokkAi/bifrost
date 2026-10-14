@@ -402,13 +402,7 @@ pub(crate) fn external_class_identity(
         {
             return None;
         }
-        let mut group = group;
-        group.sort_by(|left, right| {
-            (right.provenance.completeness == SemanticModelCompleteness::Complete)
-                .cmp(&(left.provenance.completeness == SemanticModelCompleteness::Complete))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        let symbol = *group.first()?;
+        let symbol = overlay.class_representative(group)?;
         Some(ClassIdentity::External {
             qualified_name: symbol.qualified_name.clone().into_boxed_str(),
             symbol_id: symbol.id.clone().into_boxed_str(),
@@ -526,7 +520,9 @@ pub(crate) fn external_member_lookup(
             },
         ));
     }
-    if has_member_record {
+    // An inherited member on an incomplete ancestry path must not become a
+    // proven absence (#5121). Restore the rule #4942 dropped for multi-owner lookups.
+    if coverage_open || has_member_record {
         return MemberLookup::Unknown(UnknownReason::PackIncomplete);
     }
     if !complete_surface

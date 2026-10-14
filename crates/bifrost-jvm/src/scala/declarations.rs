@@ -14,7 +14,9 @@ use brokk_bifrost_core::analyzer::model::{
     StructuredTypeName, child_fq_base,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts;
-use brokk_bifrost_core::analyzer::scala_facts::ScalaDeclarationVisibility;
+use brokk_bifrost_core::analyzer::scala_facts::{
+    ScalaDeclarationKind, ScalaDeclarationSourceFact, ScalaDeclarationVisibility,
+};
 use brokk_bifrost_core::analyzer::source_facts::{
     PrimarySourceFactCollector, SourceDeclarationId, SourceOccurrenceProvenance,
 };
@@ -228,7 +230,7 @@ pub fn parse_scala_file(
         pending.is_empty(),
         "Scala declaration work must be reached by the primary walk"
     );
-    let scala_facts = std::mem::take(&mut visitor.scala_facts);
+    let mut scala_facts = std::mem::take(&mut visitor.scala_facts);
     let native = crate::scala::resolution::extract_scala_resolution(
         root,
         source,
@@ -237,6 +239,78 @@ pub fn parse_scala_file(
         visitor.collector,
     );
     drop(visitor);
+    let source_declarations = native
+        .declaration_sources
+        .iter()
+        .map(|(site, declaration)| (*site, *declaration))
+        .collect::<HashMap<_, _>>();
+    for definition in &native.facts.definition_units {
+        if !definition.unit.is_synthetic()
+            || parsed
+                .source_declaration_units
+                .iter()
+                .any(|(_, unit)| unit == &definition.unit)
+        {
+            continue;
+        }
+        let declaration = source_declarations[&definition.declaration];
+        if native.facts.singleton_relations.iter().any(|relation| {
+            relation.declaration == definition.declaration
+                && relation.kind
+                    == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSingletonRelationKind::Companion
+        }) && !scala_facts
+            .declarations
+            .iter()
+            .any(|fact| fact.declaration == declaration)
+        {
+            let class_source = native
+                .facts
+                .singleton_relations
+                .iter()
+                .find_map(|relation| {
+                    (relation.declaration == definition.declaration
+                        && relation.kind
+                            == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSingletonRelationKind::Companion)
+                        .then_some(relation.enclosing_type)
+                        .flatten()
+                })
+                .map(|site| source_declarations[&site])
+                .expect("a synthesized companion has its case class owner");
+            let mut companion_fact: ScalaDeclarationSourceFact = scala_facts
+                .declarations
+                .iter()
+                .find(|fact| fact.declaration == class_source)
+                .expect("a synthesized companion's case class has Scala source facts")
+                .clone();
+            companion_fact.declaration = declaration;
+            companion_fact.kind = ScalaDeclarationKind::Object;
+            companion_fact.callable = None;
+            companion_fact.field_type_path = None;
+            companion_fact.type_alias_path = None;
+            companion_fact.stable_owner = true;
+            companion_fact.is_enum = false;
+            companion_fact.is_term_field = false;
+            companion_fact.is_case_class = false;
+            companion_fact.is_full_enum_case = false;
+            companion_fact.is_abstract_callable = false;
+            companion_fact.is_explicitly_abstract = false;
+            companion_fact.is_sealed = false;
+            companion_fact.is_final = true;
+            companion_fact.generic_owner = None;
+            scala_facts.declarations.push(companion_fact);
+        }
+        let parent = definition.unit.fq().parent().and_then(|fq| {
+            parsed
+                .declarations()
+                .iter()
+                .find(|unit| unit.fq() == &fq)
+                .cloned()
+        });
+        parsed.add_synthetic_code_unit(definition.unit.clone(), parent, None);
+        parsed
+            .source_declaration_units
+            .push((declaration, definition.unit.clone()));
+    }
     let occurrences = collector.finish();
     parsed.resolution_facts = native.facts;
     parsed.imports = imports

@@ -1,4 +1,4 @@
-//! Query-local mutability evidence for Python's saved callable defaults.
+//! Bounded mutability evidence for Python's saved callable defaults.
 //!
 //! Positional defaults live in the function's `__defaults__` tuple, so reading
 //! that attribute cannot replace an entry. Keyword-only defaults live in the
@@ -29,39 +29,42 @@ const MAX_METADATA_SCAN_NODES: usize = 1_000_000;
 const MAX_METADATA_SCAN_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_METADATA_SCAN_FILE_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ScanIncomplete;
+/// #5112: retain at most this many invalidated function keys per default kind.
+const MAX_SAVED_DEFAULT_FUNCTIONS_PER_KIND: usize = 16_384;
 
 pub(super) fn saved_default_argument_safety(
     analyzer: &PythonAnalyzer,
-) -> Option<SavedDefaultArgumentSafety> {
+) -> SavedDefaultArgumentSafety {
     let scope = AnalyzerQueryScope::new(analyzer);
-    scan_workspace(analyzer, scope.token()).ok()
+    scan_workspace(analyzer, scope.token()).unwrap_or_else(|| {
+        // #5112: publish incomplete evidence too, so oversized workspaces are
+        // not rescanned by every oracle. Both kinds remain conservatively open.
+        let mut safety = SavedDefaultArgumentSafety::default();
+        safety.mark_workspace_open(SavedDefaultKind::Positional);
+        safety.mark_workspace_open(SavedDefaultKind::KeywordOnly);
+        safety
+    })
 }
 
 fn scan_workspace(
     analyzer: &PythonAnalyzer,
     token: QueryToken<'_>,
-) -> Result<SavedDefaultArgumentSafety, ScanIncomplete> {
+) -> Option<SavedDefaultArgumentSafety> {
     let mut safety = SavedDefaultArgumentSafety::default();
     let mut remaining_nodes = MAX_METADATA_SCAN_NODES;
     let mut remaining_source_bytes = MAX_METADATA_SCAN_SOURCE_BYTES;
 
     for file in analyzer.analyzed_files() {
         if remaining_nodes == 0 || remaining_source_bytes == 0 {
-            return Err(ScanIncomplete);
+            return None;
         }
         let path = crate::analyzer::semantic::WorkspaceRelativePath::try_from_path(file.rel_path())
-            .map_err(|_| ScanIncomplete)?;
+            .ok()?;
         let max_source_bytes = remaining_source_bytes.min(MAX_METADATA_SCAN_FILE_BYTES);
-        let Some((_, prepared)) = analyzer
+        let (_, prepared) = analyzer
             .inner
             .prepared_syntax_limited(token, &file, max_source_bytes)
-            .map_err(|_| ScanIncomplete)?
-        else {
-            return Err(ScanIncomplete);
-        };
-
+            .ok()??;
         remaining_source_bytes = remaining_source_bytes.saturating_sub(prepared.source().len());
         remaining_nodes = remaining_nodes.saturating_sub(scan_prepared(
             &prepared,
@@ -70,8 +73,7 @@ fn scan_workspace(
             &mut safety,
         )?);
     }
-
-    Ok(safety)
+    Some(safety)
 }
 
 fn scan_prepared(
@@ -79,9 +81,9 @@ fn scan_prepared(
     path: &crate::analyzer::semantic::WorkspaceRelativePath,
     max_nodes: usize,
     safety: &mut SavedDefaultArgumentSafety,
-) -> Result<usize, ScanIncomplete> {
+) -> Option<usize> {
     if prepared.tree().root_node().has_error() {
-        return Err(ScanIncomplete);
+        return None;
     }
     scan_tree(
         prepared.tree().root_node(),
@@ -95,6 +97,10 @@ fn scan_prepared(
 #[derive(Clone, Copy)]
 struct ScanFrame<'tree> {
     node: Node<'tree>,
+    parent: Option<Node<'tree>>,
+    grandparent: Option<Node<'tree>>,
+    write_ancestor: Option<Node<'tree>>,
+    function_scope: Option<usize>,
     module_scope: bool,
     callable_scope: Option<u32>,
 }
@@ -105,6 +111,7 @@ struct MetadataEvent<'tree> {
     positional: bool,
     keyword_only: bool,
     write: bool,
+    function_scope: Option<usize>,
 }
 
 fn scan_tree(
@@ -113,15 +120,21 @@ fn scan_tree(
     path: &crate::analyzer::semantic::WorkspaceRelativePath,
     max_nodes: usize,
     safety: &mut SavedDefaultArgumentSafety,
-) -> Result<usize, ScanIncomplete> {
+) -> Option<usize> {
     let mut remaining = max_nodes;
     let mut module_functions: HashMap<Box<str>, Option<SavedDefaultFunction>> = HashMap::default();
     let mut local_function_scopes: HashMap<u32, HashMap<Box<str>, Option<SavedDefaultFunction>>> =
         HashMap::default();
     let mut has_wildcard_import = false;
     let mut events = Vec::new();
+    // Linked enclosing-function contexts live only for this file's scan.
+    let mut function_scopes = Vec::new();
     let mut stack = vec![ScanFrame {
         node: root,
+        parent: None,
+        grandparent: None,
+        write_ancestor: None,
+        function_scope: None,
         module_scope: true,
         callable_scope: None,
     }];
@@ -129,6 +142,16 @@ fn scan_tree(
     while let Some(frame) = stack.pop() {
         consume(&mut remaining)?;
         let node = frame.node;
+        let function_scope = if node.kind() == "function_definition" {
+            let index = function_scopes.len();
+            function_scopes.push((
+                u32::try_from(node.start_byte()).expect("bounded Python source fits in u32"),
+                frame.function_scope,
+            ));
+            Some(index)
+        } else {
+            frame.function_scope
+        };
 
         if frame.module_scope || frame.callable_scope.is_some() {
             if frame.module_scope && node.kind() == "wildcard_import" {
@@ -151,9 +174,8 @@ fn scan_tree(
                     | "case_clause"
             ) {
                 let bindings = python_direct_scope_bindings_bounded(node, source, || {
-                    consume(&mut remaining).is_ok()
-                })
-                .ok_or(ScanIncomplete)?;
+                    consume(&mut remaining).is_some()
+                })?;
                 for binding in bindings {
                     let Some(name) = binding.declaration.utf8_text(source.as_bytes()).ok() else {
                         continue;
@@ -197,9 +219,8 @@ fn scan_tree(
                     crate::analyzer::Language::Python,
                     node,
                     source,
-                    || consume(&mut remaining).is_ok(),
-                )
-                .ok_or(ScanIncomplete)?;
+                    || consume(&mut remaining).is_some(),
+                )?;
             let scope =
                 u32::try_from(node.start_byte()).expect("bounded Python source fits in u32");
             let bindings = local_function_scopes.entry(scope).or_default();
@@ -210,8 +231,11 @@ fn scan_tree(
             }
         }
 
-        if let Some(event) = metadata_event(node, source) {
-            events.push(event);
+        if let Some(event) = metadata_event(frame, source) {
+            events.push(MetadataEvent {
+                function_scope,
+                ..event
+            });
         }
 
         let excluded_body = matches!(
@@ -233,6 +257,16 @@ fn scan_tree(
             };
             stack.push(ScanFrame {
                 node: child,
+                parent: Some(node),
+                grandparent: frame.parent,
+                write_ancestor: match node.kind() {
+                    "assignment" | "augmented_assignment" | "delete_statement" => Some(node),
+                    "attribute" | "subscript" | "parenthesized_expression" | "tuple" | "list" => {
+                        frame.write_ancestor
+                    }
+                    _ => None,
+                },
+                function_scope,
                 module_scope: frame.module_scope && Some(child.id()) != excluded_body,
                 callable_scope,
             });
@@ -247,6 +281,8 @@ fn scan_tree(
                 &module_functions,
                 &local_function_scopes,
                 has_wildcard_import,
+                event.function_scope,
+                &function_scopes,
             )
         });
         if function.is_none() && !event.write {
@@ -260,7 +296,7 @@ fn scan_tree(
         }
     }
 
-    Ok(max_nodes - remaining)
+    Some(max_nodes - remaining)
 }
 
 fn function_key(
@@ -288,12 +324,12 @@ fn insert_scope_binding(
     }
 }
 
-fn consume(remaining: &mut usize) -> Result<(), ScanIncomplete> {
+fn consume(remaining: &mut usize) -> Option<()> {
     if *remaining == 0 {
-        return Err(ScanIncomplete);
+        return None;
     }
     *remaining -= 1;
-    Ok(())
+    Some(())
 }
 
 fn function_for_receiver(
@@ -302,6 +338,8 @@ fn function_for_receiver(
     module_functions: &HashMap<Box<str>, Option<SavedDefaultFunction>>,
     local_function_scopes: &HashMap<u32, HashMap<Box<str>, Option<SavedDefaultFunction>>>,
     has_wildcard_import: bool,
+    mut function_scope: Option<usize>,
+    function_scopes: &[(u32, Option<usize>)],
 ) -> Option<SavedDefaultFunction> {
     if receiver.kind() != "identifier" {
         return None;
@@ -309,18 +347,15 @@ fn function_for_receiver(
     let name = receiver.utf8_text(source.as_bytes()).ok()?;
     match python_name_resolution_at(name, receiver, source) {
         PythonLexicalNameResolution::Local => {
-            let mut current = receiver;
-            while let Some(parent) = current.parent() {
-                if parent.kind() == "function_definition" {
-                    let scope = u32::try_from(parent.start_byte()).ok()?;
-                    if let Some(binding) = local_function_scopes
-                        .get(&scope)
-                        .and_then(|bindings| bindings.get(name))
-                    {
-                        return binding.clone();
-                    }
+            while let Some(index) = function_scope {
+                let (scope, parent) = function_scopes[index];
+                if let Some(binding) = local_function_scopes
+                    .get(&scope)
+                    .and_then(|bindings| bindings.get(name))
+                {
+                    return binding.clone();
                 }
-                current = parent;
+                function_scope = parent;
             }
             return None;
         }
@@ -339,33 +374,40 @@ fn mark(
     kind: SavedDefaultKind,
 ) {
     match function {
-        Some(function) => safety.mark_function_open(function, kind),
+        Some(function) => {
+            safety.mark_function_open(function, kind, MAX_SAVED_DEFAULT_FUNCTIONS_PER_KIND)
+        }
         None => safety.mark_workspace_open(kind),
     }
 }
 
-fn metadata_event<'tree>(node: Node<'tree>, source: &str) -> Option<MetadataEvent<'tree>> {
-    match node.kind() {
-        "attribute" => direct_attribute_event(node, source)
-            .or_else(|| reflective_attribute_escape(node, source)),
-        "call" => reflective_call_event(node, source),
-        "identifier" => reflective_identifier_escape(node, source),
+fn metadata_event<'tree>(frame: ScanFrame<'tree>, source: &str) -> Option<MetadataEvent<'tree>> {
+    match frame.node.kind() {
+        "attribute" => direct_attribute_event(frame, source)
+            .or_else(|| reflective_attribute_escape(frame, source)),
+        "call" => reflective_call_event(frame.node, source),
+        "identifier" => reflective_identifier_escape(frame, source),
         _ => None,
     }
 }
 
-fn direct_attribute_event<'tree>(node: Node<'tree>, source: &str) -> Option<MetadataEvent<'tree>> {
+fn direct_attribute_event<'tree>(
+    frame: ScanFrame<'tree>,
+    source: &str,
+) -> Option<MetadataEvent<'tree>> {
+    let node = frame.node;
     let name = node
         .child_by_field_name("attribute")?
         .utf8_text(source.as_bytes())
         .ok()?;
-    let write = attribute_is_written(node);
+    let write = attribute_is_written(node, frame.write_ancestor);
     let (positional, keyword_only) = match (name, write) {
         ("__defaults__", true) => (true, false),
         ("__kwdefaults__", _) => (false, true),
         _ => return None,
     };
     Some(MetadataEvent {
+        function_scope: None,
         receiver: node.child_by_field_name("object"),
         positional,
         keyword_only,
@@ -373,23 +415,16 @@ fn direct_attribute_event<'tree>(node: Node<'tree>, source: &str) -> Option<Meta
     })
 }
 
-fn attribute_is_written(node: Node<'_>) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        match parent.kind() {
-            "assignment" | "augmented_assignment" => {
-                return parent.child_by_field_name("left").is_some_and(|left| {
-                    left.start_byte() <= node.start_byte() && node.end_byte() <= left.end_byte()
-                });
-            }
-            "delete_statement" => return true,
-            "attribute" | "subscript" | "parenthesized_expression" | "tuple" | "list" => {
-                current = parent;
-            }
-            _ => return false,
+fn attribute_is_written(node: Node<'_>, ancestor: Option<Node<'_>>) -> bool {
+    ancestor.is_some_and(|parent| match parent.kind() {
+        "assignment" | "augmented_assignment" => {
+            parent.child_by_field_name("left").is_some_and(|left| {
+                left.start_byte() <= node.start_byte() && node.end_byte() <= left.end_byte()
+            })
         }
-    }
-    false
+        "delete_statement" => true,
+        _ => unreachable!("write contexts contain only assignment or delete nodes"),
+    })
 }
 
 fn reflective_call_event<'tree>(node: Node<'tree>, source: &str) -> Option<MetadataEvent<'tree>> {
@@ -423,6 +458,7 @@ fn reflective_call_event<'tree>(node: Node<'tree>, source: &str) -> Option<Metad
     let metadata_name = name_node.and_then(|name| python_plain_string_literal(name, source));
     let (positional, keyword_only) = affected_defaults(metadata_name, write);
     (positional || keyword_only).then_some(MetadataEvent {
+        function_scope: None,
         receiver,
         positional,
         keyword_only,
@@ -449,11 +485,12 @@ fn affected_defaults(name: Option<&str>, write: bool) -> (bool, bool) {
 }
 
 fn reflective_identifier_escape<'tree>(
-    node: Node<'tree>,
+    frame: ScanFrame<'tree>,
     source: &str,
 ) -> Option<MetadataEvent<'tree>> {
+    let node = frame.node;
     let name = node.utf8_text(source.as_bytes()).ok()?;
-    if is_definition_name(node) || is_direct_call_function(node) {
+    if is_definition_name(node, frame.parent) || is_direct_call_function(frame) {
         return None;
     }
     let (positional, keyword_only) = match name {
@@ -462,6 +499,7 @@ fn reflective_identifier_escape<'tree>(
         _ => return None,
     };
     Some(MetadataEvent {
+        function_scope: None,
         receiver: None,
         positional,
         keyword_only,
@@ -470,14 +508,15 @@ fn reflective_identifier_escape<'tree>(
 }
 
 fn reflective_attribute_escape<'tree>(
-    node: Node<'tree>,
+    frame: ScanFrame<'tree>,
     source: &str,
 ) -> Option<MetadataEvent<'tree>> {
+    let node = frame.node;
     let name = node
         .child_by_field_name("attribute")?
         .utf8_text(source.as_bytes())
         .ok()?;
-    if is_direct_call_function(node) {
+    if is_direct_call_function(frame) {
         return None;
     }
     let (positional, keyword_only) = match name {
@@ -486,6 +525,7 @@ fn reflective_attribute_escape<'tree>(
         _ => return None,
     };
     Some(MetadataEvent {
+        function_scope: None,
         receiver: None,
         positional,
         keyword_only,
@@ -493,34 +533,26 @@ fn reflective_attribute_escape<'tree>(
     })
 }
 
-fn is_definition_name(node: Node<'_>) -> bool {
-    ["function_definition", "class_definition"]
-        .iter()
-        .any(|kind| {
-            node.parent().is_some_and(|parent| {
-                parent.kind() == *kind && parent.child_by_field_name("name") == Some(node)
-            })
-        })
+fn is_definition_name(node: Node<'_>, parent: Option<Node<'_>>) -> bool {
+    parent.is_some_and(|parent| {
+        matches!(parent.kind(), "function_definition" | "class_definition")
+            && parent.child_by_field_name("name") == Some(node)
+    })
 }
 
-fn is_direct_call_function(node: Node<'_>) -> bool {
-    if node.parent().is_some_and(|parent| {
-        parent.kind() == "call" && parent.child_by_field_name("function") == Some(node)
-    }) {
-        return true;
-    }
-    node.parent().is_some_and(|attribute| {
-        attribute.kind() == "attribute"
-            && attribute.parent().is_some_and(|call| {
-                call.kind() == "call" && call.child_by_field_name("function") == Some(attribute)
-            })
+fn is_direct_call_function(frame: ScanFrame<'_>) -> bool {
+    frame.parent.is_some_and(|parent| {
+        (parent.kind() == "call" && parent.child_by_field_name("function") == Some(frame.node))
+            || (parent.kind() == "attribute"
+                && frame.grandparent.is_some_and(|call| {
+                    call.kind() == "call" && call.child_by_field_name("function") == Some(parent)
+                }))
     })
 }
 
 #[cfg(test)]
-fn scan(source: &str) -> Result<SavedDefaultArgumentSafety, ScanIncomplete> {
-    let tree =
-        brokk_bifrost_python::declarations::parse_python_tree(source).ok_or(ScanIncomplete)?;
+fn scan(source: &str) -> Option<SavedDefaultArgumentSafety> {
+    let tree = brokk_bifrost_python::declarations::parse_python_tree(source)?;
     let path = crate::analyzer::semantic::WorkspaceRelativePath::new("fixture.py")
         .expect("test path is portable");
     let mut safety = SavedDefaultArgumentSafety::default();
@@ -531,7 +563,7 @@ fn scan(source: &str) -> Result<SavedDefaultArgumentSafety, ScanIncomplete> {
         MAX_METADATA_SCAN_NODES,
         &mut safety,
     )?;
-    Ok(safety)
+    Some(safety)
 }
 
 #[cfg(test)]

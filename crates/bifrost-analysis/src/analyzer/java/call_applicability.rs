@@ -1,11 +1,12 @@
 use crate::analyzer::resolution::{
-    AnswerMap, CallApplicabilityAdapter, CallCandidateApplicability, CandidateAssessment,
-    ConversionEvidence, FactEvaluation, InternedFactRow, LoweredCallApplicabilityObligation,
-    LoweredCallableSignatureProperty, MappingAssessment, PartialOrder, ResolutionAnswer,
-    ResolutionCompletion, SelectedTypedRow, SemanticId, StateMap,
+    AnswerMap, CallApplicabilityAdapter, CallTypeSubstitution, CandidateAssessment,
+    ConversionEvidence, FactEvaluation, InternedFactRow, IntrinsicCallType,
+    LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty, MappingAssessment,
+    PartialOrder, ResolutionAnswer, ResolutionCompletion, SelectedTypedRow, SemanticId, StateMap,
 };
 use crate::analyzer::store::Result;
 use crate::hash::HashMap;
+use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
 
 pub(super) static JAVA_CALL_APPLICABILITY_ADAPTER: JavaCallApplicabilityAdapter =
@@ -14,6 +15,57 @@ pub(super) static JAVA_CALL_APPLICABILITY_ADAPTER: JavaCallApplicabilityAdapter 
 pub(crate) struct JavaCallApplicabilityAdapter;
 
 impl CallApplicabilityAdapter for JavaCallApplicabilityAdapter {
+    fn has_intrinsic_call_type_table(&self) -> bool {
+        true
+    }
+
+    fn intrinsic_call_type(
+        &self,
+        kind: IntrinsicTypeKind,
+        spelling: &str,
+    ) -> Option<IntrinsicCallType> {
+        if kind == IntrinsicTypeKind::LanguageBuiltin && spelling == "java.lang.String" {
+            return Some(IntrinsicCallType::String);
+        }
+        if kind != IntrinsicTypeKind::Primitive {
+            return None;
+        }
+        use crate::analyzer::usages::call_conversion::JavaPrimitive;
+        Some(match crate::analyzer::java::primitive_for_name(spelling)? {
+            JavaPrimitive::Boolean => IntrinsicCallType::Boolean,
+            JavaPrimitive::Byte => IntrinsicCallType::Byte,
+            JavaPrimitive::Short => IntrinsicCallType::Short,
+            JavaPrimitive::Char => IntrinsicCallType::Char,
+            JavaPrimitive::Int => IntrinsicCallType::Int,
+            JavaPrimitive::Long => IntrinsicCallType::Long,
+            JavaPrimitive::Float => IntrinsicCallType::Float,
+            JavaPrimitive::Double => IntrinsicCallType::Double,
+        })
+    }
+
+    fn intrinsic_call_type_converts(
+        &self,
+        source: IntrinsicCallType,
+        target: IntrinsicCallType,
+    ) -> bool {
+        use IntrinsicCallType::{Boolean, Byte, Char, Double, Float, Int, Long, Short, String};
+        match (source, target) {
+            (String, String) | (Boolean, Boolean) => true,
+            (String, _) | (_, String) | (Boolean, _) | (_, Boolean) => false,
+            (Byte, Byte | Short | Int | Long | Float | Double)
+            | (Short, Short | Int | Long | Float | Double)
+            | (Char, Char | Int | Long | Float | Double)
+            | (Int, Int | Long | Float | Double)
+            | (Long, Long | Float | Double)
+            | (Float, Float | Double)
+            | (Double, Double) => crate::analyzer::java::primitive_converts(
+                java_primitive(source),
+                java_primitive(target),
+            ),
+            _ => false,
+        }
+    }
+
     fn map_arguments(
         &self,
         call: &LoweredCallApplicabilityObligation,
@@ -58,6 +110,7 @@ impl CallApplicabilityAdapter for JavaCallApplicabilityAdapter {
                 signature,
                 &bindings,
                 used_vararg,
+                &CallTypeSubstitution::empty(),
                 previous_states,
                 completion,
             ),
@@ -152,12 +205,21 @@ impl CallApplicabilityAdapter for JavaCallApplicabilityAdapter {
         };
         Ok(Some((answer, implicit_receiver_gap_reason)))
     }
+}
 
-    fn classify_primitive_pairs(
-        &self,
-        evaluation: &mut FactEvaluation<'_, '_>,
-        pairs: &[(SemanticId, SemanticId)],
-    ) -> Result<Option<CallCandidateApplicability>> {
-        evaluation.classify_java_primitive_pairs(pairs)
+fn java_primitive(
+    value: IntrinsicCallType,
+) -> crate::analyzer::usages::call_conversion::JavaPrimitive {
+    use crate::analyzer::usages::call_conversion::JavaPrimitive;
+    match value {
+        IntrinsicCallType::Boolean => JavaPrimitive::Boolean,
+        IntrinsicCallType::Byte => JavaPrimitive::Byte,
+        IntrinsicCallType::Short => JavaPrimitive::Short,
+        IntrinsicCallType::Char => JavaPrimitive::Char,
+        IntrinsicCallType::Int => JavaPrimitive::Int,
+        IntrinsicCallType::Long => JavaPrimitive::Long,
+        IntrinsicCallType::Float => JavaPrimitive::Float,
+        IntrinsicCallType::Double => JavaPrimitive::Double,
+        IntrinsicCallType::String => unreachable!("String is not a Java primitive"),
     }
 }

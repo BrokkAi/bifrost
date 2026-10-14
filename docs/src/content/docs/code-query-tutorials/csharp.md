@@ -477,15 +477,15 @@ case-insensitive decoded values with numeric bounds on one XML attribute.
     {
       "completeness": "complete",
       "end_byte": 64,
-      "fact_id": "d41244e5b011eb97af0c097ee82d1ea2eaab9d08bf1c52b2beeea6d6ec507b4d",
+      "fact_id": "<public-id>",
       "fact_provenance": "authored",
       "format": "xml",
-      "id": "61ffead58569cd87704646071be855d177bc93b1284225c1f499fbe9b2e212f1",
+      "id": "<public-id>",
       "key": "maxRequestLength",
       "node_kind": "member",
       "occurrence": 1,
       "ordinal": 7,
-      "parent_id": "22a59e6c8ea878967bb2be30c8307f1604fcb941c8be5bccbf0b8f63b8cb3ce9",
+      "parent_id": "<public-id>",
       "path": "csharp/Web.config",
       "range": {
         "end_column": 1,
@@ -499,7 +499,7 @@ case-insensitive decoded values with numeric bounds on one XML attribute.
       "scalar_kind": "string",
       "start_byte": 48,
       "value": "512",
-      "value_id": "05dbbee7167b973f47edbe9412dec8d385a8c5c7dc8751c95aa90dd2c90e26c6"
+      "value_id": "<public-id>"
     }
   ],
   "truncated": false
@@ -531,12 +531,12 @@ call-site row carries its receiver and argument binding identities.
         "start_column": 35,
         "start_line": 17
       },
-      "catch_ast_id": "cc1fdb82edad7d09860affe679de60eb3eba421eec35a471330a7df5dfd0b9c9",
+      "catch_ast_id": "<public-id>",
       "caught_type": "System.Exception",
       "caught_type_relation": "system_exception",
       "coverage": "exhaustive",
       "has_filter": false,
-      "id": "failure_handler_state:csharp/Parity.cs:cc1fdb82edad7d09860affe679de60eb3eba421eec35a471330a7df5dfd0b9c9",
+      "id": "failure_handler_state:csharp/Parity.cs:<public-id>",
       "language": "csharp",
       "path": "csharp/Parity.cs",
       "proof": "exact",
@@ -553,8 +553,8 @@ call-site row carries its receiver and argument binding identities.
             {
               "op": "failure_handler_state",
               "result": {
-                "catch_ast_id": "cc1fdb82edad7d09860affe679de60eb3eba421eec35a471330a7df5dfd0b9c9",
-                "id": "failure_handler_state:csharp/Parity.cs:cc1fdb82edad7d09860affe679de60eb3eba421eec35a471330a7df5dfd0b9c9",
+                "catch_ast_id": "<public-id>",
+                "id": "failure_handler_state:csharp/Parity.cs:<public-id>",
                 "path": "csharp/Parity.cs",
                 "range": {
                   "end_column": 10,
@@ -586,12 +586,12 @@ call-site row carries its receiver and argument binding identities.
         "start_column": 17,
         "start_line": 19
       },
-      "catch_ast_id": "5c3f9ccbcaf2ce85b87c5e8808056694a9aba01160f6c82462dc07c10c4d623a",
+      "catch_ast_id": "<public-id>",
       "caught_type": "System.Exception",
       "caught_type_relation": "system_exception",
       "coverage": "exhaustive",
       "has_filter": false,
-      "id": "failure_handler_state:csharp/Parity.cs:5c3f9ccbcaf2ce85b87c5e8808056694a9aba01160f6c82462dc07c10c4d623a",
+      "id": "failure_handler_state:csharp/Parity.cs:<public-id>",
       "language": "csharp",
       "path": "csharp/Parity.cs",
       "proof": "exact",
@@ -608,8 +608,8 @@ call-site row carries its receiver and argument binding identities.
             {
               "op": "failure_handler_state",
               "result": {
-                "catch_ast_id": "5c3f9ccbcaf2ce85b87c5e8808056694a9aba01160f6c82462dc07c10c4d623a",
-                "id": "failure_handler_state:csharp/Parity.cs:5c3f9ccbcaf2ce85b87c5e8808056694a9aba01160f6c82462dc07c10c4d623a",
+                "catch_ast_id": "<public-id>",
+                "id": "failure_handler_state:csharp/Parity.cs:<public-id>",
                 "path": "csharp/Parity.cs",
                 "range": {
                   "end_column": 10,
@@ -655,13 +655,13 @@ call-site row carries its receiver and argument binding identities.
 {
   "results": [
     {
-      "argument_identity": "e65e117bb5e5f8eeddd40ac34e7c25dc399f74213a18322450de45926d0bf1a6",
+      "argument_identity": "<public-id>",
       "arguments": [
         {
-          "caller_parameter_identity": "e65e117bb5e5f8eeddd40ac34e7c25dc399f74213a18322450de45926d0bf1a6",
+          "caller_parameter_identity": "<public-id>",
           "formal_index": 0,
           "formal_name": "value",
-          "identity": "e65e117bb5e5f8eeddd40ac34e7c25dc399f74213a18322450de45926d0bf1a6",
+          "identity": "<public-id>",
           "position": 0,
           "range": {
             "end_column": 26,
@@ -696,10 +696,10 @@ call-site row carries its receiver and argument binding identities.
         "signature": "(int)",
         "start_line": 14
       },
-      "caller_parameter_identity": "e65e117bb5e5f8eeddd40ac34e7c25dc399f74213a18322450de45926d0bf1a6",
+      "caller_parameter_identity": "<public-id>",
       "language": "csharp",
       "path": "csharp/Parity.cs",
-      "program_point_id": "153cccfe7c6e94abc315d9756c16e861938a97bea474c15249c6bd0b0a1b20f1",
+      "program_point_id": "<public-id>",
       "proof": "proven",
       "provenance": [
         {
@@ -749,7 +749,7 @@ call-site row carries its receiver and argument binding identities.
       },
       "receiver_kind": "implicit",
       "result_type": "call_site",
-      "site_id": "e95b2f9546bd7b9d1abb2e73111985e684c38d71525c36d8a6cd05aa595660e4"
+      "site_id": "<public-id>"
     }
   ],
   "truncated": false

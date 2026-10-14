@@ -5782,6 +5782,7 @@ mod tests {
             },
             &[crate::analyzer::DependencyPackEcosystem::Jvm],
             crate::analyzer::DependencyPackWorkspaceContext {
+                activation_receipt: None,
                 catalog: &catalog,
                 persistence: None,
                 activation: &activation,

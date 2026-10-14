@@ -591,6 +591,7 @@ pub enum JsTsImportBindingResolution<'a> {
 pub struct JsTsLexicalBindingScope {
     pub(crate) start_byte: usize,
     pub(crate) end_byte: usize,
+    pub(crate) node_id: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3179,6 +3180,7 @@ fn node_scope(node: Node<'_>) -> JsTsLexicalBindingScope {
     JsTsLexicalBindingScope {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
+        node_id: node.id(),
     }
 }
 

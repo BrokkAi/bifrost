@@ -602,9 +602,9 @@ dependencies = [
 
 [[package]]
 name = "brokk-tree-sitter-cpp"
-version = "0.24.2"
+version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e32dec5d2e7b2cbd64969c6d479ae156271f903e57e8a74b2938484eb6afd85"
+checksum = "0919af196ba1650fa147dc095e9cd03174ff09f3f08b661621434fa56980e28f"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -672,9 +672,9 @@ dependencies = [
 
 [[package]]
 name = "brokk-tree-sitter-typescript"
-version = "0.23.5"
+version = "0.23.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccc057aec0c571bb46bee3c700aa254c8fa296ebdefed094fce3ba712bce9fec"
+checksum = "c1ab18d84329b8220508c1b8ee323de57700aa0ee50f19959ebffe49f7e45a96"
 dependencies = [
  "cc",
  "tree-sitter-language",

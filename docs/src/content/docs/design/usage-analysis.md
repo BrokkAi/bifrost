@@ -106,6 +106,19 @@ caller and callee hydrate to graph nodes. Fields, modules, and macros can appear
 in focused reference analysis; the public workspace graph uses classes and
 callables as its ranking nodes.
 
+Scala's source usage graph attributes to authored declarations. Generated
+companion owners are excluded at the graph's declaration read boundaries using
+the stored synthetic provenance and structured companion kind. Written
+anonymous templates and primary constructors remain graph declarations.
+Generated member facts already use the source constructor's declaration rather
+than creating another usage identity. Definition lookup can still resolve an
+explicit generated apply to that constructor. Filtering at the read boundary
+preserves the graph's context rules, including the distinction between an
+allowed method value and an ordinary argument occurrence; normalizing a
+synthetic owner after resolution would let earlier owner branches consume the
+reference before those context rules run. The projection filters each query's
+already-read collections in place and retains no additional index or cache.
+
 ## Proof and completeness dimensions
 
 Usage analysis applies the

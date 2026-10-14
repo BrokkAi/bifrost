@@ -88,17 +88,45 @@ struct DeclarationScope<'tree> {
     is_global: bool,
 }
 
+fn emitted_scope_segment(node: Node<'_>, parent: Option<Node<'_>>) -> Option<&'static str> {
+    match node.kind() {
+        // A function's body block is the function's own scope: the function
+        // already contributes a segment or is the indexed owner.
+        "statement_block"
+            if parent.is_some_and(|parent| crate::syntax::is_function_like(parent.kind())) =>
+        {
+            None
+        }
+        "statement_block" | "for_statement" | "for_in_statement" | "switch_body"
+        | "catch_clause" => Some("block"),
+        kind if crate::syntax::is_function_like(kind) => Some("function"),
+        "class_declaration" | "abstract_class_declaration" | "class" => Some("class"),
+        _ => None,
+    }
+}
+
+fn is_function_or_class_scope(node: Node<'_>) -> bool {
+    crate::syntax::is_function_like(node.kind())
+        || matches!(
+            node.kind(),
+            "class_declaration" | "abstract_class_declaration" | "class"
+        )
+}
+
 /// Source-time ancestry summaries. Ancestor queries follow binder-bearing
 /// owners only; deeply nested statements never require a parent walk.
 pub(crate) struct JsTsDeclarationScopeIndex<'tree> {
     root: Node<'tree>,
     contexts: brokk_bifrost_core::hash::HashMap<usize, DeclarationScope<'tree>>,
+    scope_segments: brokk_bifrost_core::hash::HashMap<usize, (&'static str, usize)>,
 }
 
 impl<'tree> JsTsDeclarationScopeIndex<'tree> {
     pub fn new(root: Node<'tree>, source: &str) -> Self {
         let globals = JsTsGlobalScopeFacts::new(root, source);
         let mut contexts = brokk_bifrost_core::hash::HashMap::default();
+        let mut scope_segments = brokk_bifrost_core::hash::HashMap::default();
+        let mut next_scope_ordinal = brokk_bifrost_core::hash::HashMap::<usize, usize>::default();
         let initial = DeclarationScope {
             node: root,
             parent: None,
@@ -106,8 +134,8 @@ impl<'tree> JsTsDeclarationScopeIndex<'tree> {
             enclosing_scope: root,
             is_global: !globals.file_is_esm,
         };
-        let mut stack = vec![(root, initial)];
-        while let Some((node, mut context)) = stack.pop() {
+        let mut stack = vec![(root, initial, root.id())];
+        while let Some((node, mut context, owner_scope_id)) = stack.pop() {
             context.node = node;
             context.is_global |= (node.kind() == "ambient_declaration"
                 && node
@@ -120,6 +148,11 @@ impl<'tree> JsTsDeclarationScopeIndex<'tree> {
                         .and_then(|name| name.utf8_text(source.as_bytes()).ok())
                         .is_some_and(|name| globals.global_namespace_names.contains(name)));
             contexts.insert(node.id(), context);
+            if let Some(kind) = emitted_scope_segment(node, context.parent) {
+                let ordinal = next_scope_ordinal.entry(owner_scope_id).or_default();
+                scope_segments.insert(node.id(), (kind, *ordinal));
+                *ordinal += 1;
+            }
             let child_context = DeclarationScope {
                 node,
                 parent: Some(node),
@@ -135,17 +168,51 @@ impl<'tree> JsTsDeclarationScopeIndex<'tree> {
                 },
                 is_global: context.is_global,
             };
+            // Block ordinals stay under the nearest function/class owner.
+            // A block becomes an FQ segment only for a unit bound in that
+            // exact block; skipping an unrelated outer block must not reset
+            // the ordinal of a nested anonymous function.
+            let child_scope_id = if is_function_or_class_scope(node) {
+                node.id()
+            } else {
+                owner_scope_id
+            };
             let mut cursor = node.walk();
+            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
             stack.extend(
-                node.named_children(&mut cursor)
-                    .map(|child| (child, child_context)),
+                children
+                    .into_iter()
+                    .rev()
+                    .map(|child| (child, child_context, child_scope_id)),
             );
         }
-        Self { root, contexts }
+        Self {
+            root,
+            contexts,
+            scope_segments,
+        }
+    }
+
+    pub fn declaration_owner_chain(&self, node: Node<'_>) -> Vec<Node<'tree>> {
+        let mut owners = Vec::new();
+        let mut owner = self.contexts[&node.id()].owner;
+        while let Some(current) = owner {
+            owners.push(current);
+            owner = self.contexts[&current.id()].owner;
+        }
+        owners
     }
 
     pub fn parent(&self, node: Node<'_>) -> Option<Node<'tree>> {
         self.contexts[&node.id()].parent
+    }
+
+    pub fn scope_segment(&self, node: Node<'_>) -> Option<(&'static str, usize)> {
+        self.scope_segments.get(&node.id()).copied()
+    }
+
+    pub fn root(&self) -> Node<'tree> {
+        self.root
     }
 
     pub fn declaration_is_global(&self, node: Node<'_>) -> bool {
