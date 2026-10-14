@@ -764,10 +764,8 @@ pub(crate) const fn resolution_bundle_epoch(language: Language) -> &'static str 
         Language::Php => "resolution-bundle-php-v20-logical-member-names-2026-10",
         // Self-type edges and aliases extend Scala's explicit-instantiation
         // bundle; synthesized companions for case classes add singleton-relation
-        // rows.
-        Language::Scala => {
-            "resolution-bundle-scala-v61-synthesized-companions-and-logical-members-2026-10"
-        }
+        // rows. Lexical companions retain source identity without global units.
+        Language::Scala => "resolution-bundle-scala-v62-lexical-case-class-companions-5177-2026-10",
         Language::CSharp => "resolution-bundle-csharp-v20-logical-member-names-2026-10",
         Language::Ruby => "resolution-bundle-ruby-v20-logical-member-names-2026-10",
         Language::Kotlin => "resolution-bundle-kotlin-v40-logical-member-names-2026-10",

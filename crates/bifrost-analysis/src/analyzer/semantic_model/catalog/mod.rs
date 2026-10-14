@@ -165,7 +165,9 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// including version 55 entries made before the grammar upgrade.
 /// 57: recoverable PHP source-syntax warnings retain their exact source entry,
 /// changing extraction accounting and the gaps reported by warm productions.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 57;
+/// 58: Scala operator-named classes retain their indexed declarations and
+/// constructors; local case-class companions keep lexical source identities.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 58;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.

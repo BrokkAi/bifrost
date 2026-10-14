@@ -2445,29 +2445,37 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             .declaration_sources
             .iter()
             .find_map(|(site, declaration)| (*site == class_site).then_some(*declaration))
-            .expect("a non-local case class has a source declaration");
+            .expect("a case class source site has a source declaration");
         let class_unit = parsed
             .source_declaration_units
             .iter()
-            .find_map(|(declaration, unit)| (*declaration == source_declaration).then_some(unit))
-            .expect("a case class source declaration has a code unit");
-        let name = declaration_name(class).expect("a named Scala case class");
-        let name_text = node_text(name, self.source).trim();
-        let companion_fq = class_unit
-            .fq()
-            .parent()
-            .expect("a class code unit has an enclosing name")
-            .with_pushed(segment_interner().intern(name_text, SegmentKind::Companion));
-        let companion_unit = CodeUnit::with_signature_and_fq(
-            class_unit.source().clone(),
-            CodeUnitType::Class,
-            class_unit.package_name(),
-            format!("{}$", class_unit.short_name()),
-            None,
-            true,
-            companion_fq,
-        );
+            .find_map(|(declaration, unit)| (*declaration == source_declaration).then_some(unit));
         let parent_scope = self.facts.sites[class_site.index()].scope;
+        let companion_unit = if let Some(class_unit) = class_unit {
+            let name = declaration_name(class).expect("a named Scala case class");
+            let name_text = node_text(name, self.source).trim();
+            let companion_fq = class_unit
+                .fq()
+                .parent()
+                .expect("a class code unit has an enclosing name")
+                .with_pushed(segment_interner().intern(name_text, SegmentKind::Companion));
+            Some(CodeUnit::with_signature_and_fq(
+                class_unit.source().clone(),
+                CodeUnitType::Class,
+                class_unit.package_name(),
+                format!("{}$", class_unit.short_name()),
+                None,
+                true,
+                companion_fq,
+            ))
+        } else {
+            assert!(
+                self.has_unitless_lexical_ancestor(parent_scope, parsed),
+                "a non-local case class source declaration has a code unit"
+            );
+            None
+        };
+        let name = declaration_name(class).expect("a named Scala case class");
         let occurrence = self.collector.intern_subspan_bytes(
             name.start_byte(),
             name.end_byte(),
@@ -2486,13 +2494,17 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             ResolutionNamespace::Type,
             None,
         );
-        self.declaration_sources.push((site, declaration));
-        self.facts
-            .definition_units
-            .push(ResolutionDefinitionUnitFact {
-                declaration: site,
-                unit: companion_unit,
-            });
+        if let Some(companion_unit) = companion_unit {
+            self.declaration_sources.push((site, declaration));
+            self.facts
+                .definition_units
+                .push(ResolutionDefinitionUnitFact {
+                    declaration: site,
+                    unit: companion_unit,
+                });
+        } else {
+            self.publish_unitless_declaration(site, declaration, DeclarationKind::BlockLocalItem);
+        }
         let scope = ResolutionScopeId::try_from_index(self.facts.scopes.len())
             .expect("Scala resolution scope count fits u32");
         let range = node_range(name);
@@ -2509,6 +2521,50 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         self.synthesized_case_class_companions
             .insert(class.id(), site);
         (site, scope)
+    }
+
+    /// A missing parser unit is lexical only when the structured parent-scope
+    /// chain reaches a block, executable or initializer before a package boundary.
+    /// Unitless local types may nest inside other unitless local templates;
+    /// skip those owners using their exact source-declaration-to-unit links.
+    fn has_unitless_lexical_ancestor(
+        &self,
+        mut scope: ResolutionScopeId,
+        parsed: &ParsedFile,
+    ) -> bool {
+        loop {
+            let scope_fact = self.scope(scope);
+            match scope_fact.kind {
+                ResolutionScopeKind::Block
+                | ResolutionScopeKind::Executable
+                | ResolutionScopeKind::Initializer => return true,
+                ResolutionScopeKind::CompilationUnit
+                | ResolutionScopeKind::Package
+                | ResolutionScopeKind::File => {
+                    return false;
+                }
+                ResolutionScopeKind::TypeBody => {
+                    let Some(owner) = scope_fact.owner else {
+                        return false;
+                    };
+                    let Some(owner_declaration) = self
+                        .declaration_sources
+                        .iter()
+                        .find_map(|(site, declaration)| (*site == owner).then_some(*declaration))
+                    else {
+                        return false;
+                    };
+                    if parsed
+                        .source_declaration_units
+                        .iter()
+                        .any(|(declaration, _)| *declaration == owner_declaration)
+                    {
+                        return false;
+                    }
+                    scope = self.facts.sites[owner.index()].scope;
+                }
+            }
+        }
     }
 
     /// Publish one compiler-added member, unless the source already declares a
@@ -4138,6 +4194,14 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         name: Node<'source>,
         suffix: &str,
     ) -> Option<Vec<ResolutionNameId>> {
+        if !matches!(
+            self.scope(scope).kind,
+            ResolutionScopeKind::CompilationUnit
+                | ResolutionScopeKind::Package
+                | ResolutionScopeKind::TypeBody
+        ) {
+            return None;
+        }
         let package_root_scope = self.package_scope_for(scope);
         assert!(
             self.facts
@@ -4148,8 +4212,10 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         let mut owner_names = Vec::new();
         let mut owner = self.scope(scope).owner;
         while let Some(owner_site) = owner {
-            if self.facts.sites[owner_site.index()].kind != ResolutionSiteKind::TypeDeclaration {
-                break;
+            match self.facts.sites[owner_site.index()].kind {
+                ResolutionSiteKind::TypeDeclaration => {}
+                ResolutionSiteKind::PackageDeclaration => break,
+                _ => return None,
             }
             let owner_name = self.facts.identifiers.iter().find_map(|identifier| {
                 (identifier.site == owner_site
@@ -6208,6 +6274,444 @@ mod tests {
                         })
                 }),
                 "{name}'s synthesized companion must own its extractor"
+            );
+        }
+    }
+
+    #[test]
+    fn method_local_case_classes_publish_lexical_synthesized_companions() {
+        let source = "object Example {\n\
+            def first(): Unit = {\n\
+              case class Same(value: Int)\n\
+              Same(1)\n\
+            }\n\
+            def second(): Unit = {\n\
+              case class Same(value: String)\n\
+              Same(\"two\")\n\
+            }\n\
+            object NestedTemplate { case class Nested(value: Long) }\n\
+          }\n";
+        let parsed = parse(source);
+        let facts = &parsed.resolution_facts;
+        let source_facts = parsed
+            .source_facts
+            .as_ref()
+            .expect("Scala source facts are published");
+
+        let declaration_named_at = |name: &str, prefix: &str| {
+            facts
+                .identifiers
+                .iter()
+                .find_map(|identifier| {
+                    if identifier.role != ResolutionIdentifierRole::Declaration
+                        || facts.names[identifier.name.index()].spelling != name
+                    {
+                        return None;
+                    }
+                    let site = facts.sites[identifier.site.index()];
+                    (site.kind == ResolutionSiteKind::TypeDeclaration
+                        && source[site.start_byte..site.end_byte].starts_with(prefix))
+                    .then_some(identifier.site)
+                })
+                .unwrap_or_else(|| panic!("missing declaration `{name}` at `{prefix}`"))
+        };
+        let declaration_source = |site: ResolutionSiteId| {
+            let declarations = source_facts
+                .native_declaration_sources
+                .iter()
+                .filter_map(|(candidate, declaration)| (*candidate == site).then_some(*declaration))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                declarations.len(),
+                1,
+                "each native site has exactly one source declaration bridge: {site:?}"
+            );
+            declarations[0]
+        };
+        let companion_for = |class: ResolutionSiteId| {
+            facts
+                .singleton_relations
+                .iter()
+                .find(|relation| {
+                    relation.kind == ResolutionSingletonRelationKind::Companion
+                        && relation.enclosing_type == Some(class)
+                })
+                .unwrap_or_else(|| panic!("missing synthesized companion for {class:?}"))
+                .declaration
+        };
+
+        let first = declaration_named_at("Same", "case class Same");
+        let second_offset = source
+            .match_indices("case class Same")
+            .nth(1)
+            .expect("second local class source")
+            .0;
+        let second = facts
+            .identifiers
+            .iter()
+            .find_map(|identifier| {
+                if identifier.role != ResolutionIdentifierRole::Declaration
+                    || facts.names[identifier.name.index()].spelling != "Same"
+                {
+                    return None;
+                }
+                let site = facts.sites[identifier.site.index()];
+                (site.kind == ResolutionSiteKind::TypeDeclaration
+                    && site.start_byte >= second_offset
+                    && source[site.start_byte..site.end_byte].starts_with("case class Same"))
+                .then_some(identifier.site)
+            })
+            .expect("second local case class declaration");
+        let local_classes = [first, second];
+        let local_companions = local_classes.map(companion_for);
+
+        assert_ne!(
+            first, second,
+            "same-spelled local classes have distinct sites"
+        );
+        assert_ne!(
+            facts.sites[first.index()].scope,
+            facts.sites[second.index()].scope,
+            "same-spelled local classes retain distinct method scopes"
+        );
+        assert_ne!(
+            local_companions[0], local_companions[1],
+            "same-spelled local companions have distinct sites"
+        );
+
+        for (class, companion) in local_classes.into_iter().zip(local_companions) {
+            let class_declaration = declaration_source(class);
+            let companion_declaration = declaration_source(companion);
+            let class_scope = facts.sites[class.index()].scope;
+            let companion_scope = facts
+                .scopes
+                .iter()
+                .find(|scope| {
+                    scope.owner == Some(companion) && scope.kind == ResolutionScopeKind::TypeBody
+                })
+                .unwrap_or_else(|| panic!("missing synthesized companion scope for {companion:?}"));
+
+            assert_ne!(class, companion, "the companion is not the class site");
+            assert_ne!(
+                class_declaration, companion_declaration,
+                "the companion has its own source declaration identity"
+            );
+            assert_eq!(
+                facts.sites[companion.index()].scope,
+                class_scope,
+                "the companion declaration site stays in the enclosing lexical scope"
+            );
+            assert_eq!(
+                companion_scope.parent,
+                Some(class_scope),
+                "the companion scope remains under the class's lexical scope"
+            );
+            assert!(
+                facts.gaps.iter().any(|gap| {
+                    gap.site == class && gap.kind == ResolutionGapKind::UnsupportedRoute
+                }),
+                "method-local case classes have no fabricated global JVM owner route"
+            );
+            assert_eq!(
+                source_facts
+                    .occurrences
+                    .lexical_declaration(class_declaration)
+                    .map(|fact| fact.kind),
+                Some(DeclarationKind::BlockLocalItem)
+            );
+            assert_eq!(
+                source_facts
+                    .occurrences
+                    .lexical_declaration(companion_declaration)
+                    .map(|fact| (fact.kind, fact.identifier.as_str())),
+                Some((DeclarationKind::BlockLocalItem, "Same")),
+                "a unitless companion is published as its real lexical declaration"
+            );
+            assert!(
+                !parsed
+                    .source_declaration_units
+                    .iter()
+                    .any(|(declaration, _)| *declaration == class_declaration
+                        || *declaration == companion_declaration),
+                "method-local class and companion must not be assigned global parser units"
+            );
+            assert!(
+                !facts
+                    .definition_units
+                    .iter()
+                    .any(|definition| definition.declaration == companion),
+                "the unitless companion must not publish a synthetic CodeUnit"
+            );
+
+            for member_name in ["apply", "unapply"] {
+                let member = facts
+                    .member_owners
+                    .iter()
+                    .find(|member| {
+                        member.owner == companion
+                            && facts.identifiers.iter().any(|identifier| {
+                                identifier.site == member.member
+                                    && identifier.role == ResolutionIdentifierRole::Declaration
+                                    && facts.names[identifier.name.index()].spelling == member_name
+                            })
+                    })
+                    .unwrap_or_else(|| panic!("synthesized companion must own `{member_name}`"));
+                assert_eq!(
+                    facts.sites[member.member.index()].scope,
+                    companion_scope.id,
+                    "generated `{member_name}` is in the matching companion scope"
+                );
+                assert_eq!(
+                    declaration_source(member.member),
+                    class_declaration,
+                    "generated `{member_name}` is located at the local class constructor source"
+                );
+                assert!(
+                    !facts
+                        .jvm_aliases
+                        .iter()
+                        .any(|alias| alias.declaration == member.member),
+                    "method-local `{member_name}` has no fabricated JVM alias"
+                );
+            }
+        }
+
+        let nested_class = declaration_named_at("Nested", "case class Nested");
+        let nested_class_declaration = declaration_source(nested_class);
+        let nested_companion = companion_for(nested_class);
+        let nested_companion_declaration = declaration_source(nested_companion);
+        let nested_class_unit = parsed
+            .source_declaration_units
+            .iter()
+            .find_map(|(declaration, unit)| {
+                (*declaration == nested_class_declaration).then_some(unit)
+            })
+            .expect("nested-template class retains its indexed unit");
+        assert!(nested_class_unit.is_class() && !nested_class_unit.is_synthetic());
+        let nested_companion_unit = facts
+            .definition_units
+            .iter()
+            .find_map(|definition| {
+                (definition.declaration == nested_companion).then_some(&definition.unit)
+            })
+            .expect("ordinary nested-template companion retains its synthetic unit");
+        assert!(nested_companion_unit.is_class() && nested_companion_unit.is_synthetic());
+        assert!(
+            parsed
+                .source_declaration_units
+                .iter()
+                .any(
+                    |(declaration, unit)| *declaration == nested_companion_declaration
+                        && unit == nested_companion_unit
+                )
+        );
+    }
+
+    #[test]
+    fn operator_named_top_level_case_class_keeps_its_parser_units() {
+        let parsed = parse(
+            "package scala.collection.immutable\nfinal case class ::[+A](head: A, tail: List[A])\n",
+        );
+        let classes = parsed
+            .source_declaration_units
+            .iter()
+            .filter(|(_, unit)| unit.short_name() == "::" && unit.is_class())
+            .collect::<Vec<_>>();
+        assert_eq!(classes.len(), 1, "operator case class units={classes:?}");
+        let (class_declaration, class_unit) = classes[0];
+        assert!(!class_unit.is_synthetic());
+
+        let constructors = parsed
+            .source_declaration_units
+            .iter()
+            .filter(|(_, unit)| {
+                unit.short_name() == "::.::" && unit.is_function() && unit.is_synthetic()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            constructors.len(),
+            1,
+            "primary constructor units={constructors:?}"
+        );
+        assert_ne!(
+            *class_declaration, constructors[0].0,
+            "the primary constructor keeps its own source declaration identity"
+        );
+
+        let facts = &parsed.resolution_facts;
+        let class_site = facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Declaration
+                    && facts.names[identifier.name.index()].spelling == "::"
+                    && facts.sites[identifier.site.index()].kind
+                        == ResolutionSiteKind::TypeDeclaration
+            })
+            .expect("operator case class has a native type site")
+            .site;
+        let companion = facts
+            .singleton_relations
+            .iter()
+            .find(|relation| {
+                relation.kind == ResolutionSingletonRelationKind::Companion
+                    && relation.enclosing_type == Some(class_site)
+            })
+            .expect("operator case class has its synthesized companion")
+            .declaration;
+        let companion_declaration = parsed
+            .source_facts
+            .as_ref()
+            .expect("Scala source facts are published")
+            .native_declaration_sources
+            .iter()
+            .find_map(|(site, declaration)| (*site == companion).then_some(*declaration))
+            .expect("synthetic companion source mapping");
+        let companion_unit = parsed
+            .source_declaration_units
+            .iter()
+            .find_map(|(declaration, unit)| (*declaration == companion_declaration).then_some(unit))
+            .expect("top-level synthesized companion keeps its synthetic parser unit");
+        assert!(companion_unit.is_class() && companion_unit.is_synthetic());
+        assert_eq!(
+            companion_unit.short_name(),
+            format!("{}$", class_unit.short_name())
+        );
+    }
+
+    #[test]
+    fn braced_package_case_class_keeps_its_jvm_companion_routes() {
+        let parsed = parse("package demo.pkg { case class Point(value: Int) }\n");
+        let facts = &parsed.resolution_facts;
+        let companion = facts
+            .singleton_relations
+            .iter()
+            .find(|relation| relation.kind == ResolutionSingletonRelationKind::Companion)
+            .expect("the indexed case class has a companion")
+            .declaration;
+        for name in ["apply", "unapply"] {
+            let member = facts
+                .member_owners
+                .iter()
+                .find(|member| {
+                    member.owner == companion
+                        && facts.identifiers.iter().any(|identifier| {
+                            identifier.site == member.member
+                                && facts.names[identifier.name.index()].spelling == name
+                        })
+                })
+                .expect("the companion owns its generated member");
+            let alias = facts
+                .jvm_aliases
+                .iter()
+                .find(|alias| alias.declaration == member.member)
+                .unwrap_or_else(|| panic!("package-owned `{name}` retains its JVM alias"));
+            let mut segments = facts
+                .jvm_alias_owner_segments
+                .iter()
+                .filter(|segment| segment.alias == alias.id)
+                .collect::<Vec<_>>();
+            segments.sort_unstable_by_key(|segment| segment.ordinal);
+            assert_eq!(
+                segments
+                    .iter()
+                    .map(|segment| facts.names[segment.name.index()].spelling.as_str())
+                    .collect::<Vec<_>>(),
+                ["demo", "pkg", "Point$"],
+                "a package boundary is not a local executable owner"
+            );
+        }
+    }
+
+    #[test]
+    fn case_class_and_written_companion_in_initializer_block_have_no_jvm_route() {
+        let source = "object Container {\n\
+            {\n\
+              case class LocalWithCompanion(value: Int)\n\
+              object LocalWithCompanion\n\
+              LocalWithCompanion(1).value\n\
+            }\n\
+          }\n";
+        let parsed = parse(source);
+        let facts = &parsed.resolution_facts;
+        let source_facts = parsed
+            .source_facts
+            .as_ref()
+            .expect("Scala source facts are published");
+        let declaration_named_at = |name: &str, prefix: &str| {
+            facts
+                .identifiers
+                .iter()
+                .find_map(|identifier| {
+                    if identifier.role != ResolutionIdentifierRole::Declaration
+                        || facts.names[identifier.name.index()].spelling != name
+                    {
+                        return None;
+                    }
+                    let site = facts.sites[identifier.site.index()];
+                    (site.kind == ResolutionSiteKind::TypeDeclaration
+                        && source[site.start_byte..site.end_byte].starts_with(prefix))
+                    .then_some(identifier.site)
+                })
+                .unwrap_or_else(|| panic!("missing declaration `{name}` at `{prefix}`"))
+        };
+        let declaration_source = |site: ResolutionSiteId| {
+            let declarations = source_facts
+                .native_declaration_sources
+                .iter()
+                .filter_map(|(candidate, declaration)| (*candidate == site).then_some(*declaration))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                declarations.len(),
+                1,
+                "each native site has exactly one source declaration bridge: {site:?}"
+            );
+            declarations[0]
+        };
+
+        let class = declaration_named_at("LocalWithCompanion", "case class LocalWithCompanion");
+        let companion = declaration_named_at("LocalWithCompanion", "object LocalWithCompanion");
+        let class_declaration = declaration_source(class);
+        let companion_declaration = declaration_source(companion);
+        assert!(
+            !parsed
+                .source_declaration_units
+                .iter()
+                .any(|(declaration, _)| {
+                    *declaration == class_declaration || *declaration == companion_declaration
+                }),
+            "initializer-block declarations remain unitless"
+        );
+
+        assert!(
+            facts.gaps.iter().any(|gap| {
+                gap.site == class && gap.kind == ResolutionGapKind::UnsupportedRoute
+            })
+        );
+        for member_name in ["apply", "unapply"] {
+            let member = facts
+                .member_owners
+                .iter()
+                .find(|member| {
+                    member.owner == companion
+                        && facts.identifiers.iter().any(|identifier| {
+                            identifier.site == member.member
+                                && identifier.role == ResolutionIdentifierRole::Declaration
+                                && facts.names[identifier.name.index()].spelling == member_name
+                        })
+                })
+                .unwrap_or_else(|| panic!("written local companion must own `{member_name}`"));
+            assert_eq!(
+                declaration_source(member.member),
+                class_declaration,
+                "generated `{member_name}` keeps the local constructor source mapping"
+            );
+            assert!(
+                !facts
+                    .jvm_aliases
+                    .iter()
+                    .any(|alias| alias.declaration == member.member),
+                "initializer-block `{member_name}` has no fabricated JVM alias"
             );
         }
     }
